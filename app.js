@@ -1,3678 +1,6328 @@
-(() => {
-'use strict';
+// ==================== START OF CHUNK 1 OF 6 ====================
+const canvas=document.getElementById('gameCanvas');
+const ctx=canvas.getContext('2d',{alpha:false});
+const radarCanvas=document.getElementById('miniRadarCanvas');
+const rCtx=radarCanvas.getContext('2d');
+const LANES=[-2,-1,0,1,2];
+const LANE_WIDTH_M=3.5;
+let isMobileHardware=false,isHudHidden=false;
 
-if (typeof CanvasRenderingContext2D !== 'undefined' && !CanvasRenderingContext2D.prototype.roundRect) {
-    CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
-        const rad = Math.min(Array.isArray(r) ? r[0] : (r || 0), Math.abs(w) * 0.5, Math.abs(h) * 0.5);
-        this.moveTo(x + rad, y);
-        this.arcTo(x + w, y, x + w, y + h, rad);
-        this.arcTo(x + w, y + h, x, y + h, rad);
-        this.arcTo(x, y + h, x, y, rad);
-        this.arcTo(x, y, x + w, y, rad);
-        this.closePath();
-        return this;
-    };
+function detectDeviceHardware(){
+    const uaMobile=/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    const coarsePointer=window.matchMedia&&window.matchMedia('(pointer: coarse)').matches;
+    isMobileHardware=Boolean(uaMobile||coarsePointer);
+    document.body.classList.toggle('is-mobile',isMobileHardware);
+    document.body.classList.toggle('is-pc',!isMobileHardware);
+    const scanLbl=document.getElementById('gfxHardwareScanLabel');
+    if(scanLbl)scanLbl.innerText="🖥️ Quality Presets & Render Options";
+    const ctrlHeader=document.getElementById('ctrlPlatformHeaderLabel');
+    if(ctrlHeader)ctrlHeader.innerText=isMobileHardware?"📱 Mobile / Android Touch & Gyro Controls":"⌨️ PC Keyboard Controls & Keybinds";
+    const tapLaneBtn=document.getElementById('mobCtrl_drag');
+    if(tapLaneBtn)tapLaneBtn.innerText="👆 Tap Lane";
 }
 
-function colorWithAlpha(col, alpha) {
-    const s = String(col || '#38bdf8').trim();
-    const a = Math.max(0, Math.min(1, Number(alpha) || 0));
-    if (s.startsWith('#')) {
-        let hex = s.slice(1);
-        if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
-        if (hex.length >= 6) {
-            const r = parseInt(hex.slice(0, 2), 16) || 0;
-            const g = parseInt(hex.slice(2, 4), 16) || 0;
-            const b = parseInt(hex.slice(4, 6), 16) || 0;
-            return `rgba(${r},${g},${b},${a})`;
-        }
+function toggleGameHudVisibility(){
+    isHudHidden=!isHudHidden;
+    document.getElementById('gameViewportWrapper').classList.toggle('hud-hidden',isHudHidden);
+    const mobBtn=document.getElementById('mobileHideUiBtn');
+    if(mobBtn)mobBtn.innerText=isHudHidden?"👁️ Show UI":"👁️ UI";
+}
+
+const gameState={
+    running:false,paused:false,score:0,epoch:1,combo:1.0,
+    nearMisses:0,armor:100,nitroFuel:100,empCharge:100,
+    distanceM:0,speedMps:25,targetLane:0,egoLaneX:0,egoRoll:0,
+    boosting:false,braking:false,slowMoTimer:0,empWaveRadius:0,screenShake:0,
+    ep250WarnTriggered:false,ep250WarnTimer:0,
+    viewW:window.innerWidth,viewH:window.innerHeight,
+    hazards:[],pickups:[],FloatingTexts:[],stars:[]
+};
+
+const STAR_COLORS=["#ffffff","#7dd3fc","#f472b6","#c084fc","#fde68a","#00f5d4"];
+for(let i=0;i<85;i++){
+    gameState.stars.push({x:Math.random(),y:Math.random()*0.41,s:Math.random()*1.8+0.6,sp:Math.random()*0.25+0.06,col:STAR_COLORS[i%STAR_COLORS.length]});
+}
+
+let spawnAccumulator=0,pickupAccumulator=0,radarAngle=Math.PI;
+let lastRawLandscapeTilt=0,smoothedGyroDelta=0,needsSilentGyroCalib=true,hasGyroReading=false;
+let awaitingRebindAction=null,lastHudUpdateTime=0,lastLiveLbPushTime=0,doubleTapBoostTimer=null;
+const domCache={};
+let cachedGradients={key:'',sky:null,sun:null};
+
+function setTextCached(id,val){
+    if(domCache[id]===val)return;
+    domCache[id]=val;
+    const el=document.getElementById(id);
+    if(el)el.innerText=val;
+}
+function setStyleWidthCached(id,wStr){
+    const k=id+'_w';
+    if(domCache[k]===wStr)return;
+    domCache[k]=wStr;
+    const el=document.getElementById(id);
+    if(el)el.style.width=wStr;
+}
+
+const PILOT_PROFILES={
+    "1117":{id:"1117",name:"Mitadru Karmakar (Void)",callsign:"VOID // ARCHITECT",liveryName:"Dark-Matter Prismatic Chroma",isVoidChroma:true,isCore:true,dotColor:"#00f5d4",chassisTop:"#1a2236",chassisBot:"#090d18",canopyColor:"#c77dff",thrusterColor:"#ff007f",railColor:"#00f5d4",lbClass:"void-leaderboard-card",nameClass:"void-name-glow"},
+    "1183":{id:"1183",name:"Ritam Chatterjee",callsign:"RITAM // DATASET",liveryName:"Solar Gold Telemetry",isVoidChroma:false,isCore:true,dotColor:"#f59e0b",chassisTop:"#33220a",chassisBot:"#170f04",canopyColor:"#fde68a",thrusterColor:"#f97316",railColor:"#f59e0b",lbClass:"core-glow-ritam bg-[#16120a]",nameClass:"text-amber-300 font-extrabold"},
+    "1134":{id:"1134",name:"Syed Meraj Ahmed",callsign:"MERAJ // FIELD QA",liveryName:"Crimson Phantom Carbon",isVoidChroma:false,isCore:true,dotColor:"#ef4444",chassisTop:"#360f18",chassisBot:"#17060a",canopyColor:"#fda4af",thrusterColor:"#ef4444",railColor:"#f43f5e",lbClass:"core-glow-meraj bg-[#180b0e]",nameClass:"text-red-400 font-extrabold"},
+    "1075":{id:"1075",name:"Sourajita Choudhury",callsign:"SOURAJITA // IEEE",liveryName:"Emerald Matrix Jade",isVoidChroma:false,isCore:true,dotColor:"#10b981",chassisTop:"#0b3024",chassisBot:"#051711",canopyColor:"#a7f3d0",thrusterColor:"#10b981",railColor:"#10b981",lbClass:"core-glow-sourajita bg-[#091814]",nameClass:"text-emerald-300 font-extrabold"},
+    "1174":{id:"1174",name:"Debankita Das",callsign:"DEBANKITA // RISK",liveryName:"Amethyst Pulsar",isVoidChroma:false,isCore:true,dotColor:"#a855f7",chassisTop:"#271242",chassisBot:"#11071f",canopyColor:"#e9d5ff",thrusterColor:"#a855f7",railColor:"#c084fc",lbClass:"core-glow-debankita bg-[#130b1c]",nameClass:"text-purple-300 font-extrabold"},
+    "GUEST":{id:"GUEST",name:"Guest Pilot",callsign:"EGO-01 // GUEST",liveryName:"Tactical Steel",isVoidChroma:false,isCore:false,dotColor:"#38bdf8",chassisTop:"#1e293b",chassisBot:"#0f172a",canopyColor:"#7dd3fc",thrusterColor:"#38bdf8",railColor:"#38bdf8",lbClass:"bg-[#111520] border border-[#232938]",nameClass:"text-gray-200 font-semibold"}
+};
+
+const CORE_IDS=new Set(["1117","1183","1134","1075","1174"]);
+const ACCOUNTS_DB_KEY='roadSense_overdrive_accounts_db_v8';
+const DELETED_ACCOUNTS_KEY='roadSense_overdrive_deleted_accs_v8';
+const SETTINGS_PER_ACC_KEY='roadSense_overdrive_acc_settings_v12';
+
+let currentPilot=PILOT_PROFILES["GUEST"];
+let activeLiveryProfile=PILOT_PROFILES["GUEST"];
+let customGuestId=localStorage.getItem('roadSense_overdrive_customGuestId')||"";
+let customGuestName=localStorage.getItem('roadSense_overdrive_guestName')||"";
+let isAccountSessionLocked=localStorage.getItem('roadSense_overdrive_accountLocked')==='true';
+let devAllDimensionsUnlocked=true;
+let isApplyingAccountSettings=false;
+
+function generateRandomGuest4DigitId(){
+    let candidate="1000";
+    for(let tries=0;tries<50;tries++){
+        candidate=String(Math.floor(1000+Math.random()*9000));
+        if(!CORE_IDS.has(candidate))break;
     }
-    if (s.startsWith('hsl(')) return s.replace(/^hsl\(/, 'hsla(').replace(/\)$/, `,${a})`);
-    if (s.startsWith('hsla(')) return s.replace(/,[^,]+\)$/, `,${a})`);
-    if (s.startsWith('rgb(')) return s.replace(/^rgb\(/, 'rgba(').replace(/\)$/, `,${a})`);
-    if (s.startsWith('rgba(')) return s.replace(/,[^,]+\)$/, `,${a})`);
-    return `rgba(56,189,248,${a})`;
+    return candidate;
 }
 
-// =========================================================================
-// 1. DATABASE KEYS, FIREBASE 24/7 CONFIG & INDEXEDDB LOCAL ENGINE
-// =========================================================================
-// PASTE YOUR FIREBASE REALTIME DATABASE URL BELOW (e.g. "https://your-project-default-rtdb.firebaseio.com")
-const FIREBASE_DB_URL = 'https://galaxy-racer-1a578-default-rtdb.asia-southeast1.firebasedatabase.app';
-
-const FB_BASE_URL = FIREBASE_DB_URL ? FIREBASE_DB_URL.trim().replace(/\/+$/, '') + '/roadsense_v4' : '';
-
-const STORAGE_ACCOUNTS_KEY   = 'roadsense_v4_accounts';
-const STORAGE_ACTIVE_UID_KEY = 'roadsense_v4_active_uid';
-const STORAGE_LAST_OUT_KEY   = 'roadsense_v4_last_logout_uid';
-const STORAGE_SYNC_META_KEY  = 'roadsense_v4_sync_meta';
-const STORAGE_V4_RESET_DONE  = 'roadsense_v4_clean_reset_done';
-const STORAGE_GLOBAL_CFG_KEY = 'roadsense_v4_global_settings';
-const STORAGE_SEASON_KEY     = 'roadsense_v4_season_state';
-const STORAGE_LB_ALL_KEY     = 'roadsense_v4_lb_alltime';
-const STORAGE_LB_SEASON_KEY  = 'roadsense_v4_lb_season';
-const STORAGE_ALLTIME_CHAMP  = 'roadsense_v4_alltime_champ_uid';
-const LOCAL_IDB_NAME         = 'RoadSenseLocalDB_v4';
-const LOCAL_IDB_VERSION      = 2;
-
-const CANONICAL_DEV_UID = '84729160538274195';
-const DEFAULT_DEV_NAME  = 'Unknown';
-const DEFAULT_DEV_TAG   = '0000';
-const CLIENT_ID         = 'c_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now().toString(36);
-
-const SEASON_ACTIVE_MS = 3 * 24 * 60 * 60 * 1000;
-const SEASON_GAP_MS    = 1 * 24 * 60 * 60 * 1000;
-const SEASON_CYCLE_MS  = SEASON_ACTIVE_MS + SEASON_GAP_MS;
-
-function lsGet(k, fb = null) { try { const v = localStorage.getItem(k); return v === null ? fb : v; } catch (e) { return fb; } }
-function lsSet(k, v) { try { localStorage.setItem(k, v); idbMirrorSet(k, v); return true; } catch (e) { idbMirrorSet(k, v); return false; } }
-function lsRemove(k) { try { localStorage.removeItem(k); idbMirrorDelete(k); } catch (e) {} }
-function lsGetJson(k, fb) { try { const r = localStorage.getItem(k); if (!r) return fb; const p = JSON.parse(r); return p == null ? fb : p; } catch (e) { return fb; } }
-
-// Unified IndexedDB Engine: Stores both Custom Audio Songs ('songs') AND Local Database Mirror ('kv')
-let localIdbPromise = null;
-function openLocalIDB() {
-    if (!('indexedDB' in window)) return Promise.reject(new Error('IndexedDB unavailable'));
-    if (localIdbPromise) return localIdbPromise;
-    localIdbPromise = new Promise((res, rej) => {
-        const req = indexedDB.open(LOCAL_IDB_NAME, LOCAL_IDB_VERSION);
-        req.onupgradeneeded = e => {
-            const db = e.target.result;
-            if (!db.objectStoreNames.contains('songs')) db.createObjectStore('songs', { keyPath: 'uid' });
-            if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv', { keyPath: 'key' });
-        };
-        req.onsuccess = () => res(req.result);
-        req.onerror = () => { localIdbPromise = null; rej(req.error); };
-        req.onblocked = () => { localIdbPromise = null; rej(new Error('IDB blocked')); };
-    });
-    return localIdbPromise;
+function ensureGuestHas4DigitId(){
+    if(currentPilot.isCore)return "";
+    if(!/^\d{4}$/.test(customGuestId)||CORE_IDS.has(customGuestId)){
+        customGuestId=generateRandomGuest4DigitId();
+        localStorage.setItem('roadSense_overdrive_customGuestId',customGuestId);
+    }
+    return customGuestId;
 }
 
-function idbMirrorSet(key, val) {
-    openLocalIDB().then(db => {
-        const tx = db.transaction('kv', 'readwrite');
-        tx.objectStore('kv').put({ key, val, ts: Date.now() });
-    }).catch(() => {});
+function getAccountsDatabase(){try{return JSON.parse(localStorage.getItem(ACCOUNTS_DB_KEY)||'{}');}catch(e){return {};}}
+function saveAccountsDatabase(db){localStorage.setItem(ACCOUNTS_DB_KEY,JSON.stringify(db));}
+function getDeletedAccountKeys(){try{return JSON.parse(localStorage.getItem(DELETED_ACCOUNTS_KEY)||'[]');}catch(e){return [];}}
+function saveDeletedAccountKeys(arr){localStorage.setItem(DELETED_ACCOUNTS_KEY,JSON.stringify(arr));}
+
+function getEffectiveGuestDisplayName(){
+    const gid=ensureGuestHas4DigitId();
+    const clean=(customGuestName||"").trim();
+    if(clean)return clean;
+    return `Pilot #${gid}`;
 }
 
-function idbMirrorDelete(key) {
-    openLocalIDB().then(db => {
-        const tx = db.transaction('kv', 'readwrite');
-        tx.objectStore('kv').delete(key);
-    }).catch(() => {});
+function getEffectiveGuestFullLabel(){
+    const gid=ensureGuestHas4DigitId();
+    const clean=(customGuestName||"").trim();
+    return clean?`${clean} (#${gid})`:`Pilot #${gid}`;
 }
 
-async function restoreFromIndexedDBIfNeeded() {
-    try {
-        const db = await openLocalIDB();
-        const allKv = await new Promise(res => {
-            const req = db.transaction('kv', 'readonly').objectStore('kv').getAll();
-            req.onsuccess = () => res(req.result || []);
-            req.onerror = () => res([]);
-        });
-        let restored = false;
-        allKv.forEach(item => {
-            if (!item || !item.key || !item.val) return;
-            const cur = lsGet(item.key, null);
-            if (!cur || (item.key === STORAGE_ACCOUNTS_KEY && cur === '{}')) {
-                try { localStorage.setItem(item.key, item.val); restored = true; } catch (e) {}
+function getActiveAccountStorageKey(){
+    if(currentPilot.isCore)return currentPilot.id;
+    return `GUEST_ID_${ensureGuestHas4DigitId()}`;
+}
+
+function getActiveAccountStats(){
+    const db=getAccountsDatabase();
+    return db[getActiveAccountStorageKey()]||{bestScore:0,bestEpoch:1,totalFlashes:0,completedEpoch250:false};
+}
+
+function saveActiveAccountStats(scoreVal,epochVal,flashesVal){
+    const db=getAccountsDatabase();
+    const key=getActiveAccountStorageKey();
+    const prev=db[key]||{bestScore:0,bestEpoch:1,totalFlashes:0,completedEpoch250:false};
+    const dispName=currentPilot.isCore?currentPilot.name:getEffectiveGuestFullLabel();
+    const maxEp=Math.max(prev.bestEpoch||1,epochVal);
+    db[key]={
+        id:currentPilot.isCore?currentPilot.id:key,
+        guestId:currentPilot.isCore?"":ensureGuestHas4DigitId(),
+        name:dispName,isCore:currentPilot.isCore,
+        bestScore:Math.max(prev.bestScore||0,scoreVal),
+        bestEpoch:maxEp,
+        totalFlashes:(prev.totalFlashes||0)+flashesVal,
+        completedEpoch250:Boolean(prev.completedEpoch250||maxEp>250),
+        updatedAt:Date.now()
+    };
+    saveAccountsDatabase(db);
+    refreshAccountStatsUI();
+}
+
+function syncAutoBiomeButtonUI(){
+    const btn=document.getElementById('autoBiomeToggleBtn');
+    if(!btn)return;
+    btn.innerText=autoCycleBiomes?"🔄 Auto-Cycle: ON":"🔄 Auto-Cycle: OFF";
+    btn.className=autoCycleBiomes
+        ?"px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] mono-num font-bold cursor-pointer shrink-0"
+        :"px-2.5 py-1 rounded bg-gray-800 text-gray-300 border border-gray-600 text-[10px] mono-num font-bold cursor-pointer shrink-0";
+}
+
+function saveSettingsForActiveAccount(){
+    if(isApplyingAccountSettings)return;
+    try{
+        const allSet=JSON.parse(localStorage.getItem(SETTINGS_PER_ACC_KEY)||'{}');
+        allSet[getActiveAccountStorageKey()]={
+            diff:currentDiffKey,
+            liveryId:activeLiveryProfile.id,
+            biomeIdx,autoCycleBiomes,
+            audio:{...audioSettings},
+            gfx:{...gfxSettings},
+            ctrl:{
+                mobileMode:controlConfig.mobileMode,
+                doubleTapNitro:controlConfig.doubleTapNitro,
+                invertGyro:controlConfig.invertGyro,
+                gyroSensitivity:controlConfig.gyroSensitivity,
+                binds:JSON.parse(JSON.stringify(controlConfig.binds))
             }
-        });
-        if (restored) {
-            const accs = lsGetJson(STORAGE_ACCOUNTS_KEY, null);
-            if (accs && typeof accs === 'object') {
-                Object.entries(accs).forEach(([u, a]) => {
-                    const norm = normalizeAccountRecord(a, u);
-                    if (norm && !accountsCache[u]) accountsCache[u] = norm;
+        };
+        localStorage.setItem(SETTINGS_PER_ACC_KEY,JSON.stringify(allSet));
+    }catch(e){}
+}
+// ==================== END OF CHUNK 1 OF 6 ====================
+// ==================== START OF CHUNK 2 OF 6 ====================
+function loadOrResetSettingsForActiveAccount(){
+    isApplyingAccountSettings=true;
+    try{
+        const allSet=JSON.parse(localStorage.getItem(SETTINGS_PER_ACC_KEY)||'{}');
+        const saved=allSet[getActiveAccountStorageKey()];
+        if(saved){
+            setDifficulty(saved.diff||'easy');
+            if(saved.liveryId&&(currentPilot.id==='1117'||saved.liveryId===currentPilot.id)){
+                activeLiveryProfile=PILOT_PROFILES[saved.liveryId]||currentPilot;
+            }else{
+                activeLiveryProfile=currentPilot;
+            }
+            biomeIdx=isBiomeUnlockedForPilot(saved.biomeIdx||0)?(saved.biomeIdx||0):0;
+            autoCycleBiomes=saved.autoCycleBiomes!==undefined?Boolean(saved.autoCycleBiomes):true;
+            syncAutoBiomeButtonUI();
+            setTextCached('hudBiomeName',BIOME_THEMES[biomeIdx].label);
+            if(saved.audio){
+                ['master','music','menuMusic','engine','sfx','uiClick'].forEach(ch=>{
+                    if(saved.audio[ch]!==undefined)updateVolumeSetting(ch,Math.round(saved.audio[ch]*100));
                 });
-                validateAndSanitizeDatabase();
-                refreshAllLiveViews();
+                selectOstMode(saved.audio.ostMode==='mitadru'&&currentPilot.id!=='1117'?'synth':(saved.audio.ostMode||'synth'));
             }
+            if(saved.ctrl){
+                setMobileControlMode(saved.ctrl.mobileMode||'buttons');
+                applyDoubleTapNitroState(saved.ctrl.doubleTapNitro!==false);
+                controlConfig.invertGyro=Boolean(saved.ctrl.invertGyro);
+                const invBtn=document.getElementById('invertGyroBtn');
+                if(invBtn){
+                    invBtn.innerText=`⇄ Flip Axis: ${controlConfig.invertGyro?'ON':'OFF'}`;
+                    invBtn.className=controlConfig.invertGyro?"px-2 py-1 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] mono-num font-bold cursor-pointer":"px-2 py-1 rounded bg-[#182032] hover:bg-[#232f47] text-gray-200 border border-gray-600/40 text-[10px] mono-num font-bold cursor-pointer";
+                }
+                updateGyroSpeedSetting(Math.round((saved.ctrl.gyroSensitivity||0.65)*100));
+                if(saved.ctrl.binds)controlConfig.binds=saved.ctrl.binds;
+                refreshKeybindLabels();
+            }
+            if(saved.gfx){
+                applyGraphicsPreset(saved.gfx.preset||'medium',false);
+                if(saved.gfx.resScale)updateGfxResolution(Math.round(saved.gfx.resScale*100),false);
+                if(saved.gfx.roadSlices)updateGfxDrawSlices(saved.gfx.roadSlices,false);
+                if(saved.gfx.particles!==undefined)updateGfxParticles(Math.round(saved.gfx.particles*100),false);
+                ['bloom','shake','transitions','scanlines','pillars','reflections','speedLines','hudBoxes'].forEach(k=>{
+                    if(saved.gfx[k]!==undefined)applyGfxOptionState(k,saved.gfx[k],false);
+                });
+                setVisualFilter(saved.gfx.filter||'filter-standard',false);
+            }
+        }else{
+            resetGameSettingsOnly();
+            resetSoundSettingsOnly();
+            resetControlSettingsOnly();
+            resetGraphicsSettingsOnly();
         }
-    } catch (e) {}
+    }catch(e){}
+    isApplyingAccountSettings=false;
+    saveSettingsForActiveAccount();
 }
 
-(function purgeLegacyV3DataOnce() {
-    if (lsGet(STORAGE_V4_RESET_DONE, '') === '1') return;
-    ['roadsense_v3_accounts','roadsense_v3_dev_uid','roadsense_v3_active_uid','roadsense_v3_last_logout_uid','roadsense_v3_first_boot_done','roadsense_v3_global_settings','roadsense_v3_season_state','roadsense_v3_lb_alltime','roadsense_v3_lb_season','roadsense_v3_alltime_champ_uid'].forEach(lsRemove);
-    try { if ('indexedDB' in window && indexedDB.deleteDatabase) indexedDB.deleteDatabase('RoadSenseCustomSongsDB_v3'); } catch (e) {}
-    lsSet(STORAGE_V4_RESET_DONE, '1');
-})();
+function refreshAccountStatsUI(){
+    const st=getActiveAccountStats();
+    setTextCached('bootHighScore',(st.bestScore||0).toLocaleString());
+    setTextCached('bootBestEpoch',`Epoch ${st.bestEpoch||1}`);
+    setTextCached('bootTotalFlashes',(st.totalFlashes||0).toLocaleString());
+}
 
-// =========================================================================
-// 2. ALL-IN-ONE CHROMA & FX SKIN DEFINITIONS
-// =========================================================================
-const SEASON_FX_SKINS = [
-    { id: 'standard',     name: 'Standard Overdrive', desc: 'Custom colors with Mach shock-ring Nitro afterburner.', tier: 'permanent', allInOne: false, cardClass: '' },
-    { id: 'void_chroma',  name: 'Void Prismatic FX',  desc: 'ALL-IN-ONE full-spectrum chroma chassis, rails, EMP & Hyper-Void Singularity afterburner.', tier: 'alltime1', allInOne: true, cardClass: 'skin-card-void' },
-    { id: 'aether_helix', name: 'Aether Ribbon',      desc: 'ALL-IN-ONE cryo-aurora chroma body, rails, EMP & twin-helix plasma streams.', tier: 'top5', allInOne: true, cardClass: 'skin-card-aether' },
-    { id: 'solar_crown',  name: 'Solar Crown',        desc: 'ALL-IN-ONE molten solar-gold chroma body, rails, EMP & Mach shock-diamond flare.', tier: 'top5', allInOne: true, cardClass: 'skin-card-solar' },
-    { id: 'chrono_arc',   name: 'Chrono Arc',         desc: 'ALL-IN-ONE quantum-emerald chroma body, rails, EMP & chronometric ion warp rings.', tier: 'top5', allInOne: true, cardClass: 'skin-card-chrono' }
+function showLoginBanner(msg,ok=true){
+    const b=document.getElementById('loginFeedbackBanner');
+    if(!b)return;
+    b.className=ok
+        ?"text-[10.5px] font-semibold px-2.5 py-1 rounded-lg bg-emerald-950/90 text-emerald-300 border border-emerald-500/40 block"
+        :"text-[10.5px] font-semibold px-2.5 py-1 rounded-lg bg-red-950/90 text-red-300 border border-red-500/40 block";
+    b.innerText=msg;
+}
+
+function loginPilotById(){
+    const input=document.getElementById('pilotIdInput');
+    const gInput=document.getElementById('guestCallsignInput');
+    let raw=(input?input.value:'').trim();
+    const typedName=(gInput?gInput.value:'').trim();
+    if(!raw){
+        raw=generateRandomGuest4DigitId();
+    }else if(!/^\d{4}$/.test(raw)){
+        showLoginBanner("✕ Enter a 4-digit numeric ID (or leave blank for Auto-ID).",false);
+        playGameSfx('hit');
+        return;
+    }
+    isAccountSessionLocked=true;
+    localStorage.setItem('roadSense_overdrive_accountLocked','true');
+    if(PILOT_PROFILES[raw]&&raw!=="GUEST"){
+        customGuestId="";
+        localStorage.removeItem('roadSense_overdrive_customGuestId');
+        applyPilotProfile(raw);
+        if(input)input.value='';
+        showLoginBanner(`✓ Core Pilot Authenticated: ${currentPilot.name}`,true);
+        playGameSfx('pickup');
+    }else{
+        customGuestId=raw;
+        localStorage.setItem('roadSense_overdrive_customGuestId',customGuestId);
+        const db=getAccountsDatabase();
+        const existingAcc=db[`GUEST_ID_${customGuestId}`];
+        if(typedName){
+            customGuestName=typedName;
+        }else if(existingAcc&&existingAcc.name&&!existingAcc.name.startsWith('Pilot #')){
+            customGuestName=existingAcc.name.replace(/\s*\(#\d{4}\)$/,'');
+        }else{
+            customGuestName="";
+        }
+        localStorage.setItem('roadSense_overdrive_guestName',customGuestName);
+        applyPilotProfile("GUEST");
+        if(input)input.value='';
+        showLoginBanner(`✓ Guest Account Logged In: ${getEffectiveGuestFullLabel()}`,true);
+        playGameSfx('pickup');
+    }
+}
+
+function confirmGuestAccountLogin(){
+    const idInput=document.getElementById('pilotIdInput');
+    const gInput=document.getElementById('guestCallsignInput');
+    const rawId=(idInput?idInput.value:'').trim();
+    if(rawId&&/^\d{4}$/.test(rawId)){
+        loginPilotById();
+        return;
+    }
+    ensureGuestHas4DigitId();
+    if(gInput)updateGuestCallsign(gInput.value);
+    isAccountSessionLocked=true;
+    localStorage.setItem('roadSense_overdrive_accountLocked','true');
+    applyPilotProfile("GUEST");
+    showLoginBanner(`✓ Guest Session Active: ${getEffectiveGuestFullLabel()}`,true);
+    playGameSfx('pickup');
+}
+
+function openSwitchAccountRow(){
+    isAccountSessionLocked=false;
+    localStorage.setItem('roadSense_overdrive_accountLocked','false');
+    customGuestId=generateRandomGuest4DigitId();
+    customGuestName="";
+    localStorage.setItem('roadSense_overdrive_customGuestId',customGuestId);
+    localStorage.removeItem('roadSense_overdrive_guestName');
+    const gInput=document.getElementById('guestCallsignInput');
+    const idInput=document.getElementById('pilotIdInput');
+    if(gInput)gInput.value="";
+    if(idInput){idInput.value="";idInput.placeholder=customGuestId;}
+    applyPilotProfile("GUEST");
+    showLoginBanner(`⇄ New Guest ID Assigned: #${customGuestId} (Or enter custom 4-digit ID / Name).`,true);
+}
+
+function updateGuestCallsign(val){
+    customGuestName=(val||"").trim();
+    localStorage.setItem('roadSense_overdrive_guestName',customGuestName);
+    if(!currentPilot.isCore){
+        const fullLbl=getEffectiveGuestFullLabel();
+        document.getElementById('activePilotLabel').innerText=fullLbl;
+        document.getElementById('hudPilotCallsign').innerText=fullLbl.toUpperCase();
+        const db=getAccountsDatabase();
+        const key=getActiveAccountStorageKey();
+        if(db[key]){db[key].name=fullLbl;saveAccountsDatabase(db);}
+        refreshAccountStatsUI();
+    }
+}
+
+function applyPilotProfile(idKey){
+    currentPilot=PILOT_PROFILES[idKey]||PILOT_PROFILES["GUEST"];
+    activeLiveryProfile=currentPilot;
+    localStorage.setItem('roadSense_overdrive_pilotId',currentPilot.id);
+    if(currentPilot.isCore){
+        isAccountSessionLocked=true;
+        localStorage.setItem('roadSense_overdrive_accountLocked','true');
+    }else{
+        ensureGuestHas4DigitId();
+    }
+    if(currentPilot.id==="1117")devAllDimensionsUnlocked=true;
+    loadOrResetSettingsForActiveAccount();
+    const dispLabel=currentPilot.isCore?currentPilot.name:getEffectiveGuestFullLabel();
+    const displayCallsign=currentPilot.isCore?currentPilot.callsign:dispLabel.toUpperCase();
+    document.getElementById('activePilotLabel').innerText=dispLabel;
+    document.getElementById('activeLiveryBadge').innerText=activeLiveryProfile.liveryName;
+    document.getElementById('activePilotColorDot').style.backgroundColor=activeLiveryProfile.dotColor;
+    document.getElementById('hudPilotCallsign').innerText=displayCallsign;
+    document.getElementById('hudPilotDot').style.backgroundColor=activeLiveryProfile.dotColor;
+
+    const loginRow=document.getElementById('pilotLoginInputRow');
+    const switchBtn=document.getElementById('switchAccountBtn');
+    if(isAccountSessionLocked||currentPilot.isCore){
+        if(loginRow)loginRow.classList.add('hidden');
+        if(switchBtn)switchBtn.classList.remove('hidden');
+    }else{
+        if(loginRow)loginRow.classList.remove('hidden');
+        if(switchBtn)switchBtn.classList.add('hidden');
+        const gInput=document.getElementById('guestCallsignInput');
+        const idInput=document.getElementById('pilotIdInput');
+        if(gInput)gInput.value=customGuestName;
+        if(idInput)idInput.placeholder=customGuestId||"Auto";
+    }
+
+    const devTabBtn=document.getElementById('setTabBtn_dev');
+    const navGrid=document.getElementById('settingsTabNavGrid');
+    const hudRefillBtn=document.getElementById('hudDevRefillBtn');
+    if(currentPilot.id==="1117"){
+        if(devTabBtn)devTabBtn.classList.remove('hidden');
+        if(navGrid)navGrid.className="px-3 py-1.5 bg-[#090b10] border-b border-[#232836] grid grid-cols-5 gap-1.5 shrink-0";
+        if(hudRefillBtn)hudRefillBtn.classList.remove('hidden');
+    }else{
+        if(devTabBtn)devTabBtn.classList.add('hidden');
+        if(navGrid)navGrid.className="px-3 py-1.5 bg-[#090b10] border-b border-[#232836] grid grid-cols-4 gap-1.5 shrink-0";
+        if(hudRefillBtn)hudRefillBtn.classList.add('hidden');
+    }
+
+    const ostBadge=document.getElementById('mitadruOstBadge');
+    if(ostBadge)ostBadge.innerText=currentPilot.id==="1117"?"UNLOCKED":"ID 1117";
+
+    refreshAccountStatsUI();
+    buildVehicleLiverySelector();
+    buildBiomeSelectorGrid();
+    loadCustomSongForActivePilot();
+    syncDevDimensionsButtonLabel();
+}
+
+function buildVehicleLiverySelector(){
+    const container=document.getElementById('vehicleLiveryGrid');
+    const hint=document.getElementById('liveryAccessHint');
+    if(!container)return;
+    const isArch=(currentPilot.id==="1117");
+    if(hint)hint.innerText=isArch?"👑 ID 1117: All Liveries Unlocked":`Assigned: ${activeLiveryProfile.liveryName}`;
+    container.innerHTML=["1117","1183","1134","1075","1174","GUEST"].map(k=>{
+        const p=PILOT_PROFILES[k];
+        const unlocked=isArch||(currentPilot.id===k);
+        const sel=(activeLiveryProfile.id===k);
+        if(!unlocked)return `<button type="button" disabled class="px-2 py-1.5 rounded-lg text-[10px] font-semibold text-left truncate border bg-[#0b0d14] border-[#1b202e] text-gray-600 opacity-55 cursor-not-allowed">🔒 ${p.liveryName}</button>`;
+        return `<button type="button" onclick="selectVehicleLivery('${k}')" class="px-2 py-1.5 rounded-lg text-[10px] font-bold text-left truncate cursor-pointer border flex items-center gap-1.5 ${sel?'bg-sky-500/25 border-sky-400 text-white':'bg-[#121621] border-[#22293a] text-gray-300 hover:text-white'}"><span class="w-2 h-2 rounded-full shrink-0" style="background:${p.dotColor}"></span><span class="truncate">${p.liveryName}</span></button>`;
+    }).join('');
+}
+
+function selectVehicleLivery(k){
+    if(currentPilot.id!=="1117"&&currentPilot.id!==k)return;
+    activeLiveryProfile=PILOT_PROFILES[k]||currentPilot;
+    document.getElementById('activeLiveryBadge').innerText=activeLiveryProfile.liveryName;
+    document.getElementById('activePilotColorDot').style.backgroundColor=activeLiveryProfile.dotColor;
+    document.getElementById('hudPilotDot').style.backgroundColor=activeLiveryProfile.dotColor;
+    buildVehicleLiverySelector();
+    saveSettingsForActiveAccount();
+}
+
+const BIOME_THEMES=[
+    {label:"🌌 Cyber Void",unlockEpoch:1,horizonType:"cyber",skyTop:"#03050a",skyBot:"#0d1b38",roadDark:"#0b0e17",roadLight:"#111624",curb:"#38bdf8",sun:"#38bdf8",weather:"none"},
+    {label:"🌧️ Monsoon Glare",unlockEpoch:10,horizonType:"monsoon",skyTop:"#04080e",skyBot:"#132a2e",roadDark:"#080d12",roadLight:"#0e161f",curb:"#10b981",sun:"#10b981",weather:"rain"},
+    {label:"🔥 Solar Overdrive",unlockEpoch:20,horizonType:"solar",skyTop:"#14040d",skyBot:"#3b0d24",roadDark:"#140914",roadLight:"#1d0e1e",curb:"#f59e0b",sun:"#f97316",weather:"embers"},
+    {label:"❄️ Cryo-Singularity",unlockEpoch:30,horizonType:"cryo",skyTop:"#020b18",skyBot:"#0c3559",roadDark:"#0a1626",roadLight:"#102138",curb:"#7dd3fc",sun:"#e0f2fe",weather:"snow"},
+    {label:"☣️ Bio-Luminescent",unlockEpoch:40,horizonType:"bio",skyTop:"#021008",skyBot:"#0a2e1c",roadDark:"#07140e",roadLight:"#0c2117",curb:"#4ade80",sun:"#22c55e",weather:"spores"},
+    {label:"🩸 Crimson Eclipse",unlockEpoch:50,horizonType:"eclipse",skyTop:"#090204",skyBot:"#2d0610",roadDark:"#120508",roadLight:"#1c090e",curb:"#f43f5e",sun:"#e11d48",weather:"embers"},
+    {label:"⚡ Tachyon Storm",unlockEpoch:60,horizonType:"tachyon",skyTop:"#090418",skyBot:"#261054",roadDark:"#0e081c",roadLight:"#160d2b",curb:"#c084fc",sun:"#eab308",weather:"rain"},
+    {label:"🏜️ Dune Mirage 2077",unlockEpoch:70,horizonType:"dune",skyTop:"#1c0d02",skyBot:"#452108",roadDark:"#1a1109",roadLight:"#26190d",curb:"#fbbf24",sun:"#f59e0b",weather:"spores"},
+    {label:"🌸 Neo-Tokyo Sakura",unlockEpoch:80,horizonType:"sakura",skyTop:"#0d0417",skyBot:"#2e0c38",roadDark:"#12091c",roadLight:"#1b0e29",curb:"#f472b6",sun:"#ec4899",weather:"petals"},
+    {label:"🟢 Matrix Kernel",unlockEpoch:90,horizonType:"matrix",skyTop:"#000802",skyBot:"#03220a",roadDark:"#020d05",roadLight:"#05180a",curb:"#22c55e",sun:"#4ade80",weather:"matrix"},
+    {label:"🪐 Saturn Rings Orbit",unlockEpoch:100,horizonType:"saturn",skyTop:"#020308",skyBot:"#111833",roadDark:"#080b14",roadLight:"#101526",curb:"#818cf8",sun:"#6366f1",weather:"none"},
+    {label:"🌋 Magma Caldera",unlockEpoch:110,horizonType:"magma",skyTop:"#140300",skyBot:"#3d0e02",roadDark:"#170704",roadLight:"#240c06",curb:"#fb923c",sun:"#ef4444",weather:"embers"},
+    {label:"⚪ Astral Monolith",unlockEpoch:120,horizonType:"astral",skyTop:"#090b10",skyBot:"#1e2433",roadDark:"#0e1117",roadLight:"#171b24",curb:"#e2e8f0",sun:"#f8fafc",weather:"snow"},
+    {label:"✨ Cosmic Singularity (Ep 250)",unlockEpoch:251,horizonType:"cosmic250",isEpoch250Special:true,skyTop:"#02000a",skyBot:"#14042d",roadDark:"#070214",roadLight:"#12052c",curb:"#00f5d4",sun:"#ff007f",weather:"cosmic"}
 ];
-const SEASONAL_TOP5_SKIN_CYCLE = ['aether_helix', 'solar_crown', 'chrono_arc'];
-function getSeasonFeaturedSkin(sNum) {
-    const id = SEASONAL_TOP5_SKIN_CYCLE[(Math.max(1, sNum) - 1) % SEASONAL_TOP5_SKIN_CYCLE.length];
-    return SEASON_FX_SKINS.find(s => s.id === id) || SEASON_FX_SKINS[2];
+
+const EPOCH_250_INDEX=13;
+const EPOCH_250_LENGTH_M=800;
+let biomeIdx=0,autoCycleBiomes=true;
+
+function isBiomeUnlockedForPilot(idx){
+    if(currentPilot.id==="1117")return devAllDimensionsUnlocked?true:(idx===0);
+    const b=BIOME_THEMES[idx];
+    if(!b)return false;
+    const st=getActiveAccountStats();
+    const maxReached=Math.max(st.bestEpoch||1,gameState.epoch||1);
+    if(b.isEpoch250Special)return Boolean(st.completedEpoch250||maxReached>=251);
+    return maxReached>=(b.unlockEpoch||1);
 }
 
-function getSkinChromaPalette(skinId, cust, now) {
-    if (skinId === 'void_chroma') {
-        const h1 = (now * 0.14) % 360, h2 = (h1 + 118) % 360, h3 = (h1 + 235) % 360;
-        return {
-            isAllInOne: true,
-            primaryGlow: `hsl(${h1},100%,60%)`, secondaryGlow: `hsl(${h2},100%,64%)`, tertiaryGlow: `hsl(${h3},100%,68%)`,
-            bodyTint: `hsla(${h1},95%,54%,0.44)`, bodyMidTint: `hsla(${h2},95%,48%,0.34)`,
-            canopyTop: `hsl(${h2},96%,72%)`, canopyMid: `hsla(${h3},85%,24%,0.92)`,
-            tailColor: `hsl(${h1},100%,62%)`, railColor: `hsl(${h1},100%,60%)`, railFill: `hsla(${h1},95%,58%,0.14)`,
-            empPrimary: `hsl(${h1},100%,60%)`, empSecondary: `hsl(${h2},100%,66%)`, empFlash: `hsla(${h2},95%,58%,0.30)`,
-            underglow: `hsla(${h1},100%,58%,0.46)`, radarDot: `hsl(${h1},100%,64%)`
-        };
+function buildBiomeSelectorGrid(){
+    const container=document.getElementById('biomeGridSelector');
+    if(!container)return;
+    container.innerHTML=BIOME_THEMES.map((b,idx)=>{
+        const unlocked=isBiomeUnlockedForPilot(idx);
+        const active=(idx===biomeIdx);
+        const lockText=b.isEpoch250Special?"🔒 Survive Ep 250":`🔒 Ep ${b.unlockEpoch}`;
+        if(!unlocked)return `<button type="button" disabled class="px-2 py-1.5 rounded-lg text-[10px] font-semibold text-left truncate border bg-[#0b0d14] border-[#1b202e] text-gray-600 opacity-60 cursor-not-allowed">${lockText} • ${b.label}</button>`;
+        return `<button type="button" onclick="selectManualBiome(${idx})" class="biome-btn px-2 py-1.5 rounded-lg text-[10px] font-semibold text-left truncate cursor-pointer border ${active?'bg-sky-500/25 border-sky-400 text-white':'bg-[#121621] border-[#22293a] text-gray-300 hover:text-white'}">${b.label}</button>`;
+    }).join('');
+}
+
+function selectManualBiome(idx){
+    if(!isBiomeUnlockedForPilot(idx))return;
+    biomeIdx=idx%BIOME_THEMES.length;
+    cachedGradients.key='';
+    autoCycleBiomes=false;
+    syncAutoBiomeButtonUI();
+    setTextCached('hudBiomeName',BIOME_THEMES[biomeIdx].label);
+    buildBiomeSelectorGrid();
+    saveSettingsForActiveAccount();
+}
+
+function toggleAutoBiomeCycle(){
+    autoCycleBiomes=!autoCycleBiomes;
+    syncAutoBiomeButtonUI();
+    saveSettingsForActiveAccount();
+}
+
+const audioSettings={master:0.95,music:0.90,menuMusic:0.85,engine:0.80,sfx:0.92,uiClick:0.85,ostMode:'synth'};
+let audioCtx=null,masterGainNode=null,musicBusNode=null,sfxBusNode=null,engineOsc1=null,engineOsc2=null,engineGain=null,synthLoopTimer=null,synthStep=0,menuStep=0;
+let nextSynthNoteTime=0,nextMenuNoteTime=0,hasTrustedGesture=false,isBootSplashDismissed=false;
+const lastSfxTime={};
+
+const MENU_ARP_NOTES=[293.66,349.23,440.00,587.33,523.25,440.00,349.23,293.66,261.63,349.23,440.00,523.25,440.00,349.23,329.63,293.66];
+const MENU_BASS_NOTES=[73.42,73.42,87.31,87.31,65.41,65.41,110.00,98.00];
+const GAME_BASS_NOTES=[73.42,73.42,146.83,73.42,87.31,87.31,98.00,110.00,73.42,73.42,146.83,73.42,116.54,116.54,110.00,98.00];
+const GAME_ARP_NOTES=[293.66,349.23,440.00,587.33,523.25,440.00,349.23,440.00,293.66,349.23,466.16,587.33,659.25,587.33,440.00,349.23];
+
+function buildMenuAutoplayWavUrl(){
+    const sr=22050,stepSec=0.135,steps=16,stepSamples=Math.floor(sr*stepSec),totalSamples=stepSamples*steps;
+    const buf=new ArrayBuffer(44+totalSamples*2),view=new DataView(buf);
+    const writeStr=(off,s)=>{for(let i=0;i<s.length;i++)view.setUint8(off+i,s.charCodeAt(i));};
+    writeStr(0,'RIFF');view.setUint32(4,36+totalSamples*2,true);writeStr(8,'WAVE');writeStr(12,'fmt ');
+    view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);
+    view.setUint32(24,sr,true);view.setUint32(28,sr*2,true);view.setUint16(32,2,true);view.setUint16(34,16,true);
+    writeStr(36,'data');view.setUint32(40,totalSamples*2,true);
+    let offset=44;
+    for(let s=0;s<steps;s++){
+        const note=MENU_ARP_NOTES[s],bNote=MENU_BASS_NOTES[(s>>1)%MENU_BASS_NOTES.length];
+        for(let i=0;i<stepSamples;i++){
+            const t=i/sr,att=Math.min(1,t/0.008),dec=Math.exp(-t*13);
+            const tri=(2/Math.PI)*Math.asin(Math.sin(t*note*Math.PI*2));
+            let sample=(tri*0.60+Math.sin(t*note*0.5*Math.PI*2)*0.40)*0.24*att*dec;
+            if(s%2===0){
+                const bFund=Math.sin(t*bNote*Math.PI*2);
+                const bHarm=Math.sin(t*bNote*2*Math.PI*2)*0.45+Math.sin(t*bNote*3*Math.PI*2)*0.20;
+                sample+=(bFund*0.65+bHarm*0.35)*0.20*att*Math.exp(-t*11);
+            }
+            const clamped=Math.max(-0.95,Math.min(0.95,sample));
+            view.setInt16(offset,Math.floor(clamped*32767),true);
+            offset+=2;
+        }
     }
-    if (skinId === 'aether_helix') {
-        const w = Math.sin(now * 0.0032), h1 = 186 + w * 34, h2 = 258 - w * 32;
-        return {
-            isAllInOne: true,
-            primaryGlow: `hsl(${h1},98%,62%)`, secondaryGlow: `hsl(${h2},96%,70%)`, tertiaryGlow: '#e0f2fe',
-            bodyTint: `hsla(${h1},90%,48%,0.40)`, bodyMidTint: `hsla(${h2},86%,44%,0.32)`,
-            canopyTop: `hsl(${h1},100%,78%)`, canopyMid: `hsla(${h2},75%,22%,0.92)`,
-            tailColor: `hsl(${h2},100%,68%)`, railColor: `hsl(${h1},98%,62%)`, railFill: `hsla(${h1},92%,56%,0.13)`,
-            empPrimary: `hsl(${h1},100%,62%)`, empSecondary: `hsl(${h2},98%,72%)`, empFlash: `hsla(${h1},95%,60%,0.26)`,
-            underglow: `hsla(${h1},95%,58%,0.42)`, radarDot: `hsl(${h1},100%,66%)`
-        };
+    return URL.createObjectURL(new Blob([buf],{type:'audio/wav'}));
+}
+
+const menuUnlockAudio=document.createElement('audio');
+menuUnlockAudio.id='mainMenuLoopAudio';
+menuUnlockAudio.src=buildMenuAutoplayWavUrl();
+menuUnlockAudio.loop=true;
+menuUnlockAudio.preload='auto';
+menuUnlockAudio.playsInline=true;
+menuUnlockAudio.setAttribute('playsinline','');
+menuUnlockAudio.setAttribute('webkit-playsinline','');
+menuUnlockAudio.style.display='none';
+
+function mountMenuAudioToMainPage(){
+    const host=document.getElementById('startModal')||document.body;
+    if(host&&!document.getElementById('mainMenuLoopAudio')){
+        host.appendChild(menuUnlockAudio);
     }
-    if (skinId === 'solar_crown') {
-        const w = Math.sin(now * 0.0036), h1 = 38 + w * 18, h2 = 6 + (1 - w) * 14;
-        return {
-            isAllInOne: true,
-            primaryGlow: `hsl(${h1},100%,58%)`, secondaryGlow: `hsl(${h2},100%,58%)`, tertiaryGlow: '#fef9c3',
-            bodyTint: `hsla(${h1},96%,48%,0.42)`, bodyMidTint: `hsla(${h2},92%,40%,0.32)`,
-            canopyTop: `hsl(${h1},100%,76%)`, canopyMid: `hsla(${h2},82%,20%,0.92)`,
-            tailColor: `hsl(${h2},100%,56%)`, railColor: `hsl(${h1},100%,58%)`, railFill: `hsla(${h1},96%,54%,0.13)`,
-            empPrimary: `hsl(${h1},100%,58%)`, empSecondary: `hsl(${h2},100%,60%)`, empFlash: `hsla(${h1},100%,56%,0.25)`,
-            underglow: `hsla(${h1},100%,54%,0.42)`, radarDot: `hsl(${h1},100%,62%)`
-        };
-    }
-    if (skinId === 'chrono_arc') {
-        const w = Math.sin(now * 0.0038), h1 = 152 + w * 24, h2 = 172 - w * 26;
-        return {
-            isAllInOne: true,
-            primaryGlow: `hsl(${h1},96%,54%)`, secondaryGlow: `hsl(${h2},100%,64%)`, tertiaryGlow: '#d1fae5',
-            bodyTint: `hsla(${h1},92%,42%,0.40)`, bodyMidTint: `hsla(${h2},88%,38%,0.30)`,
-            canopyTop: `hsl(${h2},100%,74%)`, canopyMid: `hsla(${h1},78%,16%,0.92)`,
-            tailColor: `hsl(${h1},100%,56%)`, railColor: `hsl(${h1},96%,54%)`, railFill: `hsla(${h1},94%,50%,0.13)`,
-            empPrimary: `hsl(${h1},98%,55%)`, empSecondary: `hsl(${h2},100%,68%)`, empFlash: `hsla(${h1},95%,52%,0.25)`,
-            underglow: `hsla(${h1},95%,52%,0.42)`, radarDot: `hsl(${h1},100%,60%)`
-        };
-    }
-    const sec = (cust && cust.bodySecondary) || '#38bdf8', emp = (cust && cust.empColor) || '#38bdf8', can = (cust && cust.canopyColor) || '#7dd3fc';
-    return {
-        isAllInOne: false,
-        primaryGlow: sec, secondaryGlow: emp, tertiaryGlow: '#e0f2fe',
-        bodyTint: colorWithAlpha(sec, 0.28), bodyMidTint: '#090d16',
-        canopyTop: can, canopyMid: '#0f172a',
-        tailColor: '#f43f5e', railColor: emp, railFill: colorWithAlpha(emp, 0.12),
-        empPrimary: emp, empSecondary: '#e0f2fe', empFlash: emp,
-        underglow: colorWithAlpha(sec, 0.34), radarDot: sec
+}
+mountMenuAudioToMainPage();
+
+function createAndMountBootSplashGate(){
+    if(document.getElementById('bootSplashGateModal'))return;
+    const wrapper=document.getElementById('gameViewportWrapper')||document.body;
+    const gate=document.createElement('div');
+    gate.id='bootSplashGateModal';
+    gate.className='absolute inset-0 bg-[#03050a]/95 z-[95] flex items-center justify-center p-4 select-none';
+    gate.innerHTML=`
+        <div class="hardware-panel modal-anim p-6 sm:p-8 rounded-2xl max-w-md w-full text-center space-y-4 border border-sky-500/40 shadow-[0_0_50px_rgba(14,165,233,0.25)]">
+            <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-[10px] mono-num font-extrabold uppercase tracking-widest">
+                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> SYSTEM ONLINE // AUDIO READY
+            </div>
+            <h1 class="title-cinzel text-xl sm:text-2xl font-black text-white tracking-wider">ROADSENSE: OVERDRIVE</h1>
+            <p class="text-xs text-gray-300 mono-num leading-relaxed">Neural Interceptor Telemetry &amp; Synth Audio Engine Ready.</p>
+            <button type="button" id="enterMainMenuGateBtn" class="btn-launch w-full py-3.5 px-6 rounded-xl text-sm sm:text-base font-extrabold uppercase tracking-wider cursor-pointer shadow-lg">
+                ▶ START / ENTER MAIN MENU
+            </button>
+            <div class="text-[10px] mono-num text-sky-300/80 uppercase tracking-wider">Tap button or press [ENTER] / [SPACE]</div>
+        </div>
+    `;
+    wrapper.appendChild(gate);
+    const startModalEl=document.getElementById('startModal');
+    if(startModalEl)startModalEl.style.display='none';
+
+    const triggerEnter=(ev)=>{
+        if(ev){
+            ev.stopPropagation();
+            if(ev.type==='keydown'&&ev.key!=='Enter'&&ev.key!==' ')return;
+        }
+        enterMainMenuFromSplash();
     };
-}
-
-// =========================================================================
-// 3. CANVAS, HARDWARE & HELPERS
-// =========================================================================
-const canvas = document.getElementById('gameCanvas');
-const ctx = canvas.getContext('2d', { alpha: false });
-const radarCanvas = document.getElementById('miniRadarCanvas');
-const rCtx = radarCanvas.getContext('2d');
-const garageCanvas = document.getElementById('garagePreviewCanvas');
-const gCtx = garageCanvas ? garageCanvas.getContext('2d') : null;
-
-const LANES = [-2, -1, 0, 1, 2];
-const LANE_WIDTH_M = 3.5;
-const EGO_Z_REAR = 1.24, EGO_Z_CENTER = 1.48, EGO_Z_FRONT = 1.78, EGO_HALF_LANE_W = 0.33;
-const EPOCH_250_INDEX = 13;
-const EPOCH_250_LENGTH_M = 800;
-
-let isMobileHardware = false, isHudHidden = false, isBootSplashDismissed = false;
-let hasTrustedGesture = false, isPortalExiting = false, mainMenuSplashGuardUntil = 0;
-let currentSettingsTab = 'game', currentLbTab = 'season', lbDevManageMode = false;
-let devGodModeActive = false, awaitingRebindAction = null;
-let garageNitroPreviewOn = true, garageEmpPreviewRadius = 0;
-let devRevealAllIds = false;
-const devRowRevealSet = new Set();
-let menuCruiseDist = 0;
-let colorSyncDebounceTimer = null;
-
-const revealState = { menuTag: false, menuUid: false, prevTag: false, prevUid: false, profTag: false, profUid: false };
-
-const domCache = {};
-function setTextCached(id, val) {
-    const s = String(val);
-    if (domCache[id] === s) return;
-    domCache[id] = s;
-    const el = document.getElementById(id);
-    if (el) el.innerText = s;
-}
-function setWidthCached(id, wStr) {
-    const k = id + '_w';
-    if (domCache[k] === wStr) return;
-    domCache[k] = wStr;
-    const el = document.getElementById(id);
-    if (el) el.style.width = wStr;
-}
-function escapeHtml(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-function formatUidSpaced(uid) {
-    const s = String(uid || '').replace(/\D/g, '');
-    return s.length !== 17 ? s : `${s.slice(0, 4)} ${s.slice(4, 8)} ${s.slice(8, 12)} ${s.slice(12)}`;
-}
-function showToast(msg, tone = 'info') {
-    const box = document.getElementById('toastContainer');
-    if (!box) return;
-    const el = document.createElement('div');
-    el.className = `toast-pill mono ${tone === 'ok' ? 'toast-ok' : (tone === 'err' ? 'toast-err' : '')}`;
-    el.innerText = msg;
-    box.appendChild(el);
-    while (box.children.length > 3) box.removeChild(box.firstChild);
-    setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 0.25s ease'; setTimeout(() => el.remove(), 260); }, 2500);
-}
-
-function copyTextReliable(text) {
-    const str = String(text || '');
-    if (!str) return Promise.resolve(false);
-    const execFallback = () => {
-        try {
-            const ta = document.createElement('textarea');
-            ta.value = str; ta.setAttribute('readonly', '');
-            ta.style.position = 'fixed'; ta.style.top = '0'; ta.style.left = '0';
-            ta.style.opacity = '0'; ta.style.pointerEvents = 'none';
-            document.body.appendChild(ta);
-            ta.focus(); ta.select(); ta.setSelectionRange(0, str.length);
-            const ok = document.execCommand('copy');
-            document.body.removeChild(ta);
-            return Boolean(ok);
-        } catch (e) { return false; }
-    };
-    if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
-        return navigator.clipboard.writeText(str).then(() => true).catch(() => execFallback());
+    gate.addEventListener('pointerdown',triggerEnter);
+    gate.addEventListener('click',triggerEnter);
+    const btn=gate.querySelector('#enterMainMenuGateBtn');
+    if(btn){
+        btn.addEventListener('pointerdown',triggerEnter);
+        btn.addEventListener('click',triggerEnter);
     }
-    return Promise.resolve(execFallback());
 }
 
-function copyUidDirect(uid, btnId) {
-    if (!uid) { showToast('No UID to copy.', 'err'); return; }
-    const btn = btnId ? document.getElementById(btnId) : null;
-    const orig = btn ? btn.innerText : '';
-    copyTextReliable(uid).then(ok => {
-        if (ok) {
-            if (btn) { btn.innerText = '✓ Copied'; setTimeout(() => { if (document.getElementById(btnId)) btn.innerText = orig; }, 1400); }
-            showToast(`Copied UID: ${uid}`, 'ok'); playSfx('pickup');
-        } else { showToast('Copy blocked by browser.', 'err'); playSfx('hit'); }
-    });
-}
-function copyCurrentAccountUid(btnId) { copyUidDirect(activeAccount ? activeAccount.uid : '', btnId); }
-function copyPrevAccountUid(btnId) { copyUidDirect(lastLoggedOutUid || '', btnId); }
-
-let confirmModalResolver = null;
-function askConfirm({ title, body, okLabel = 'Confirm', danger = true }) {
-    return new Promise(resolve => {
-        confirmModalResolver = resolve;
-        document.getElementById('confirmModalTitle').innerText = title || 'Confirm';
-        document.getElementById('confirmModalBody').innerText = body || '';
-        const okBtn = document.getElementById('confirmModalOkBtn');
-        okBtn.innerText = okLabel;
-        okBtn.className = danger ? 'btn btn-sm btn-danger' : 'btn btn-sm btn-sky active';
-        document.getElementById('confirmModal').style.display = 'flex';
-        syncCursorVisibility();
-    });
-}
-function resolveConfirmModal(accepted) {
-    document.getElementById('confirmModal').style.display = 'none';
-    const r = confirmModalResolver;
-    confirmModalResolver = null;
+function enterMainMenuFromSplash(){
+    if(isBootSplashDismissed)return;
+    isBootSplashDismissed=true;
+    hasTrustedGesture=true;
+    const gate=document.getElementById('bootSplashGateModal');
+    if(gate)gate.style.display='none';
+    const startModalEl=document.getElementById('startModal');
+    if(startModalEl)startModalEl.style.display='flex';
+    ensureAudioEngine();
+    tryStartMenuUnlockAudio();
+    playGameSfx('pickup');
     syncCursorVisibility();
-    if (r) r(Boolean(accepted));
 }
+// ==================== END OF CHUNK 2 OF 6 ====================
+// ==================== START OF CHUNK 3 OF 6 ====================
+let engineSubOsc=null,engineTurboOsc=null,engineTurboGain=null,engineFilterNode=null,engineRumbleLfo=null,engineRumbleGain=null;
 
-function detectDeviceHardware() {
-    const uaMob = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-    const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
-    isMobileHardware = Boolean(uaMob || coarse);
-    document.body.classList.toggle('is-mobile', isMobileHardware);
-    document.body.classList.toggle('is-pc', !isMobileHardware);
-    const ch = document.getElementById('ctrlPlatformHeaderLabel');
-    if (ch) ch.innerText = isMobileHardware ? 'MOBILE CONTROLS' : 'KEYBOARD CONTROLS';
-}
-
-// =========================================================================
-// 4. GLOBAL SETTINGS
-// =========================================================================
-const DIFFICULTY_PRESETS = {
-    easy:   { label: 'Easy',     speedMul: 0.72, spawnMeters: 32.0, hitboxScale: 0.78, scoreMul: 1.0, nitroRegen: 6.8, empRegen: 4.8, pickupSpacing: 21.0, pickupScale: 1.00 },
-    normal: { label: 'Normal',   speedMul: 0.84, spawnMeters: 26.5, hitboxScale: 0.84, scoreMul: 1.2, nitroRegen: 4.2, empRegen: 3.0, pickupSpacing: 25.0, pickupScale: 0.86 },
-    hard:   { label: 'Hard',     speedMul: 0.95, spawnMeters: 22.5, hitboxScale: 0.89, scoreMul: 1.5, nitroRegen: 2.3, empRegen: 1.6, pickupSpacing: 29.0, pickupScale: 0.74 },
-    void:   { label: 'Void Max', speedMul: 1.06, spawnMeters: 19.0, hitboxScale: 0.93, scoreMul: 2.0, nitroRegen: 1.1, empRegen: 0.7, pickupSpacing: 34.0, pickupScale: 0.62 }
-};
-
-const GRAPHICS_PRESETS = {
-    low:    { title: 'Low',    resScale: 0.75, roadSlices: 18, particles: 0.25, bloom: false, shake: false, transitions: true, scanlines: false, pillars: false, reflections: false, speedLines: false, hudBoxes: true, legacyModels: false },
-    medium: { title: 'Medium', resScale: 1.00, roadSlices: 26, particles: 0.65, bloom: true,  shake: true,  transitions: true, scanlines: false, pillars: true,  reflections: false, speedLines: false, hudBoxes: true, legacyModels: false },
-    high:   { title: 'High',   resScale: 1.25, roadSlices: 36, particles: 1.00, bloom: true,  shake: true,  transitions: true, scanlines: false, pillars: true,  reflections: true,  speedLines: true,  hudBoxes: true, legacyModels: false },
-    ultra:  { title: 'Ultra',  resScale: 1.50, roadSlices: 48, particles: 1.50, bloom: true,  shake: true,  transitions: true, scanlines: false, pillars: true,  reflections: true,  speedLines: true,  hudBoxes: true, legacyModels: false }
-};
-
-const GFX_TOGGLE_META = [
-    { k: 'bloom', lbl: '💡 Glow' }, { k: 'shake', lbl: '📳 Shake' }, { k: 'transitions', lbl: '🌀 FX Anim' },
-    { k: 'scanlines', lbl: '📺 Scanline' }, { k: 'pillars', lbl: '🏛️ Sky Art' }, { k: 'reflections', lbl: '✨ Road Sheen' },
-    { k: 'speedLines', lbl: '💨 Warp Lines' }, { k: 'hudBoxes', lbl: '📦 YOLO Boxes' }, { k: 'legacyModels', lbl: '👾 Legacy' }
-];
-
-const OPTIC_FILTER_META = [
-    { k: 'filter-standard',  lbl: 'Standard',     atmo: '' },
-    { k: 'filter-bw',        lbl: 'B&W Noir',     atmo: '' },
-    { k: 'filter-negative',  lbl: 'Negative',     atmo: '' },
-    { k: 'filter-warm',      lbl: 'Warm',         atmo: 'atmo-warm' },
-    { k: 'filter-vintage',   lbl: 'Vintage',      atmo: 'atmo-vintage' },
-    { k: 'filter-cinematic', lbl: 'Cinematic',    atmo: 'atmo-cinematic' },
-    { k: 'filter-nightvis',  lbl: 'Night Vision', atmo: 'atmo-nightvis' },
-    { k: 'filter-blueprint', lbl: 'Blueprint',    atmo: 'atmo-blueprint' }
-];
-const VALID_FILTERS = new Set(OPTIC_FILTER_META.map(f => f.k));
-
-function getDefaultGlobalSettings() {
-    return {
-        difficulty: 'easy', autoCycleBiomes: true, selectedBiomeIdx: 0,
-        audio: { master: 0.95, music: 0.90, menuMusic: 0.85, engine: 0.80, sfx: 0.92, uiClick: 0.85, ostMode: 'synth' },
-        controls: {
-            mobileMode: 'buttons', doubleTapNitro: true, invertGyro: false, gyroSensitivity: 0.65,
-            binds: { left: ['a', 'arrowleft'], right: ['d', 'arrowright'], nitro: ['shift', 'w', 'arrowup'], brake: ['s', 'arrowdown'], emp: [' ', 'e'], hideui: ['h'] }
-        },
-        graphics: {
-            preset: 'medium', filter: 'filter-standard', resScale: 1.00, roadSlices: 26, particles: 0.65,
-            bloom: true, shake: true, transitions: true, scanlines: false, pillars: true, reflections: false, speedLines: false, hudBoxes: true, legacyModels: false
-        }
-    };
-}
-
-let globalSettings = (() => {
-    const def = getDefaultGlobalSettings();
-    const r = lsGetJson(STORAGE_GLOBAL_CFG_KEY, null);
-    if (!r || typeof r !== 'object') return def;
-    return {
-        difficulty: DIFFICULTY_PRESETS[r.difficulty] ? r.difficulty : def.difficulty,
-        autoCycleBiomes: r.autoCycleBiomes !== undefined ? Boolean(r.autoCycleBiomes) : true,
-        selectedBiomeIdx: Math.max(0, Math.min(13, parseInt(r.selectedBiomeIdx, 10) || 0)),
-        audio: { ...def.audio, ...(r.audio || {}) },
-        controls: { ...def.controls, ...(r.controls || {}), binds: { ...def.controls.binds, ...((r.controls && r.controls.binds) || {}) } },
-        graphics: { ...def.graphics, ...(r.graphics || {}) }
-    };
-})();
-function saveGlobalSettings() { lsSet(STORAGE_GLOBAL_CFG_KEY, JSON.stringify(globalSettings)); }
-
-// =========================================================================
-// 5. 14 VIBRANT DIMENSIONS & VEHICLE PRESETS
-// =========================================================================
-const BIOME_THEMES = [
-    { label: '🌌 Cyber Void',         unlockEpoch: 1,   horizonType: 'cyber',     skyTop: '#03050a', skyBot: '#0d1b38', roadDark: '#0b0e17', roadLight: '#111624', curb: '#38bdf8', sun: '#38bdf8', weather: 'none' },
-    { label: '🌧️ Monsoon Glare',      unlockEpoch: 10,  horizonType: 'monsoon',   skyTop: '#04080e', skyBot: '#132a2e', roadDark: '#080d12', roadLight: '#0e161f', curb: '#10b981', sun: '#10b981', weather: 'rain' },
-    { label: '🔥 Solar Overdrive',    unlockEpoch: 20,  horizonType: 'solar',     skyTop: '#14040d', skyBot: '#3b0d24', roadDark: '#140914', roadLight: '#1d0e1e', curb: '#f59e0b', sun: '#f97316', weather: 'embers' },
-    { label: '❄️ Cryo-Singularity',   unlockEpoch: 30,  horizonType: 'cryo',      skyTop: '#020b18', skyBot: '#0c3559', roadDark: '#0a1626', roadLight: '#102138', curb: '#7dd3fc', sun: '#e0f2fe', weather: 'snow' },
-    { label: '☣️ Bio-Luminescent',    unlockEpoch: 40,  horizonType: 'bio',       skyTop: '#021008', skyBot: '#0a2e1c', roadDark: '#07140e', roadLight: '#0c2117', curb: '#4ade80', sun: '#22c55e', weather: 'spores' },
-    { label: '🩸 Crimson Eclipse',    unlockEpoch: 50,  horizonType: 'eclipse',   skyTop: '#090204', skyBot: '#2d0610', roadDark: '#120508', roadLight: '#1c090e', curb: '#f43f5e', sun: '#e11d48', weather: 'embers' },
-    { label: '⚡ Tachyon Storm',      unlockEpoch: 60,  horizonType: 'tachyon',   skyTop: '#090418', skyBot: '#261054', roadDark: '#0e081c', roadLight: '#160d2b', curb: '#c084fc', sun: '#eab308', weather: 'rain' },
-    { label: '🏜️ Dune Mirage 2077',   unlockEpoch: 70,  horizonType: 'dune',      skyTop: '#1c0d02', skyBot: '#452108', roadDark: '#1a1109', roadLight: '#26190d', curb: '#fbbf24', sun: '#f59e0b', weather: 'spores' },
-    { label: '🌸 Neo-Tokyo Sakura',   unlockEpoch: 80,  horizonType: 'sakura',    skyTop: '#0d0417', skyBot: '#2e0c38', roadDark: '#12091c', roadLight: '#1b0e29', curb: '#f472b6', sun: '#ec4899', weather: 'petals' },
-    { label: '🟢 Matrix Kernel',      unlockEpoch: 90,  horizonType: 'matrix',    skyTop: '#000802', skyBot: '#03220a', roadDark: '#020d05', roadLight: '#05180a', curb: '#22c55e', sun: '#4ade80', weather: 'matrix' },
-    { label: '🪐 Saturn Orbit',       unlockEpoch: 100, horizonType: 'saturn',    skyTop: '#020308', skyBot: '#111833', roadDark: '#080b14', roadLight: '#101526', curb: '#818cf8', sun: '#6366f1', weather: 'none' },
-    { label: '🌋 Magma Caldera',      unlockEpoch: 110, horizonType: 'magma',     skyTop: '#140300', skyBot: '#3d0e02', roadDark: '#170704', roadLight: '#240c06', curb: '#fb923c', sun: '#ef4444', weather: 'embers' },
-    { label: '⚪ Astral Monolith',    unlockEpoch: 120, horizonType: 'astral',    skyTop: '#090b10', skyBot: '#1e2433', roadDark: '#0e1117', roadLight: '#171b24', curb: '#e2e8f0', sun: '#f8fafc', weather: 'snow' },
-    { label: '✨ Cosmic Singularity', unlockEpoch: 251, horizonType: 'cosmic250', isEpoch250Special: true, skyTop: '#02000a', skyBot: '#14042d', roadDark: '#070214', roadLight: '#12052c', curb: '#00f5d4', sun: '#ff007f', weather: 'cosmic' }
-];
-let biomeIdx = 0;
-
-const DEFAULT_VEHICLE_CUST = {
-    bodyPrimary: '#1e293b', bodySecondary: '#38bdf8', canopyColor: '#7dd3fc',
-    empColor: '#38bdf8', boostColor: '#fbbf24', nitroSkin: 'standard'
-};
-const GARAGE_PRESETS = {
-    steel:    { bodyPrimary: '#1e293b', bodySecondary: '#38bdf8', canopyColor: '#7dd3fc', empColor: '#38bdf8', boostColor: '#fbbf24' },
-    cobalt:   { bodyPrimary: '#0f2544', bodySecondary: '#38bdf8', canopyColor: '#bae6fd', empColor: '#00f5d4', boostColor: '#38bdf8' },
-    crimson:  { bodyPrimary: '#360f18', bodySecondary: '#f43f5e', canopyColor: '#fda4af', empColor: '#ef4444', boostColor: '#fb923c' },
-    emerald:  { bodyPrimary: '#0b3024', bodySecondary: '#10b981', canopyColor: '#a7f3d0', empColor: '#10b981', boostColor: '#34d399' },
-    solar:    { bodyPrimary: '#33220a', bodySecondary: '#f59e0b', canopyColor: '#fde68a', empColor: '#f59e0b', boostColor: '#f97316' },
-    amethyst: { bodyPrimary: '#271242', bodySecondary: '#c084fc', canopyColor: '#e9d5ff', empColor: '#a855f7', boostColor: '#c084fc' }
-};
-const COLOR_SWATCHES = {
-    bodyPrimary:   ['#1e293b', '#1a2236', '#0f2544', '#360f18', '#0b3024', '#33220a', '#271242', '#0f172a'],
-    bodySecondary: ['#38bdf8', '#00f5d4', '#10b981', '#f59e0b', '#f43f5e', '#c084fc', '#e2e8f0', '#fb923c'],
-    canopyColor:   ['#7dd3fc', '#c77dff', '#a7f3d0', '#fde68a', '#fda4af', '#e9d5ff', '#bae6fd', '#0f172a'],
-    empColor:      ['#38bdf8', '#00f5d4', '#10b981', '#c084fc', '#f59e0b', '#f43f5e', '#ffffff', '#60a5fa'],
-    boostColor:    ['#fbbf24', '#f97316', '#38bdf8', '#00f5d4', '#10b981', '#f43f5e', '#c084fc', '#f8fafc']
-};
-
-// =========================================================================
-// 6. ACCOUNT DB + CRDT TOMBSTONES + HYBRID FIREBASE/INDEXEDDB SYNC
-// =========================================================================
-let accountsCache = (() => {
-    const p = lsGetJson(STORAGE_ACCOUNTS_KEY, {});
-    return (p && typeof p === 'object' && !Array.isArray(p)) ? p : {};
-})();
-
-let syncMeta = (() => {
-    const def = { wipeAllAccountsTs: 0, wipeAllScoresTs: 0, wipeAllAccountsVer: 0, wipeAllScoresVer: 0, deletedUids: {}, resetScoreTs: {}, resetScoreVer: {} };
-    const r = lsGetJson(STORAGE_SYNC_META_KEY, null);
-    if (!r || typeof r !== 'object') return def;
-    return {
-        wipeAllAccountsTs: Number(r.wipeAllAccountsTs) || 0,
-        wipeAllScoresTs: Number(r.wipeAllScoresTs) || 0,
-        wipeAllAccountsVer: Number(r.wipeAllAccountsVer) || 0,
-        wipeAllScoresVer: Number(r.wipeAllScoresVer) || 0,
-        deletedUids: (r.deletedUids && typeof r.deletedUids === 'object') ? r.deletedUids : {},
-        resetScoreTs: (r.resetScoreTs && typeof r.resetScoreTs === 'object') ? r.resetScoreTs : {},
-        resetScoreVer: (r.resetScoreVer && typeof r.resetScoreVer === 'object') ? r.resetScoreVer : {}
-    };
-})();
-function saveSyncMeta() { lsSet(STORAGE_SYNC_META_KEY, JSON.stringify(syncMeta)); }
-function saveAccountsCache() { lsSet(STORAGE_ACCOUNTS_KEY, JSON.stringify(accountsCache)); }
-
-function normalizeAccountRecord(acc, uidKey) {
-    if (!acc || typeof acc !== 'object') return null;
-    const uid = /^\d{17}$/.test(String(acc.uid || uidKey)) ? String(acc.uid || uidKey) : null;
-    if (!uid) return null;
-    const st = (acc.stats && typeof acc.stats === 'object') ? acc.stats : {};
-    const cust = (acc.custom && typeof acc.custom === 'object') ? acc.custom : {};
-    return {
-        uid,
-        name: String(acc.name || 'Pilot').trim().slice(0, 28) || 'Pilot',
-        tag: String(acc.tag || '0000').trim().slice(0, 10) || '0000',
-        isDev: uid === CANONICAL_DEV_UID,
-        createdAt: Number(acc.createdAt) || Date.now(),
-        updatedAt: Number(acc.updatedAt) || Number(acc.createdAt) || Date.now(),
-        accVer: typeof acc.accVer === 'number' ? acc.accVer : (syncMeta.wipeAllAccountsVer || 0),
-        scoreVer: typeof acc.scoreVer === 'number' ? acc.scoreVer : (syncMeta.wipeAllScoresVer || 0),
-        indivScoreVer: typeof acc.indivScoreVer === 'number' ? acc.indivScoreVer : ((syncMeta.resetScoreVer && syncMeta.resetScoreVer[uid]) || 0),
-        editVer: typeof acc.editVer === 'number' ? acc.editVer : 1,
-        stats: {
-            allTimeBest: Math.max(0, Number(st.allTimeBest) || 0),
-            bestEpoch: Math.max(1, Number(st.bestEpoch) || 1),
-            totalFlashes: Math.max(0, Number(st.totalFlashes) || 0),
-            totalRuns: Math.max(0, Number(st.totalRuns) || 0),
-            completedEpoch250: Boolean(st.completedEpoch250),
-            seasonScores: (st.seasonScores && typeof st.seasonScores === 'object') ? st.seasonScores : {}
-        },
-        custom: { ...DEFAULT_VEHICLE_CUST, ...cust },
-        seasonalSkins: Array.isArray(acc.seasonalSkins) ? acc.seasonalSkins : [],
-        inbox: Array.isArray(acc.inbox) ? acc.inbox : []
-    };
-}
-
-function generateUnique17DigitUid() {
-    for (let attempt = 0; attempt < 300; attempt++) {
-        let uid = String(1 + Math.floor(Math.random() * 9));
-        if (window.crypto && window.crypto.getRandomValues) {
-            const b = new Uint8Array(16);
-            window.crypto.getRandomValues(b);
-            for (let i = 0; i < 16; i++) uid += String(b[i] % 10);
-        } else {
-            for (let i = 0; i < 16; i++) uid += String(Math.floor(Math.random() * 10));
-        }
-        if (uid !== CANONICAL_DEV_UID && !accountsCache[uid]) return uid;
-    }
-    return String(Date.now()).padEnd(17, '9').slice(0, 17);
-}
-
-function makeAccountObj({ uid, name, tag, isDev = false }) {
-    const now = Date.now();
-    return {
-        uid, name: name.trim(), tag: tag.trim(), isDev: uid === CANONICAL_DEV_UID,
-        createdAt: now, updatedAt: now,
-        accVer: syncMeta.wipeAllAccountsVer || 0,
-        scoreVer: syncMeta.wipeAllScoresVer || 0,
-        indivScoreVer: (syncMeta.resetScoreVer && syncMeta.resetScoreVer[uid]) || 0,
-        editVer: 1,
-        stats: { allTimeBest: 0, bestEpoch: 1, totalFlashes: 0, totalRuns: 0, completedEpoch250: false, seasonScores: {} },
-        custom: isDev
-            ? { bodyPrimary: '#1a2236', bodySecondary: '#00f5d4', canopyColor: '#c77dff', empColor: '#00f5d4', boostColor: '#ff007f', nitroSkin: 'void_chroma' }
-            : { ...DEFAULT_VEHICLE_CUST },
-        seasonalSkins: [], inbox: []
-    };
-}
-
-function packAccountForSync(acc) {
-    return {
-        uid: acc.uid, name: acc.name, tag: acc.tag, isDev: acc.isDev,
-        createdAt: acc.createdAt, updatedAt: acc.updatedAt || Date.now(),
-        accVer: typeof acc.accVer === 'number' ? acc.accVer : syncMeta.wipeAllAccountsVer,
-        scoreVer: typeof acc.scoreVer === 'number' ? acc.scoreVer : syncMeta.wipeAllScoresVer,
-        indivScoreVer: typeof acc.indivScoreVer === 'number' ? acc.indivScoreVer : (syncMeta.resetScoreVer[acc.uid] || 0),
-        editVer: typeof acc.editVer === 'number' ? acc.editVer : 1,
-        stats: acc.stats, custom: acc.custom,
-        seasonalSkins: (acc.seasonalSkins || []).slice(-6)
-    };
-}
-
-let activeAccount = null;
-let lastLoggedOutUid = lsGet(STORAGE_LAST_OUT_KEY, '') || '';
-
-function validateAndSanitizeDatabase() {
-    const clean = {};
-    Object.entries(accountsCache).forEach(([k, v]) => {
-        const norm = normalizeAccountRecord(v, k);
-        if (norm) clean[norm.uid] = norm;
-    });
-    accountsCache = clean;
-    if (!accountsCache[CANONICAL_DEV_UID]) {
-        accountsCache[CANONICAL_DEV_UID] = makeAccountObj({ uid: CANONICAL_DEV_UID, name: DEFAULT_DEV_NAME, tag: DEFAULT_DEV_TAG, isDev: true });
-        pushMail(accountsCache[CANONICAL_DEV_UID], {
-            title: 'Dev Root Ready (IndexedDB + Firebase 24/7)',
-            sender: 'SYSTEM',
-            body: 'Your unique 17-digit Dev UID is synced across all browsers.\nNames & IDs are completely unrestricted for all players.'
-        });
-    }
-    Object.values(accountsCache).forEach(acc => { acc.isDev = (acc.uid === CANONICAL_DEV_UID); });
-    if (lastLoggedOutUid && !accountsCache[lastLoggedOutUid]) { lastLoggedOutUid = ''; lsRemove(STORAGE_LAST_OUT_KEY); }
-    saveAccountsCache();
-}
-
-let seasonStateCache = (() => {
-    const s = lsGetJson(STORAGE_SEASON_KEY, null);
-    if (s && s.originTs) return s;
-    const fresh = { originTs: Date.now(), devOffsetMs: 0, lastAnnouncedSeason: 0, lastFinalizedSeason: 0 };
-    lsSet(STORAGE_SEASON_KEY, JSON.stringify(fresh));
-    return fresh;
-})();
-function saveSeasonState() { lsSet(STORAGE_SEASON_KEY, JSON.stringify(seasonStateCache)); }
-
-let lbAllCache = (() => {
-    const a = lsGetJson(STORAGE_LB_ALL_KEY, []);
-    return Array.isArray(a) ? a.filter(e => e && e.uid && Number(e.score) > 0) : [];
-})();
-let lbSeasonCache = (() => {
-    const o = lsGetJson(STORAGE_LB_SEASON_KEY, {});
-    return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
-})();
-function saveLbAll() { lsSet(STORAGE_LB_ALL_KEY, JSON.stringify(lbAllCache.slice(0, 100))); }
-function saveLbSeason() { lsSet(STORAGE_LB_SEASON_KEY, JSON.stringify(lbSeasonCache)); }
-function getSeasonLbFor(sNum) {
-    const arr = Array.isArray(lbSeasonCache[sNum]) ? lbSeasonCache[sNum] : [];
-    return arr.filter(e => e && e.uid && Number(e.score) > 0).sort((a, b) => b.score - a.score);
-}
-
-let seasonStatusCache = computeSeasonStatus();
-function computeSeasonStatus() {
-    const nowMs = Date.now() + (Number(seasonStateCache.devOffsetMs) || 0);
-    const elapsed = Math.max(0, nowMs - seasonStateCache.originTs);
-    const seasonNum = Math.floor(elapsed / SEASON_CYCLE_MS) + 1;
-    const within = elapsed % SEASON_CYCLE_MS;
-    const isGap = within >= SEASON_ACTIVE_MS;
-    const remainingMs = isGap ? (SEASON_CYCLE_MS - within) : (SEASON_ACTIVE_MS - within);
-    return { seasonNum, phase: isGap ? 'GAP' : 'ACTIVE', remainingMs, featuredSkin: getSeasonFeaturedSkin(seasonNum), nextSeasonNum: seasonNum + 1 };
-}
-
-// =========================================================================
-// 7. QUOTA-SAFE FIREBASE 24/7 + INDEXEDDB + LOCAL BROADCAST SYNC ENGINE
-// =========================================================================
-let localBc = null;
-try { if ('BroadcastChannel' in window) localBc = new BroadcastChannel('roadsense_v4_rt_v12'); } catch (e) { localBc = null; }
-
-let rtEventSource = null, rtReconnectTimer = null, rtPollTimer = null;
-let isPullingCloud = false, lastSeenPulsePid = '';
-const seenPacketIds = new Set();
-
-function ensureSyncMetaVersions() {
-    if (typeof syncMeta.wipeAllAccountsVer !== 'number') syncMeta.wipeAllAccountsVer = 0;
-    if (typeof syncMeta.wipeAllScoresVer !== 'number') syncMeta.wipeAllScoresVer = 0;
-    if (!syncMeta.resetScoreVer || typeof syncMeta.resetScoreVer !== 'object') syncMeta.resetScoreVer = {};
-    if (!syncMeta.deletedUids || typeof syncMeta.deletedUids !== 'object') syncMeta.deletedUids = {};
-}
-ensureSyncMetaVersions();
-
-function setRealtimeStatusUI(state) {
-    const text = state === 'live' ? '🟢 LIVE DB' : (state === 'syncing' ? '🟡 SYNC' : '🔵 LOCAL IDB');
-    const cls = state === 'live' ? 'badge badge-emerald mono' : (state === 'syncing' ? 'badge badge-amber mono' : 'badge badge-sky mono');
-    ['rtSyncStatusBadge', 'devRtBadge'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) { el.innerText = text; el.className = cls; }
-    });
-}
-
-function refreshAllLiveViews() {
-    reconcileAllTimeChampion();
-    updateTopLeaderBanner();
-    refreshMenuAccountUI();
-    refreshInboxBadgeUI();
-    if (document.getElementById('leaderboardModal').style.display === 'flex') renderLeaderboardList();
-    if (document.getElementById('inboxModal').style.display === 'flex') renderInboxList();
-    if (document.getElementById('pauseSettingsModal').style.display === 'flex') {
-        if (currentSettingsTab === 'dev') renderDevAccountsList();
-        if (currentSettingsTab === 'garage') buildGarageUI();
-    }
-}
-
-// Low-bandwidth Firebase REST helper
-async function fbRequest(path, method = 'GET', bodyObj = null, timeoutMs = 4500) {
-    if (!FB_BASE_URL) return null;
-    const ctrl = new AbortController();
-    const tid = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-        const opts = { method, signal: ctrl.signal, cache: 'no-store' };
-        if (bodyObj !== null) {
-            opts.headers = { 'Content-Type': 'application/json' };
-            opts.body = JSON.stringify(bodyObj);
-        }
-        const res = await fetch(`${FB_BASE_URL}${path}.json`, opts);
-        if (!res.ok) return null;
-        return await res.json();
-    } catch (e) {
-        return null;
-    } finally {
-        clearTimeout(tid);
-    }
-}
-
-// Publishes delta changes to Firebase (only ~300 bytes per action!) + Local BroadcastChannel
-async function publishRealtimeEvent(op, data = {}) {
-    ensureSyncMetaVersions();
-    const pid = CLIENT_ID + '_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e5).toString(36);
-    seenPacketIds.add(pid);
-    lastSeenPulsePid = pid;
-    if (seenPacketIds.size > 2000) seenPacketIds.clear();
-
-    if (op === 'score_reset_all') {
-        syncMeta.wipeAllScoresVer += 1;
-        Object.values(accountsCache).forEach(a => { a.scoreVer = syncMeta.wipeAllScoresVer; });
-        saveSyncMeta(); saveAccountsCache();
-    } else if (op === 'acc_delete_all') {
-        syncMeta.wipeAllAccountsVer += 1;
-        syncMeta.deletedUids = {};
-        saveSyncMeta();
-    } else if (op === 'score_reset' && data.uid) {
-        syncMeta.resetScoreVer[data.uid] = (Number(syncMeta.resetScoreVer[data.uid]) || 0) + 1;
-        if (accountsCache[data.uid]) {
-            accountsCache[data.uid].indivScoreVer = syncMeta.resetScoreVer[data.uid];
-            saveAccountsCache();
-        }
-        saveSyncMeta();
-    } else if (op === 'acc_delete' && data.uid && data.uid !== CANONICAL_DEV_UID) {
-        syncMeta.deletedUids[data.uid] = true;
-        saveSyncMeta();
-    } else if (op === 'acc_upsert' && data.acc && data.acc.uid) {
-        const u = data.acc.uid;
-        if (accountsCache[u]) {
-            accountsCache[u].accVer = syncMeta.wipeAllAccountsVer;
-            accountsCache[u].scoreVer = syncMeta.wipeAllScoresVer;
-            accountsCache[u].indivScoreVer = syncMeta.resetScoreVer[u] || 0;
-            accountsCache[u].editVer = (Number(accountsCache[u].editVer) || 0) + 1;
-            saveAccountsCache();
-        }
-    } else if (op === 'score_record' && data.entry && data.entry.uid) {
-        const u = data.entry.uid;
-        if (accountsCache[u]) {
-            accountsCache[u].accVer = syncMeta.wipeAllAccountsVer;
-            accountsCache[u].scoreVer = syncMeta.wipeAllScoresVer;
-            accountsCache[u].indivScoreVer = syncMeta.resetScoreVer[u] || 0;
-            accountsCache[u].editVer = (Number(accountsCache[u].editVer) || 0) + 1;
-            saveAccountsCache();
-        }
-    }
-
-    // 1. Instant Same-Browser Tab Sync via BroadcastChannel
-    const localPacket = {
-        type: 'rs_sync_v12', pid, sender: CLIENT_ID, op,
-        meta: {
-            wipeAllAccountsVer: syncMeta.wipeAllAccountsVer,
-            wipeAllScoresVer: syncMeta.wipeAllScoresVer,
-            resetScoreVer: syncMeta.resetScoreVer,
-            deletedUids: syncMeta.deletedUids
-        },
-        seasonState: seasonStateCache,
-        accounts: data.acc ? [packAccountForSync(accountsCache[data.acc.uid] || data.acc)] : [],
-        ...data
-    };
-    if (localBc) { try { localBc.postMessage(localPacket); } catch (e) {} }
-
-    // 2. Quota-Safe Delta Sync to Firebase 24/7 Cloud DB
-    if (!FB_BASE_URL) {
-        setRealtimeStatusUI('local');
+function tryStartMenuUnlockAudio(){
+    if(!hasTrustedGesture)return;
+    mountMenuAudioToMainPage();
+    const isMenuOrPaused=!gameState.running||gameState.paused;
+    if(!isAppAudible()||!isMenuOrPaused||audioSettings.master<=0.01||audioSettings.menuMusic<=0.01){
+        menuUnlockAudio.pause();
         return;
     }
-
-    try {
-        if (op === 'acc_upsert' && data.acc && data.acc.uid) {
-            const packed = packAccountForSync(accountsCache[data.acc.uid] || data.acc);
-            await fbRequest(`/accounts/${packed.uid}`, 'PUT', packed);
-            await fbRequest('/pulse', 'PUT', { pid, op, uid: packed.uid, ts: Date.now() });
-        } else if (op === 'score_record' && data.entry && data.entry.uid) {
-            const u = data.entry.uid;
-            if (accountsCache[u]) await fbRequest(`/accounts/${u}`, 'PUT', packAccountForSync(accountsCache[u]));
-            await fbRequest(`/leaderboards/alltime/${u}`, 'PUT', data.entry);
-            if (data.sNum && data.sScore > 0) {
-                await fbRequest(`/leaderboards/season/${data.sNum}/${u}`, 'PUT', { ...data.entry, score: data.sScore });
-            }
-            await fbRequest('/pulse', 'PUT', { pid, op, uid: u, sNum: data.sNum || 0, sScore: data.sScore || 0, ts: Date.now() });
-        } else if (op === 'acc_delete' && data.uid) {
-            await fbRequest(`/accounts/${data.uid}`, 'DELETE');
-            await fbRequest(`/leaderboards/alltime/${data.uid}`, 'DELETE');
-            await fbRequest(`/meta/deletedUids/${data.uid}`, 'PUT', true);
-            await fbRequest('/pulse', 'PUT', { pid, op, uid: data.uid, ts: Date.now() });
-        } else if (op === 'score_reset' && data.uid) {
-            const u = data.uid;
-            await fbRequest(`/leaderboards/alltime/${u}`, 'DELETE');
-            await fbRequest(`/leaderboards/season/${seasonStatusCache.seasonNum}/${u}`, 'DELETE');
-            if (accountsCache[u]) await fbRequest(`/accounts/${u}`, 'PUT', packAccountForSync(accountsCache[u]));
-            await fbRequest(`/meta/resetScoreVer/${u}`, 'PUT', syncMeta.resetScoreVer[u]);
-            await fbRequest('/pulse', 'PUT', { pid, op, uid: u, ts: Date.now() });
-        } else if (op === 'score_reset_all') {
-            await fbRequest('/leaderboards', 'DELETE');
-            await fbRequest('/meta/wipeAllScoresVer', 'PUT', syncMeta.wipeAllScoresVer);
-            await fbRequest('/pulse', 'PUT', { pid, op, wipeAllScoresVer: syncMeta.wipeAllScoresVer, ts: Date.now() });
-        } else if (op === 'acc_delete_all') {
-            const devPacked = packAccountForSync(accountsCache[CANONICAL_DEV_UID]);
-            await fbRequest('/accounts', 'PUT', { [CANONICAL_DEV_UID]: devPacked });
-            await fbRequest('/leaderboards', 'DELETE');
-            await fbRequest('/meta/wipeAllAccountsVer', 'PUT', syncMeta.wipeAllAccountsVer);
-            await fbRequest('/meta/deletedUids', 'DELETE');
-            await fbRequest('/pulse', 'PUT', { pid, op, wipeAllAccountsVer: syncMeta.wipeAllAccountsVer, ts: Date.now() });
-        } else if (op === 'mail_broadcast' && data.mail) {
-            await fbRequest('/meta/latestMail', 'PUT', data.mail);
-            await fbRequest('/pulse', 'PUT', { pid, op, mail: data.mail, ts: Date.now() });
-        } else if (op === 'season_sync') {
-            await fbRequest('/meta/seasonState', 'PUT', seasonStateCache);
-            await fbRequest('/pulse', 'PUT', { pid, op, seasonState: seasonStateCache, ts: Date.now() });
-        }
-        setRealtimeStatusUI('live');
-    } catch (e) {}
-}
-
-function mergeSingleAccountRecord(rawAcc, fromReplay = false) {
-    if (!rawAcc || !rawAcc.uid) return false;
-    ensureSyncMetaVersions();
-    const u = rawAcc.uid;
-    const remAccVer = typeof rawAcc.accVer === 'number' ? rawAcc.accVer : 0;
-
-    if (u !== CANONICAL_DEV_UID) {
-        if (remAccVer < syncMeta.wipeAllAccountsVer) return false;
-        if (syncMeta.deletedUids[u]) return false;
-    }
-
-    const inc = normalizeAccountRecord(rawAcc, u);
-    if (!inc) return false;
-
-    const remScoreVer = typeof rawAcc.scoreVer === 'number' ? rawAcc.scoreVer : 0;
-    const remIndivVer = typeof rawAcc.indivScoreVer === 'number' ? rawAcc.indivScoreVer : 0;
-    const curIndivVer = Number(syncMeta.resetScoreVer[u]) || 0;
-    const scoresValid = (remScoreVer >= syncMeta.wipeAllScoresVer) && (remIndivVer >= curIndivVer);
-
-    if (!scoresValid) {
-        inc.stats.allTimeBest = 0;
-        inc.stats.bestEpoch = 1;
-        inc.stats.totalFlashes = 0;
-        inc.stats.seasonScores = {};
-    }
-
-    const cur = accountsCache[u];
-    const remEditVer = Number(rawAcc.editVer) || 1;
-    const curEditVer = cur ? (Number(cur.editVer) || 0) : 0;
-
-    if (!cur) {
-        inc.accVer = syncMeta.wipeAllAccountsVer;
-        inc.scoreVer = syncMeta.wipeAllScoresVer;
-        inc.indivScoreVer = curIndivVer;
-        inc.editVer = remEditVer;
-        accountsCache[u] = inc;
-    } else {
-        if (remEditVer >= curEditVer) {
-            cur.name = inc.name;
-            cur.tag = inc.tag;
-            cur.custom = { ...cur.custom, ...inc.custom };
-            cur.editVer = remEditVer;
-        }
-        if (scoresValid) {
-            if (inc.stats.allTimeBest > (cur.stats.allTimeBest || 0)) cur.stats.allTimeBest = inc.stats.allTimeBest;
-            cur.stats.bestEpoch = Math.max(cur.stats.bestEpoch || 1, inc.stats.bestEpoch || 1);
-            cur.stats.totalFlashes = Math.max(cur.stats.totalFlashes || 0, inc.stats.totalFlashes || 0);
-            cur.stats.totalRuns = Math.max(cur.stats.totalRuns || 0, inc.stats.totalRuns || 0);
-            cur.stats.completedEpoch250 = Boolean(cur.stats.completedEpoch250 || inc.stats.completedEpoch250);
-            const curS = cur.stats.seasonScores || {}, incS = inc.stats.seasonScores || {};
-            Object.keys(incS).forEach(k => { curS[k] = Math.max(Number(curS[k]) || 0, Number(incS[k]) || 0); });
-            cur.stats.seasonScores = curS;
-        }
-        cur.accVer = syncMeta.wipeAllAccountsVer;
-        cur.scoreVer = syncMeta.wipeAllScoresVer;
-        cur.indivScoreVer = curIndivVer;
-        if (activeAccount && activeAccount.uid === u) activeAccount = cur;
-        syncAccountMetaInLeaderboards(cur);
-    }
-
-    const finalAcc = accountsCache[u];
-    if (scoresValid && finalAcc && finalAcc.stats.allTimeBest > 0) {
-        const sNum = seasonStatusCache.seasonNum;
-        const sScore = (finalAcc.stats.seasonScores && finalAcc.stats.seasonScores[sNum]) || 0;
-        mergeScoreEntryLocally({
-            uid: finalAcc.uid, name: finalAcc.name, tag: finalAcc.tag, isDev: finalAcc.isDev,
-            score: finalAcc.stats.allTimeBest, epoch: finalAcc.stats.bestEpoch,
-            accent: finalAcc.custom.bodySecondary, skinId: finalAcc.custom.nitroSkin,
-            isPrism: finalAcc.custom.nitroSkin === 'void_chroma', ts: Date.now()
-        }, sNum, sScore);
-    }
-    saveAccountsCache();
-    return true;
-}
-
-function applyIncomingRealtimeEvent(pkt, fromReplay = false) {
-    if (!pkt || typeof pkt !== 'object') return;
-    if (pkt.pid) {
-        if (seenPacketIds.has(pkt.pid)) return;
-        seenPacketIds.add(pkt.pid);
-    }
-
-    ensureSyncMetaVersions();
-    let changed = false;
-    const remMeta = pkt.meta || {};
-
-    if (Number(remMeta.wipeAllAccountsVer) > syncMeta.wipeAllAccountsVer) {
-        syncMeta.wipeAllAccountsVer = Number(remMeta.wipeAllAccountsVer);
-        syncMeta.deletedUids = {};
-        saveSyncMeta();
-        applyDeleteAllNonDevLocally(0, !fromReplay, true);
-        changed = true;
-    }
-
-    if (Number(remMeta.wipeAllScoresVer) > syncMeta.wipeAllScoresVer) {
-        syncMeta.wipeAllScoresVer = Number(remMeta.wipeAllScoresVer);
-        saveSyncMeta();
-        applyResetAllScoresLocally();
-        Object.values(accountsCache).forEach(a => { a.scoreVer = syncMeta.wipeAllScoresVer; });
-        saveAccountsCache();
-        changed = true;
-        if (!fromReplay) showToast('⚡ Live DB: All scores reset.');
-    }
-
-    if (remMeta.deletedUids && typeof remMeta.deletedUids === 'object') {
-        Object.keys(remMeta.deletedUids).forEach(u => {
-            if (u !== CANONICAL_DEV_UID && remMeta.deletedUids[u] && !syncMeta.deletedUids[u]) {
-                syncMeta.deletedUids[u] = true;
-                saveSyncMeta();
-                applyAccountDeleteLocally(u, !fromReplay);
-                changed = true;
-            }
-        });
-    }
-
-    if (remMeta.resetScoreVer && typeof remMeta.resetScoreVer === 'object') {
-        Object.entries(remMeta.resetScoreVer).forEach(([u, ver]) => {
-            const remV = Number(ver) || 0, curV = Number(syncMeta.resetScoreVer[u]) || 0;
-            if (remV > curV) {
-                syncMeta.resetScoreVer[u] = remV;
-                saveSyncMeta();
-                applyScoreResetLocally(u);
-                if (accountsCache[u]) { accountsCache[u].indivScoreVer = remV; saveAccountsCache(); }
-                changed = true;
-                if (!fromReplay) showToast('⚡ Live DB: Pilot score reset.');
-            }
-        });
-    }
-
-    if (Array.isArray(pkt.accounts)) {
-        pkt.accounts.forEach(rawAcc => {
-            if (mergeSingleAccountRecord(rawAcc, fromReplay)) changed = true;
-        });
-    }
-
-    if (pkt.op === 'mail_broadcast' && pkt.mail && pkt.mail.title && pkt.mail.body) {
-        Object.values(accountsCache).forEach(acc => {
-            if (!(acc.inbox || []).some(m => m.id === pkt.mail.id)) {
-                acc.inbox.unshift({ ...pkt.mail, read: false });
-                if (acc.inbox.length > 50) acc.inbox.length = 50;
-            }
-        });
-        saveAccountsCache();
-        changed = true;
-        if (!fromReplay && activeAccount) showToast(`📬 New Mail: ${pkt.mail.title}`, 'ok');
-    }
-
-    if (pkt.seasonState && Number(pkt.seasonState.devOffsetMs) > (Number(seasonStateCache.devOffsetMs) || 0)) {
-        seasonStateCache.originTs = Number(pkt.seasonState.originTs) || seasonStateCache.originTs;
-        seasonStateCache.devOffsetMs = Number(pkt.seasonState.devOffsetMs) || 0;
-        saveSeasonState();
-        syncSeasonLifecycle();
-        changed = true;
-    }
-
-    if (changed) refreshAllLiveViews();
-}
-
-// Handles a tiny 80-byte Firebase Pulse notification by fetching ONLY the delta that changed!
-async function handleFirebasePulse(pulse) {
-    if (!pulse || !pulse.pid || pulse.pid === lastSeenPulsePid || seenPacketIds.has(pulse.pid)) return;
-    lastSeenPulsePid = pulse.pid;
-    seenPacketIds.add(pulse.pid);
-
-    const op = pulse.op;
-    if ((op === 'acc_upsert' || op === 'score_record') && pulse.uid) {
-        const remAcc = await fbRequest(`/accounts/${pulse.uid}`, 'GET');
-        if (remAcc && mergeSingleAccountRecord(remAcc, false)) refreshAllLiveViews();
-    } else if (op === 'acc_delete' && pulse.uid) {
-        syncMeta.deletedUids[pulse.uid] = true;
-        saveSyncMeta();
-        applyAccountDeleteLocally(pulse.uid, true);
-        refreshAllLiveViews();
-    } else if (op === 'score_reset' && pulse.uid) {
-        syncMeta.resetScoreVer[pulse.uid] = (Number(syncMeta.resetScoreVer[pulse.uid]) || 0) + 1;
-        saveSyncMeta();
-        applyScoreResetLocally(pulse.uid);
-        refreshAllLiveViews();
-    } else if (op === 'score_reset_all') {
-        if (Number(pulse.wipeAllScoresVer) > syncMeta.wipeAllScoresVer) {
-            syncMeta.wipeAllScoresVer = Number(pulse.wipeAllScoresVer);
-            saveSyncMeta();
-        }
-        applyResetAllScoresLocally();
-        refreshAllLiveViews();
-        showToast('⚡ Live DB: All scores reset.');
-    } else if (op === 'acc_delete_all') {
-        if (Number(pulse.wipeAllAccountsVer) > syncMeta.wipeAllAccountsVer) {
-            syncMeta.wipeAllAccountsVer = Number(pulse.wipeAllAccountsVer);
-            syncMeta.deletedUids = {};
-            saveSyncMeta();
-        }
-        applyDeleteAllNonDevLocally(0, true, true);
-        refreshAllLiveViews();
-    } else if (op === 'mail_broadcast' && pulse.mail) {
-        applyIncomingRealtimeEvent({ type: 'rs_sync_v12', pid: pulse.pid, op: 'mail_broadcast', mail: pulse.mail }, false);
-    } else if (op === 'season_sync' && pulse.seasonState) {
-        applyIncomingRealtimeEvent({ type: 'rs_sync_v12', pid: pulse.pid, op: 'season_sync', seasonState: pulse.seasonState }, false);
-    }
-}
-
-function mergeScoreEntryLocally(entry, sNum, sScore) {
-    const scoreVal = Number(entry.score) || 0;
-    if (scoreVal > 0) {
-        const ai = lbAllCache.findIndex(e => e.uid === entry.uid);
-        if (ai >= 0) {
-            if (scoreVal > lbAllCache[ai].score) { lbAllCache[ai].score = scoreVal; lbAllCache[ai].epoch = Math.max(lbAllCache[ai].epoch || 1, entry.epoch || 1); }
-            lbAllCache[ai].name = entry.name; lbAllCache[ai].tag = entry.tag; lbAllCache[ai].accent = entry.accent; lbAllCache[ai].isPrism = entry.isPrism;
-        } else lbAllCache.push({ ...entry });
-        lbAllCache.sort((a, b) => b.score - a.score); saveLbAll();
-    }
-    const seasonPts = Number(sScore) || 0;
-    if (sNum && seasonPts > 0) {
-        const list = Array.isArray(lbSeasonCache[sNum]) ? lbSeasonCache[sNum] : [];
-        const si = list.findIndex(e => e.uid === entry.uid);
-        if (si >= 0) {
-            if (seasonPts > list[si].score) { list[si].score = seasonPts; list[si].epoch = Math.max(list[si].epoch || 1, entry.epoch || 1); }
-            list[si].name = entry.name; list[si].tag = entry.tag; list[si].accent = entry.accent; list[si].isPrism = entry.isPrism;
-        } else list.push({ ...entry, score: seasonPts });
-        list.sort((a, b) => b.score - a.score); lbSeasonCache[sNum] = list.slice(0, 100); saveLbSeason();
-    }
-}
-
-function applyScoreResetLocally(uid) {
-    removeUidFromLeaderboards(uid);
-    if (accountsCache[uid]) {
-        accountsCache[uid].stats.allTimeBest = 0; accountsCache[uid].stats.bestEpoch = 1;
-        accountsCache[uid].stats.totalFlashes = 0; accountsCache[uid].stats.seasonScores = {};
-        saveAccountsCache();
-    }
-}
-function applyResetAllScoresLocally() {
-    lbAllCache = []; lbSeasonCache = {}; saveLbAll(); saveLbSeason();
-    Object.values(accountsCache).forEach(a => { a.stats.allTimeBest = 0; a.stats.bestEpoch = 1; a.stats.totalFlashes = 0; a.stats.seasonScores = {}; });
-    saveAccountsCache(); reconcileAllTimeChampion();
-}
-function applyAccountDeleteLocally(uid, notify) {
-    if (!uid || uid === CANONICAL_DEV_UID) return;
-    const existed = accountsCache[uid];
-    delete accountsCache[uid]; saveAccountsCache();
-    removeUidFromLeaderboards(uid); deleteCustomSongByUid(uid);
-    if (lastLoggedOutUid === uid) { lastLoggedOutUid = ''; lsRemove(STORAGE_LAST_OUT_KEY); }
-    if (activeAccount && activeAccount.uid === uid) {
-        activeAccount = null; lsRemove(STORAGE_ACTIVE_UID_KEY); resetAllRevealStates();
-        document.getElementById('pauseSettingsModal').style.display = 'none';
-        returnToMainMenu(); showAuthFeedback('Your account was deleted.', false);
-    } else if (notify && existed && activeAccount && activeAccount.isDev) showToast(`⚡ Live DB: Deleted "${existed.name}"`);
-}
-function applyDeleteAllNonDevLocally(wipeTs, notify, forceAll = true) {
-    let removed = 0;
-    Object.values(accountsCache).forEach(a => {
-        if (!a.isDev && (forceAll || a.createdAt <= wipeTs)) {
-            delete accountsCache[a.uid]; removeUidFromLeaderboards(a.uid); deleteCustomSongByUid(a.uid);
-            if (lastLoggedOutUid === a.uid) { lastLoggedOutUid = ''; lsRemove(STORAGE_LAST_OUT_KEY); }
-            if (activeAccount && activeAccount.uid === a.uid) {
-                activeAccount = null; lsRemove(STORAGE_ACTIVE_UID_KEY); resetAllRevealStates();
-                document.getElementById('pauseSettingsModal').style.display = 'none';
-                returnToMainMenu(); showAuthFeedback('All player accounts were reset by Dev.', false);
-            }
-            removed++;
-        }
-    });
-    saveAccountsCache();
-    if (notify && removed > 0) showToast(`⚡ Live DB: Wiped ${removed} player account(s).`);
-}
-
-// Initial Bootstrap Pull from Firebase (runs once on boot or manual sync)
-async function pullCloudHistoryAndSync(sendPushAfter = false) {
-    if (!FB_BASE_URL) {
-        setRealtimeStatusUI('local');
+    if(audioCtx&&audioCtx.state==='running'){
+        menuUnlockAudio.pause();
         return;
     }
-    if (isPullingCloud || document.hidden || isPortalExiting) return;
-    isPullingCloud = true;
-    try {
-        const snap = await fbRequest('', 'GET', null, 6000);
-        if (snap && typeof snap === 'object') {
-            if (snap.pulse && snap.pulse.pid) {
-                lastSeenPulsePid = snap.pulse.pid;
-                seenPacketIds.add(snap.pulse.pid);
-            }
-            const remAccounts = snap.accounts && typeof snap.accounts === 'object' ? Object.values(snap.accounts) : [];
-            const remMeta = snap.meta || {};
-            applyIncomingRealtimeEvent({
-                type: 'rs_sync_v12',
-                pid: 'boot_' + Date.now(),
-                op: remMeta.latestMail ? 'mail_broadcast' : 'state_sync',
-                meta: remMeta,
-                seasonState: remMeta.seasonState || null,
-                mail: remMeta.latestMail || null,
-                accounts: remAccounts
-            }, true);
+    menuUnlockAudio.volume=Math.min(1,audioSettings.master*audioSettings.menuMusic*0.85);
+    if(menuUnlockAudio.paused){
+        menuUnlockAudio.muted=false;
+        const p=menuUnlockAudio.play();
+        if(p&&typeof p.catch==='function'){
+            p.catch(()=>{});
         }
-        setRealtimeStatusUI('live');
-        if (sendPushAfter && activeAccount) {
-            await fbRequest(`/accounts/${activeAccount.uid}`, 'PUT', packAccountForSync(activeAccount));
-        }
-    } catch (e) {
-        setRealtimeStatusUI('local');
-    } finally {
-        isPullingCloud = false;
     }
 }
 
-// Connects to Firebase's tiny 80-byte /pulse.json via SSE stream + quota-safe fallback check
-function connectRealtimeStream() {
-    if (isPortalExiting) return;
-    if (!FB_BASE_URL) {
-        setRealtimeStatusUI('local');
-        return;
-    }
-    if (!rtPollTimer) {
-        rtPollTimer = setInterval(async () => {
-            if (isPortalExiting || document.hidden || !FB_BASE_URL) return;
-            const pulse = await fbRequest('/pulse', 'GET', null, 3000);
-            if (pulse && pulse.pid && pulse.pid !== lastSeenPulsePid) {
-                await handleFirebasePulse(pulse);
-            }
-        }, 10000);
-    }
-    if (typeof EventSource === 'undefined') return;
-    if (rtEventSource) { try { rtEventSource.close(); } catch (e) {} rtEventSource = null; }
-    try {
-        rtEventSource = new EventSource(`${FB_BASE_URL}/pulse.json`);
-        rtEventSource.onopen = () => setRealtimeStatusUI('live');
-        rtEventSource.addEventListener('put', ev => {
-            try {
-                const payload = JSON.parse(ev.data);
-                if (payload && payload.data) handleFirebasePulse(payload.data);
-            } catch (e) {}
-        });
-        rtEventSource.onerror = () => {
-            try { rtEventSource.close(); } catch (e) {}
-            rtEventSource = null;
-            if (rtReconnectTimer) clearTimeout(rtReconnectTimer);
-            rtReconnectTimer = setTimeout(connectRealtimeStream, 8000);
+function isAppAudible(){
+    return document.visibilityState!=='hidden'&&!document.hidden;
+}
+
+function buildVolumeSlidersUI(){
+    const sliders=[
+        {k:'master',lbl:'🔊 Master Volume',col:'emerald',val:95},
+        {k:'music',lbl:'🎵 Gameplay OST Volume',col:'sky',val:90},
+        {k:'menuMusic',lbl:'🎹 Menu & Pause Music',col:'cyan',val:85},
+        {k:'engine',lbl:'🏎️ Engine & Turbo',col:'amber',val:80},
+        {k:'sfx',lbl:'⚡ Effects, EMP & Siren',col:'purple',val:92},
+        {k:'uiClick',lbl:'🔘 UI Button Clicks',col:'pink',val:85}
+    ];
+    const grid=document.getElementById('volumeSlidersGrid');
+    if(!grid)return;
+    grid.innerHTML=sliders.map(s=>`<div><div class="flex justify-between text-[10.5px]"><span class="text-gray-300">${s.lbl}</span><span id="volLabel_${s.k}" class="text-${s.col}-400 font-bold">${s.val}%</span></div><input type="range" id="volSlider_${s.k}" min="0" max="100" value="${s.val}" oninput="updateVolumeSetting('${s.k}',this.value)" class="w-full accent-${s.col}-400 cursor-pointer"></div>`).join('');
+}
+
+const mitadruAudio=new Audio();
+mitadruAudio.preload='none';
+mitadruAudio.loop=true;
+const mitadruCandidates=["Mitadru.m4a","./Mitadru.m4a","/media/Mitadru.m4a","mitadru.m4a","Mitadru.mp3"];
+let mitadruIdx=0;
+mitadruAudio.addEventListener('error',()=>{
+    if(audioSettings.ostMode!=='mitadru')return;
+    mitadruIdx++;
+    if(mitadruIdx<mitadruCandidates.length){mitadruAudio.src=mitadruCandidates[mitadruIdx];if(isAppAudible()&&gameState.running&&!gameState.paused)mitadruAudio.play().catch(()=>{});}
+});
+
+const customAudio=new Audio();
+customAudio.loop=true;
+let currentCustomObjectUrl=null;
+const CUSTOM_SONGS_DB_NAME='RoadSenseCustomSongsDB_v1';
+
+function openCustomSongsIDB(){
+    return new Promise((resolve,reject)=>{
+        const req=indexedDB.open(CUSTOM_SONGS_DB_NAME,1);
+        req.onupgradeneeded=(e)=>{
+            const db=e.target.result;
+            if(!db.objectStoreNames.contains('songs'))db.createObjectStore('songs',{keyPath:'accountKey'});
         };
-    } catch (e) {}
-}
-
-function forceManualCloudSync() {
-    pullCloudHistoryAndSync(true);
-    showToast(FB_BASE_URL ? 'Syncing Firebase 24/7 DB...' : 'Synced Local IndexedDB.', 'info');
-    playSfx('uiClick');
-}
-
-if (localBc) localBc.onmessage = ev => { if (ev && ev.data) applyIncomingRealtimeEvent(ev.data, false); };
-
-window.addEventListener('storage', ev => {
-    if (!ev || !ev.key) return;
-    if ([STORAGE_ACCOUNTS_KEY, STORAGE_LB_ALL_KEY, STORAGE_LB_SEASON_KEY, STORAGE_SYNC_META_KEY].includes(ev.key)) {
-        const freshAcc = lsGetJson(STORAGE_ACCOUNTS_KEY, null);
-        if (freshAcc && typeof freshAcc === 'object') {
-            accountsCache = freshAcc; validateAndSanitizeDatabase();
-            if (activeAccount) {
-                if (accountsCache[activeAccount.uid]) activeAccount = accountsCache[activeAccount.uid];
-                else { activeAccount = null; lsRemove(STORAGE_ACTIVE_UID_KEY); returnToMainMenu(); }
-            }
-        }
-        const freshAll = lsGetJson(STORAGE_LB_ALL_KEY, null); if (Array.isArray(freshAll)) lbAllCache = freshAll;
-        const freshSea = lsGetJson(STORAGE_LB_SEASON_KEY, null); if (freshSea && typeof freshSea === 'object') lbSeasonCache = freshSea;
-        refreshAllLiveViews();
-    }
-});
-
-// =========================================================================
-// 8. ALL-TIME #1 CHAMPION, SEASON LIFECYCLE & LEADERBOARD RECORDING
-// =========================================================================
-function getAllTimeTop1Uid() {
-    lbAllCache.sort((a, b) => b.score - a.score);
-    const top = lbAllCache[0];
-    return (top && Number(top.score) > 0) ? top.uid : null;
-}
-function hasNitroSkinUnlocked(acc, skinId) {
-    if (skinId === 'standard') return true;
-    if (!acc) return false;
-    if (acc.isDev) return true;
-    if (skinId === 'void_chroma') { const top1Uid = getAllTimeTop1Uid(); return Boolean(top1Uid && top1Uid === acc.uid); }
-    const st = seasonStatusCache;
-    return (acc.seasonalSkins || []).some(sk =>
-        sk.skinId === skinId && sk.claimed && !sk.expired &&
-        ((st.phase === 'ACTIVE' && sk.validForSeason === st.seasonNum) || (st.phase === 'GAP' && sk.validForSeason === st.seasonNum + 1))
-    );
-}
-function getSkinStatusLabel(acc, skinId) {
-    if (skinId === 'standard') return 'Permanent';
-    if (acc && acc.isDev) return 'Dev Unlimited';
-    if (skinId === 'void_chroma') return hasNitroSkinUnlocked(acc, 'void_chroma') ? '👑 All-Time #1 Active' : 'All-Time #1 Exclusive';
-    if (!acc) return 'Top 5 Season Reward';
-    const st = seasonStatusCache;
-    const sk = (acc.seasonalSkins || []).find(x => x.skinId === skinId && x.claimed && !x.expired && ((st.phase === 'ACTIVE' && x.validForSeason === st.seasonNum) || (st.phase === 'GAP' && x.validForSeason === st.seasonNum + 1)));
-    return sk ? `Active • Expires End of S${sk.validForSeason}` : 'Top 5 Season Reward';
-}
-function reconcileAllTimeChampion() {
-    const newChampUid = getAllTimeTop1Uid(), prevChampUid = lsGet(STORAGE_ALLTIME_CHAMP, '') || '';
-    let mod = false;
-    if (newChampUid !== prevChampUid) {
-        if (prevChampUid && accountsCache[prevChampUid] && !accountsCache[prevChampUid].isDev) {
-            const pAcc = accountsCache[prevChampUid];
-            if (pAcc.custom.nitroSkin === 'void_chroma') pAcc.custom.nitroSkin = 'standard';
-            pushMail(pAcc, { title: 'All-Time #1 Crown Claimed by Rival', sender: 'SYSTEM', body: 'Another pilot took #1 on the All-Time leaderboard. Reclaim #1 All-Time to re-unlock Void Prismatic FX!' });
-            mod = true;
-        }
-        if (newChampUid && accountsCache[newChampUid]) {
-            pushMail(accountsCache[newChampUid], { title: '👑 All-Time #1: Void Prismatic FX Unlocked!', sender: 'HALL OF FAME', body: 'You hold #1 on the All-Time leaderboard! Void Prismatic FX (All-in-One Chroma + Singularity Afterburner) is now unlocked in your Garage.' });
-            mod = true;
-        }
-        if (newChampUid) lsSet(STORAGE_ALLTIME_CHAMP, newChampUid); else lsRemove(STORAGE_ALLTIME_CHAMP);
-    }
-    Object.values(accountsCache).forEach(acc => {
-        if (!acc.isDev && acc.custom.nitroSkin === 'void_chroma' && acc.uid !== newChampUid) { acc.custom.nitroSkin = 'standard'; mod = true; }
+        req.onsuccess=()=>resolve(req.result);
+        req.onerror=()=>reject(req.error);
     });
-    if (mod) saveAccountsCache();
-}
-function formatCountdown(ms) {
-    const sec = Math.max(0, Math.floor(ms / 1000));
-    const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-    if (d > 0) return `${d}d ${String(h).padStart(2, '0')}h`;
-    if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
-    return `${m}m ${String(s).padStart(2, '0')}s`;
-}
-function pushMail(acc, { title, sender = 'SYSTEM', body, reward = null, id = null }) {
-    if (!acc) return;
-    if (!Array.isArray(acc.inbox)) acc.inbox = [];
-    const mid = id || ('m_' + Date.now() + '_' + Math.floor(Math.random() * 1e6));
-    acc.inbox.unshift({ id: mid, title, sender, body, ts: Date.now(), read: false, reward });
-    if (acc.inbox.length > 50) acc.inbox.length = 50;
-}
-function pushMailAll(spec) {
-    const mailObj = { id: 'm_' + Date.now() + '_' + Math.floor(Math.random() * 1e6), title: spec.title, sender: spec.sender || 'SYSTEM', body: spec.body, ts: Date.now(), read: false, reward: null };
-    Object.values(accountsCache).forEach(acc => pushMail(acc, mailObj));
-    saveAccountsCache(); return mailObj;
-}
-function syncSeasonLifecycle() {
-    seasonStatusCache = computeSeasonStatus();
-    const st = seasonStatusCache; let changed = false;
-    const targetFinalized = (st.phase === 'GAP') ? st.seasonNum : (st.seasonNum - 1);
-    while (seasonStateCache.lastFinalizedSeason < targetFinalized) { const ended = seasonStateCache.lastFinalizedSeason + 1; finalizeSeason(ended); seasonStateCache.lastFinalizedSeason = ended; changed = true; }
-    if (st.phase === 'ACTIVE' && seasonStateCache.lastAnnouncedSeason < st.seasonNum) {
-        const feat = getSeasonFeaturedSkin(st.seasonNum);
-        pushMailAll({ title: `Season ${st.seasonNum} Started`, sender: 'SEASON ENGINE', body: `Season ${st.seasonNum} is live for 3 days (followed by a 1-day off-season gap).\n\nFinish Top 5 in Season ${st.seasonNum} to unlock "${feat.name}" (All-in-One Chroma) for Season ${st.seasonNum + 1}. Hold #1 All-Time to wield Void Prismatic FX!` });
-        seasonStateCache.lastAnnouncedSeason = st.seasonNum; changed = true;
-    }
-    if (changed) { saveSeasonState(); refreshSeasonUI(); refreshInboxBadgeUI(); }
-}
-function finalizeSeason(endedSeason) {
-    const sLb = getSeasonLbFor(endedSeason), rewardSkin = getSeasonFeaturedSkin(endedSeason), nextSeason = endedSeason + 1;
-    const top5 = new Map(); sLb.slice(0, 5).forEach((e, i) => top5.set(e.uid, { rank: i + 1, score: e.score }));
-    Object.values(accountsCache).forEach(acc => {
-        if (!acc.isDev && Array.isArray(acc.seasonalSkins)) {
-            const expNames = [];
-            acc.seasonalSkins.forEach(sk => { if (!sk.expired && sk.validForSeason <= endedSeason) { sk.expired = true; const m = SEASON_FX_SKINS.find(x => x.id === sk.skinId); expNames.push(m ? m.name : sk.skinId); } });
-            if (expNames.length) {
-                if (acc.custom.nitroSkin !== 'standard' && !hasNitroSkinUnlocked(acc, acc.custom.nitroSkin)) acc.custom.nitroSkin = 'standard';
-                pushMail(acc, { title: `Seasonal Skin Expired (S${endedSeason})`, sender: 'GARAGE', body: `Your seasonal reward (${expNames.join(', ')}) expired at the end of Season ${endedSeason}.` });
-            }
-        }
-        const win = top5.get(acc.uid);
-        if (win) {
-            if (!Array.isArray(acc.seasonalSkins)) acc.seasonalSkins = [];
-            acc.seasonalSkins.push({ skinId: rewardSkin.id, wonSeason: endedSeason, validForSeason: nextSeason, claimed: false, expired: false, rank: win.rank });
-            pushMail(acc, {
-                title: `🏆 Season ${endedSeason} Top 5 (#${win.rank})`, sender: 'REWARDS',
-                body: `Finished #${win.rank} in Season ${endedSeason} (${win.score.toLocaleString()} pts).\nClaim "${rewardSkin.name}" (All-in-One Chroma) below — active for Season ${nextSeason}.`,
-                reward: { skinId: rewardSkin.id, skinName: rewardSkin.name, wonSeason: endedSeason, validForSeason: nextSeason, rank: win.rank, claimed: false }
-            });
-        }
-        const rankIdx = sLb.findIndex(e => e.uid === acc.uid), pts = (acc.stats.seasonScores && acc.stats.seasonScores[endedSeason]) || 0;
-        pushMail(acc, { title: `Season ${endedSeason} Ended`, sender: 'SEASON ENGINE', body: `${rankIdx >= 0 ? `Final Rank: #${rankIdx + 1} (${pts.toLocaleString()} pts)` : 'No ranked runs recorded.'}\n\n24h Off-Season Gap is now active before Season ${nextSeason}.` });
-    });
-    saveAccountsCache();
-}
-function syncAccountMetaInLeaderboards(acc) {
-    if (!acc) return;
-    let modAll = false, modS = false;
-    lbAllCache.forEach(e => { if (e.uid === acc.uid) { e.name = acc.name; e.tag = acc.tag; e.accent = acc.custom.bodySecondary; e.skinId = acc.custom.nitroSkin; e.isPrism = acc.custom.nitroSkin === 'void_chroma'; modAll = true; } });
-    Object.values(lbSeasonCache).forEach(arr => { if (!Array.isArray(arr)) return; arr.forEach(e => { if (e.uid === acc.uid) { e.name = acc.name; e.tag = acc.tag; e.accent = acc.custom.bodySecondary; e.skinId = acc.custom.nitroSkin; e.isPrism = acc.custom.nitroSkin === 'void_chroma'; modS = true; } }); });
-    if (modAll) saveLbAll(); if (modS) saveLbSeason();
-}
-function recordScoreToLeaderboards(acc, scoreVal, epochVal) {
-    if (!acc || scoreVal <= 0) return;
-    const st = seasonStatusCache, nowTs = Date.now();
-    const entry = { uid: acc.uid, name: acc.name, tag: acc.tag, isDev: acc.isDev, score: scoreVal, epoch: epochVal, accent: acc.custom.bodySecondary, skinId: acc.custom.nitroSkin, isPrism: acc.custom.nitroSkin === 'void_chroma', ts: nowTs };
-    const sNum = st.phase === 'ACTIVE' ? st.seasonNum : 0, sScore = sNum ? (acc.stats.seasonScores[sNum] || scoreVal) : 0;
-    mergeScoreEntryLocally(entry, sNum, sScore);
-    reconcileAllTimeChampion(); updateTopLeaderBanner();
-    publishRealtimeEvent('score_record', { entry, sNum, sScore });
-}
-function removeUidFromLeaderboards(uid) {
-    lbAllCache = lbAllCache.filter(e => e.uid !== uid); saveLbAll();
-    Object.keys(lbSeasonCache).forEach(k => { if (Array.isArray(lbSeasonCache[k])) lbSeasonCache[k] = lbSeasonCache[k].filter(e => e.uid !== uid); });
-    saveLbSeason(); reconcileAllTimeChampion(); updateTopLeaderBanner();
 }
 
-// =========================================================================
-// 9. AUDIO ENGINE & INDEXEDDB ARRAYBUFFER SONG STORAGE
-// =========================================================================
-let audioCtx = null, compressorNode = null, masterGain = null, musicBus = null, sfxBus = null;
-let engineOsc1 = null, engineOsc2 = null, engineSub = null, engineTurbo = null, engineFilter = null, engineGain = null, engineTurboGain = null, engineLfo = null, engineLfoGain = null;
-let musicSchedId = null, synthStep = 0, menuStep = 0, nextGameNoteT = 0, nextMenuNoteT = 0;
-const lastSfxTs = {};
-
-const MENU_ARP  = [293.66, 349.23, 440.00, 587.33, 523.25, 440.00, 349.23, 293.66, 261.63, 349.23, 440.00, 523.25, 440.00, 349.23, 329.63, 293.66];
-const MENU_BASS = [73.42, 73.42, 87.31, 87.31, 65.41, 65.41, 110.00, 98.00];
-const GAME_BASS = [73.42, 73.42, 146.83, 73.42, 87.31, 87.31, 98.00, 110.00, 73.42, 73.42, 146.83, 73.42, 116.54, 116.54, 110.00, 98.00];
-const GAME_ARP  = [293.66, 349.23, 440.00, 587.33, 523.25, 440.00, 349.23, 440.00, 293.66, 349.23, 466.16, 587.33, 659.25, 587.33, 440.00, 349.23];
-
-const mitadruAudio = new Audio();
-mitadruAudio.preload = 'none'; mitadruAudio.loop = true;
-mitadruAudio.addEventListener('error', () => {
-    if (globalSettings.audio.ostMode === 'mitadru') {
-        globalSettings.audio.ostMode = 'synth'; syncOstButtonsUI(); saveGlobalSettings();
-        showToast('Mitadru.m4a not found locally — using Cyber-Synth.');
-    }
-});
-
-const customAudio = new Audio(); customAudio.loop = true;
-let customSongObjUrl = null;
-
-function isAppAudible() { return document.visibilityState !== 'hidden' && !document.hidden && !isPortalExiting; }
-function safeGain(v) { return Number.isFinite(v) ? Math.max(0.0005, Math.min(1.5, v)) : 0.0005; }
-function safeFreq(f) { return Number.isFinite(f) ? Math.max(20, Math.min(18000, f)) : 220; }
-
-function ensureAudioEngine() {
-    if (!hasTrustedGesture || isPortalExiting) return null;
-    try {
-        if (!audioCtx) {
-            const AC = window.AudioContext || window.webkitAudioContext;
-            if (!AC) return null;
-            audioCtx = new AC();
-            compressorNode = audioCtx.createDynamicsCompressor();
-            compressorNode.threshold.setValueAtTime(-12, audioCtx.currentTime);
-            compressorNode.knee.setValueAtTime(18, audioCtx.currentTime);
-            compressorNode.ratio.setValueAtTime(6, audioCtx.currentTime);
-            compressorNode.attack.setValueAtTime(0.003, audioCtx.currentTime);
-            compressorNode.release.setValueAtTime(0.15, audioCtx.currentTime);
-
-            masterGain = audioCtx.createGain();
-            masterGain.gain.setValueAtTime(Math.max(0.0001, globalSettings.audio.master), audioCtx.currentTime);
-            musicBus = audioCtx.createGain(); musicBus.gain.setValueAtTime(0.75, audioCtx.currentTime);
-            sfxBus = audioCtx.createGain(); sfxBus.gain.setValueAtTime(0.80, audioCtx.currentTime);
-            musicBus.connect(compressorNode); sfxBus.connect(compressorNode);
-            compressorNode.connect(masterGain); masterGain.connect(audioCtx.destination);
-
-            engineOsc1 = audioCtx.createOscillator(); engineOsc2 = audioCtx.createOscillator();
-            engineSub = audioCtx.createOscillator(); engineTurbo = audioCtx.createOscillator();
-            engineLfo = audioCtx.createOscillator(); engineFilter = audioCtx.createBiquadFilter();
-            engineGain = audioCtx.createGain(); engineTurboGain = audioCtx.createGain(); engineLfoGain = audioCtx.createGain();
-
-            engineOsc1.type = 'sawtooth'; engineOsc2.type = 'sawtooth'; engineSub.type = 'square';
-            engineTurbo.type = 'triangle'; engineLfo.type = 'sine';
-            const t0 = audioCtx.currentTime;
-            engineOsc1.frequency.setValueAtTime(85, t0); engineOsc2.frequency.setValueAtTime(127.5, t0);
-            engineSub.frequency.setValueAtTime(42.5, t0); engineTurbo.frequency.setValueAtTime(420, t0);
-            engineLfo.frequency.setValueAtTime(28, t0); engineLfoGain.gain.setValueAtTime(14, t0);
-
-            engineLfo.connect(engineLfoGain); engineLfoGain.connect(engineOsc1.frequency); engineLfoGain.connect(engineOsc2.frequency);
-            engineFilter.type = 'lowpass'; engineFilter.frequency.setValueAtTime(720, t0); engineFilter.Q.setValueAtTime(2.8, t0);
-            engineGain.gain.setValueAtTime(0.0001, t0); engineTurboGain.gain.setValueAtTime(0.0001, t0);
-
-            engineOsc1.connect(engineFilter); engineOsc2.connect(engineFilter); engineSub.connect(engineFilter);
-            engineFilter.connect(engineGain); engineGain.connect(sfxBus);
-            engineTurbo.connect(engineTurboGain); engineTurboGain.connect(sfxBus);
-            engineOsc1.start(t0); engineOsc2.start(t0); engineSub.start(t0); engineTurbo.start(t0); engineLfo.start(t0);
-        }
-        if (isAppAudible() && audioCtx.state !== 'running') {
-            audioCtx.resume().then(() => {
-                if (!audioCtx) return;
-                nextGameNoteT = audioCtx.currentTime + 0.02; nextMenuNoteT = audioCtx.currentTime + 0.02;
-                tickMusicScheduler();
-            }).catch(() => {});
-        }
-        return audioCtx;
-    } catch (e) { return null; }
-}
-
-function updateEnginePitch() {
-    if (!audioCtx || audioCtx.state !== 'running' || !engineGain) return;
-    try {
-        const now = audioCtx.currentTime, vol = globalSettings.audio.engine;
-        if (!gameState.running || gameState.paused || !isAppAudible() || globalSettings.audio.master <= 0.01 || vol <= 0.01) {
-            engineGain.gain.setTargetAtTime(0.0001, now, 0.04); engineTurboGain.gain.setTargetAtTime(0.0001, now, 0.04); return;
-        }
-        const r = Math.max(0.75, Math.min(2.4, (Number(gameState.speedMps) || 24) / 24));
-        const hz = safeFreq(78 * r + (gameState.boosting ? 46 : (gameState.braking ? -18 : 0)));
-        engineOsc1.frequency.setTargetAtTime(hz, now, 0.04);
-        engineOsc2.frequency.setTargetAtTime(safeFreq(hz * 1.498), now, 0.04);
-        engineSub.frequency.setTargetAtTime(safeFreq(hz * 0.5), now, 0.04);
-        engineLfo.frequency.setTargetAtTime(gameState.boosting ? 44 : 26 * r, now, 0.05);
-        engineFilter.frequency.setTargetAtTime(gameState.boosting ? 2400 : (gameState.braking ? 480 : 780 * r), now, 0.05);
-        engineFilter.Q.setTargetAtTime(gameState.boosting ? 4.2 : 2.6, now, 0.05);
-        engineGain.gain.setTargetAtTime(safeGain(vol * (gameState.boosting ? 0.38 : (gameState.braking ? 0.18 : 0.25))), now, 0.05);
-        engineTurbo.frequency.setTargetAtTime(safeFreq(gameState.boosting ? (560 + r * 220) : (280 + r * 90)), now, 0.06);
-        engineTurboGain.gain.setTargetAtTime(safeGain(vol * (gameState.boosting ? 0.20 : 0.02)), now, 0.06);
-    } catch (e) {}
-}
-
-function scheduleMenuNote(t) {
-    const v = globalSettings.audio.menuMusic;
-    if (!audioCtx || audioCtx.state !== 'running' || globalSettings.audio.master <= 0.01 || v <= 0.01) return;
-    try {
-        const i = menuStep % 16, n = MENU_ARP[i];
-        const o1 = audioCtx.createOscillator(), o2 = audioCtx.createOscillator(), g = audioCtx.createGain();
-        o1.type = 'triangle'; o2.type = 'sine'; o1.frequency.setValueAtTime(n, t); o2.frequency.setValueAtTime(n * 0.5, t);
-        g.gain.setValueAtTime(0.0005, t); g.gain.linearRampToValueAtTime(safeGain(0.22 * v), t + 0.008); g.gain.exponentialRampToValueAtTime(0.0005, t + 0.195);
-        o1.connect(g); o2.connect(g); g.connect(musicBus); o1.start(t); o2.start(t); o1.stop(t + 0.205); o2.stop(t + 0.205);
-        if (i % 2 === 0) {
-            const b = audioCtx.createOscillator(), f = audioCtx.createBiquadFilter(), bg = audioCtx.createGain();
-            b.type = 'sawtooth'; b.frequency.setValueAtTime(MENU_BASS[(i >> 1) % MENU_BASS.length], t); f.type = 'lowpass'; f.frequency.setValueAtTime(380, t);
-            bg.gain.setValueAtTime(0.0005, t); bg.gain.linearRampToValueAtTime(safeGain(0.18 * v), t + 0.008); bg.gain.exponentialRampToValueAtTime(0.0005, t + 0.205);
-            b.connect(f); f.connect(bg); bg.connect(musicBus); b.start(t); b.stop(t + 0.215);
-        }
-        menuStep++;
-    } catch (e) {}
-}
-
-function scheduleGameNote(t) {
-    const v = globalSettings.audio.music;
-    if (!audioCtx || audioCtx.state !== 'running' || globalSettings.audio.ostMode !== 'synth' || globalSettings.audio.master <= 0.01 || v <= 0.01) return;
-    try {
-        const i = synthStep % 16;
-        if (i % 4 === 0) {
-            const k = audioCtx.createOscillator(), kg = audioCtx.createGain();
-            k.type = 'sine'; k.frequency.setValueAtTime(146.83, t); k.frequency.exponentialRampToValueAtTime(36.71, t + 0.13);
-            kg.gain.setValueAtTime(0.0005, t); kg.gain.linearRampToValueAtTime(safeGain(0.42 * v), t + 0.005); kg.gain.exponentialRampToValueAtTime(0.0005, t + 0.14);
-            k.connect(kg); kg.connect(musicBus); k.start(t); k.stop(t + 0.145);
-        } else if (i % 4 === 2) {
-            const s = audioCtx.createOscillator(), sg = audioCtx.createGain();
-            s.type = 'triangle'; s.frequency.setValueAtTime(220, t); s.frequency.exponentialRampToValueAtTime(73.42, t + 0.085);
-            sg.gain.setValueAtTime(0.0005, t); sg.gain.linearRampToValueAtTime(safeGain(0.20 * v), t + 0.005); sg.gain.exponentialRampToValueAtTime(0.0005, t + 0.09);
-            s.connect(sg); sg.connect(musicBus); s.start(t); s.stop(t + 0.095);
-        }
-        const b = audioCtx.createOscillator(), bf = audioCtx.createBiquadFilter(), bg = audioCtx.createGain();
-        b.type = 'sawtooth'; b.frequency.setValueAtTime(GAME_BASS[i], t); bf.type = 'lowpass'; bf.frequency.setValueAtTime(680, t);
-        bg.gain.setValueAtTime(0.0005, t); bg.gain.linearRampToValueAtTime(safeGain(0.28 * v), t + 0.006); bg.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
-        b.connect(bf); bf.connect(bg); bg.connect(musicBus); b.start(t); b.stop(t + 0.115);
-
-        const l1 = audioCtx.createOscillator(), l2 = audioCtx.createOscillator(), lg = audioCtx.createGain();
-        l1.type = 'sawtooth'; l2.type = 'triangle'; l1.frequency.setValueAtTime(GAME_ARP[i], t); l2.frequency.setValueAtTime(GAME_ARP[i] * 1.004, t);
-        lg.gain.setValueAtTime(0.0005, t); lg.gain.linearRampToValueAtTime(safeGain(0.20 * v), t + 0.006); lg.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
-        l1.connect(lg); l2.connect(lg); lg.connect(musicBus); l1.start(t); l2.start(t); l1.stop(t + 0.135); l2.stop(t + 0.135);
-        synthStep++;
-    } catch (e) {}
-}
-
-function tickMusicScheduler() {
-    if (!isAppAudible() || !hasTrustedGesture || !isBootSplashDismissed || globalSettings.audio.master <= 0.01) return;
-    if (!audioCtx || audioCtx.state !== 'running') return;
-    const now = audioCtx.currentTime;
-    if (!gameState.running || gameState.paused) {
-        if (nextMenuNoteT < now - 0.05 || nextMenuNoteT > now + 1.0) nextMenuNoteT = now + 0.02;
-        let g = 0; while (nextMenuNoteT < now + 0.22 && g++ < 4) { scheduleMenuNote(nextMenuNoteT); nextMenuNoteT += 0.135; }
-        nextGameNoteT = 0;
-    } else if (globalSettings.audio.ostMode === 'synth') {
-        if (nextGameNoteT < now - 0.05 || nextGameNoteT > now + 1.0) nextGameNoteT = now + 0.02;
-        let g = 0; while (nextGameNoteT < now + 0.22 && g++ < 4) { scheduleGameNote(nextGameNoteT); nextGameNoteT += 0.1171875; }
-        nextMenuNoteT = 0;
-    }
-}
-
-function startMusicScheduler() {
-    if (musicSchedId) clearInterval(musicSchedId);
-    musicSchedId = setInterval(tickMusicScheduler, 32);
-}
-
-function syncExternalTracks() {
-    const play = gameState.running && !gameState.paused && isAppAudible();
-    const vol = Math.max(0, Math.min(1, globalSettings.audio.master * globalSettings.audio.music));
-    mitadruAudio.volume = vol; customAudio.volume = vol;
-    if (!play) { mitadruAudio.pause(); customAudio.pause(); return; }
-    if (globalSettings.audio.ostMode === 'mitadru') {
-        customAudio.pause();
-        if (!mitadruAudio.src || mitadruAudio.src === window.location.href) mitadruAudio.src = 'Mitadru.m4a';
-        mitadruAudio.play().catch(() => {});
-    } else if (globalSettings.audio.ostMode === 'custom') {
-        mitadruAudio.pause();
-        if (customAudio.src) customAudio.play().catch(() => {});
-    } else { mitadruAudio.pause(); customAudio.pause(); }
-}
-
-function playSfx(type) {
-    if (globalSettings.audio.master <= 0.01 || !isAppAudible() || !hasTrustedGesture || !isBootSplashDismissed) return;
-    const np = performance.now();
-    if (lastSfxTs[type] && np - lastSfxTs[type] < 50) return;
-    lastSfxTs[type] = np;
-    const actx = ensureAudioEngine();
-    if (!actx || actx.state !== 'running') return;
-    try {
-        const now = actx.currentTime, sv = globalSettings.audio.sfx, cv = globalSettings.audio.uiClick;
-        if (type === 'uiClick') {
-            if (cv <= 0.01) return;
-            const o = actx.createOscillator(), g = actx.createGain();
-            o.type = 'sine'; o.frequency.setValueAtTime(587.33, now); o.frequency.exponentialRampToValueAtTime(880, now + 0.045);
-            g.gain.setValueAtTime(0.0005, now); g.gain.linearRampToValueAtTime(safeGain(0.11 * cv), now + 0.005); g.gain.exponentialRampToValueAtTime(0.0005, now + 0.05);
-            o.connect(g); g.connect(sfxBus); o.start(now); o.stop(now + 0.055);
-            return;
-        }
-        if (sv <= 0.01) return;
-        if (type === 'steer') {
-            const o = actx.createOscillator(), g = actx.createGain();
-            o.type = 'sine'; o.frequency.setValueAtTime(349.23, now); o.frequency.exponentialRampToValueAtTime(587.33, now + 0.05);
-            g.gain.setValueAtTime(0.0005, now); g.gain.linearRampToValueAtTime(safeGain(0.11 * sv), now + 0.005); g.gain.exponentialRampToValueAtTime(0.0005, now + 0.055);
-            o.connect(g); g.connect(sfxBus); o.start(now); o.stop(now + 0.06);
-        } else if (type === 'nitro') {
-            const r1 = actx.createOscillator(), r2 = actx.createOscillator(), rf = actx.createBiquadFilter(), rg = actx.createGain();
-            r1.type = 'sawtooth'; r2.type = 'square'; r1.frequency.setValueAtTime(95, now); r1.frequency.exponentialRampToValueAtTime(240, now + 0.34);
-            r2.frequency.setValueAtTime(48, now); r2.frequency.exponentialRampToValueAtTime(120, now + 0.34);
-            rf.type = 'lowpass'; rf.frequency.setValueAtTime(450, now); rf.frequency.exponentialRampToValueAtTime(2600, now + 0.28); rf.Q.setValueAtTime(3.5, now);
-            rg.gain.setValueAtTime(0.0005, now); rg.gain.linearRampToValueAtTime(safeGain(0.28 * sv), now + 0.015); rg.gain.exponentialRampToValueAtTime(0.0005, now + 0.38);
-            r1.connect(rf); r2.connect(rf); rf.connect(rg); rg.connect(sfxBus); r1.start(now); r2.start(now); r1.stop(now + 0.39); r2.stop(now + 0.39);
-            const sp = actx.createOscillator(), sg = actx.createGain();
-            sp.type = 'triangle'; sp.frequency.setValueAtTime(320, now); sp.frequency.exponentialRampToValueAtTime(980, now + 0.32);
-            sg.gain.setValueAtTime(0.0005, now); sg.gain.linearRampToValueAtTime(safeGain(0.16 * sv), now + 0.02); sg.gain.exponentialRampToValueAtTime(0.0005, now + 0.35);
-            sp.connect(sg); sg.connect(sfxBus); sp.start(now); sp.stop(now + 0.36);
-        } else if (type === 'pickup') {
-            [587.33, 880, 1174.66].forEach((f, idx) => { const o = actx.createOscillator(), g = actx.createGain(), st = now + idx * 0.035; o.type = 'sine'; o.frequency.setValueAtTime(f, st); g.gain.setValueAtTime(0.0005, st); g.gain.linearRampToValueAtTime(safeGain(0.15 * sv), st + 0.005); g.gain.exponentialRampToValueAtTime(0.0005, st + 0.14); o.connect(g); g.connect(sfxBus); o.start(st); o.stop(st + 0.145); });
-        } else if (type === 'phantom') {
-            [587.33, 698.46, 880, 1174.66].forEach((f, idx) => { const o = actx.createOscillator(), g = actx.createGain(), st = now + idx * 0.03; o.type = 'triangle'; o.frequency.setValueAtTime(f, st); g.gain.setValueAtTime(0.0005, st); g.gain.linearRampToValueAtTime(safeGain(0.15 * sv), st + 0.005); g.gain.exponentialRampToValueAtTime(0.0005, st + 0.22); o.connect(g); g.connect(sfxBus); o.start(st); o.stop(st + 0.225); });
-        } else if (type === 'emp') {
-            const o1 = actx.createOscillator(), o2 = actx.createOscillator(), g = actx.createGain();
-            o1.type = 'sawtooth'; o2.type = 'triangle'; o1.frequency.setValueAtTime(880, now); o1.frequency.exponentialRampToValueAtTime(73.42, now + 0.52);
-            o2.frequency.setValueAtTime(1174.66, now); o2.frequency.exponentialRampToValueAtTime(146.83, now + 0.52);
-            g.gain.setValueAtTime(0.0005, now); g.gain.linearRampToValueAtTime(safeGain(0.20 * sv), now + 0.008); g.gain.exponentialRampToValueAtTime(0.0005, now + 0.55);
-            o1.connect(g); o2.connect(g); g.connect(sfxBus); o1.start(now); o2.start(now); o1.stop(now + 0.56); o2.stop(now + 0.56);
-        } else if (type === 'siren250') {
-            for (let c = 0; c < 6; c++) { const st = now + c * 0.5, o = actx.createOscillator(), g = actx.createGain(); o.type = 'triangle'; o.frequency.setValueAtTime(440, st); o.frequency.linearRampToValueAtTime(880, st + 0.25); o.frequency.linearRampToValueAtTime(440, st + 0.48); g.gain.setValueAtTime(0.0005, st); g.gain.linearRampToValueAtTime(safeGain(0.20 * sv), st + 0.01); g.gain.exponentialRampToValueAtTime(0.0005, st + 0.49); o.connect(g); g.connect(sfxBus); o.start(st); o.stop(st + 0.495); }
-        } else if (type === 'hit') {
-            if (!actx._crashBuf) { const len = Math.floor(actx.sampleRate * 0.45), buf = actx.createBuffer(1, len, actx.sampleRate), d = buf.getChannelData(0); for (let i = 0; i < len; i++) d[i] = Math.tanh((Math.random() * 2 - 1) * 2.2) * Math.pow(1 - i / len, 0.55); actx._crashBuf = buf; }
-            const n1 = actx.createBufferSource(); n1.buffer = actx._crashBuf;
-            const f1 = actx.createBiquadFilter(); f1.type = 'bandpass'; f1.frequency.setValueAtTime(1850, now); f1.frequency.exponentialRampToValueAtTime(320, now + 0.32); f1.Q.setValueAtTime(1.4, now);
-            const g1 = actx.createGain(); g1.gain.setValueAtTime(safeGain(0.46 * sv), now); g1.gain.exponentialRampToValueAtTime(0.0005, now + 0.34);
-            n1.connect(f1); f1.connect(g1); g1.connect(sfxBus); n1.start(now); n1.stop(now + 0.35);
-
-            const n2 = actx.createBufferSource(); n2.buffer = actx._crashBuf;
-            const f2 = actx.createBiquadFilter(); f2.type = 'highpass'; f2.frequency.setValueAtTime(3200, now);
-            const g2 = actx.createGain(); g2.gain.setValueAtTime(safeGain(0.26 * sv), now); g2.gain.exponentialRampToValueAtTime(0.0005, now + 0.11);
-            n2.connect(f2); f2.connect(g2); g2.connect(sfxBus); n2.start(now); n2.stop(now + 0.12);
-
-            const p = actx.createOscillator(), pg = actx.createGain();
-            p.type = 'sine'; p.frequency.setValueAtTime(165, now); p.frequency.exponentialRampToValueAtTime(28, now + 0.26);
-            pg.gain.setValueAtTime(safeGain(0.50 * sv), now); pg.gain.exponentialRampToValueAtTime(0.0005, now + 0.28);
-            p.connect(pg); pg.connect(sfxBus); p.start(now); p.stop(now + 0.29);
-        }
-    } catch (e) {}
-}
-
-function silenceAllAudio() {
-    mitadruAudio.pause(); customAudio.pause();
-    if (audioCtx && audioCtx.state === 'running') audioCtx.suspend().catch(() => {});
-    updateEqVisuals(false);
-}
-function resumeAudioForeground() {
-    if (!isAppAudible() || !isBootSplashDismissed) return;
-    if (hasTrustedGesture) ensureAudioEngine();
-    syncExternalTracks(); updateEnginePitch(); updateEqVisuals(gameState.running && !gameState.paused);
-}
-function updateEqVisuals(playing) {
-    const on = playing && globalSettings.audio.master > 0.01 && globalSettings.audio.music > 0.01;
-    document.querySelectorAll('.eq-bar').forEach(b => b.classList.toggle('eq-paused', !on));
-}
-
-function unlockAudioFromUserGesture(e) {
-    if (e && e.isTrusted) {
-        hasTrustedGesture = true;
-        if (isBootSplashDismissed) {
-            const actx = ensureAudioEngine();
-            if (actx && actx.state === 'running') tickMusicScheduler();
-        }
-    }
-}
-['click', 'touchend', 'keydown'].forEach(evt => window.addEventListener(evt, unlockAudioFromUserGesture, { capture: true, passive: true }));
-
-// Stores ArrayBuffer + mimeType in IndexedDB so iOS Safari, Android, and PC all play uploaded songs reliably!
-async function handleCustomSongUpload(files) {
-    if (!activeAccount || !files || !files[0]) return;
-    const f = files[0], inp = document.getElementById('customSongFileInput');
-    if (inp) inp.value = '';
-    if (f.size > 20 * 1024 * 1024) { setTextCached('customSongStatusText', '✕ Exceeds 20 MB'); showToast('Track exceeds 20 MB limit.', 'err'); playSfx('hit'); return; }
-    try {
-        const arrayBuf = await f.arrayBuffer();
-        const mimeType = f.type || 'audio/mpeg';
-        const db = await openLocalIDB();
-        await new Promise((res, rej) => {
-            const tx = db.transaction('songs', 'readwrite');
-            tx.objectStore('songs').put({
-                uid: activeAccount.uid,
-                pilotName: `${activeAccount.name} #${activeAccount.tag}`,
-                fileName: f.name,
-                sizeBytes: f.size,
-                mimeType,
-                buffer: arrayBuf,
-                ts: Date.now()
-            });
-            tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
-        });
-        await loadCustomSongForActiveAccount(); selectOstMode('custom');
-        showToast(`Loaded track into IndexedDB: ${f.name}`, 'ok'); playSfx('pickup');
-    } catch (e) { setTextCached('customSongStatusText', '✕ Upload failed'); showToast('Track upload failed.', 'err'); }
-}
-async function loadCustomSongForActiveAccount() {
-    const stEl = document.getElementById('customSongStatusText'), subEl = document.getElementById('customOstBtnSub'), rmBtn = document.getElementById('removeMyCustomSongBtn');
-    if (customSongObjUrl) { URL.revokeObjectURL(customSongObjUrl); customSongObjUrl = null; }
-    if (!activeAccount) {
-        customAudio.pause(); customAudio.removeAttribute('src');
-        if (stEl) stEl.innerText = 'Custom Track (≤ 20 MB)'; if (subEl) subEl.innerText = 'None'; if (rmBtn) rmBtn.classList.add('hidden');
+async function handleCustomSongUpload(files){
+    if(!files||!files[0])return;
+    const file=files[0];
+    if(file.size>20*1024*1024){
+        document.getElementById('customSongStatusText').innerText="✕ File exceeds 20 MB limit!";
+        playGameSfx('hit');
         return;
     }
-    try {
-        const db = await openLocalIDB();
-        const rec = await new Promise(res => { const req = db.transaction('songs', 'readonly').objectStore('songs').get(activeAccount.uid); req.onsuccess = () => res(req.result || null); req.onerror = () => res(null); });
-        if (rec && (rec.buffer || rec.blob)) {
-            const blobObj = rec.buffer ? new Blob([rec.buffer], { type: rec.mimeType || 'audio/mpeg' }) : rec.blob;
-            customSongObjUrl = URL.createObjectURL(blobObj);
-            customAudio.src = customSongObjUrl; customAudio.loop = true;
-            if (stEl) stEl.innerText = `✓ ${rec.fileName} (${(rec.sizeBytes / 1048576).toFixed(1)} MB)`;
-            if (subEl) subEl.innerText = rec.fileName; if (rmBtn) rmBtn.classList.remove('hidden');
-        } else {
-            customAudio.pause(); customAudio.removeAttribute('src');
-            if (stEl) stEl.innerText = 'Custom Track (≤ 20 MB)'; if (subEl) subEl.innerText = 'None'; if (rmBtn) rmBtn.classList.add('hidden');
-            if (globalSettings.audio.ostMode === 'custom') selectOstMode('synth');
+    try{
+        const db=await openCustomSongsIDB();
+        const accountKey=getActiveAccountStorageKey();
+        const pilotName=currentPilot.isCore?currentPilot.name:getEffectiveGuestFullLabel();
+        await new Promise((res,rej)=>{
+            const tx=db.transaction('songs','readwrite');
+            tx.objectStore('songs').put({accountKey,pilotName,fileName:file.name,sizeBytes:file.size,blob:file,ts:Date.now()});
+            tx.oncomplete=()=>res();
+            tx.onerror=()=>rej(tx.error);
+        });
+        await loadCustomSongForActivePilot();
+        selectOstMode('custom');
+        playGameSfx('pickup');
+        renderDevCustomSongsList();
+    }catch(e){
+        document.getElementById('customSongStatusText').innerText="✕ Upload failed.";
+    }
+}
+
+async function loadCustomSongForActivePilot(){
+    try{
+        const db=await openCustomSongsIDB();
+        const accountKey=getActiveAccountStorageKey();
+        const record=await new Promise((res)=>{
+            const tx=db.transaction('songs','readonly');
+            const req=tx.objectStore('songs').get(accountKey);
+            req.onsuccess=()=>res(req.result||null);
+            req.onerror=()=>res(null);
+        });
+        const statusText=document.getElementById('customSongStatusText');
+        const subEl=document.getElementById('customOstBtnSub');
+        const rmBtn=document.getElementById('removeMyCustomSongBtn');
+        if(currentCustomObjectUrl){URL.revokeObjectURL(currentCustomObjectUrl);currentCustomObjectUrl=null;}
+        if(record&&record.blob){
+            currentCustomObjectUrl=URL.createObjectURL(record.blob);
+            customAudio.src=currentCustomObjectUrl;
+            customAudio.loop=true;
+            const mb=(record.sizeBytes/(1024*1024)).toFixed(1);
+            if(statusText)statusText.innerText=`✓ Loaded: ${record.fileName} (${mb} MB • Looping)`;
+            if(subEl)subEl.innerText=record.fileName;
+            if(rmBtn)rmBtn.classList.remove('hidden');
+        }else{
+            customAudio.pause();
+            customAudio.removeAttribute('src');
+            if(statusText)statusText.innerText="Upload Custom Song (≤ 20 MB, Auto-Loop)";
+            if(subEl)subEl.innerText="No song uploaded";
+            if(rmBtn)rmBtn.classList.add('hidden');
+            if(audioSettings.ostMode==='custom')selectOstMode('synth');
         }
         renderDevCustomSongsList();
-    } catch (e) {}
-}
-async function removeCurrentPilotCustomSong() { if (activeAccount) { await deleteCustomSongByUid(activeAccount.uid); showToast('Custom track removed.'); playSfx('uiClick'); } }
-async function deleteCustomSongByUid(uid) {
-    try {
-        const db = await openLocalIDB();
-        await new Promise(res => { const tx = db.transaction('songs', 'readwrite'); tx.objectStore('songs').delete(uid); tx.oncomplete = () => res(); tx.onerror = () => res(); });
-        if (activeAccount && activeAccount.uid === uid) await loadCustomSongForActiveAccount(); else renderDevCustomSongsList();
-    } catch (e) {}
-}
-async function devRemoveAllCustomSongs() {
-    if (!activeAccount || !activeAccount.isDev) return;
-    const ok = await askConfirm({ title: 'Clear All Custom Songs?', body: 'Remove every uploaded custom audio track from IndexedDB?', okLabel: 'Clear All' });
-    if (!ok) return;
-    try {
-        const db = await openLocalIDB();
-        await new Promise(res => { const tx = db.transaction('songs', 'readwrite'); tx.objectStore('songs').clear(); tx.oncomplete = () => res(); });
-        await loadCustomSongForActiveAccount();
-        showDevFeedback('✓ All custom songs cleared.'); showToast('All custom songs cleared.', 'ok'); playSfx('pickup');
-    } catch (e) {}
-}
-async function renderDevCustomSongsList() {
-    const el = document.getElementById('devCustomSongsList');
-    if (!el || !activeAccount || !activeAccount.isDev) return;
-    try {
-        const db = await openLocalIDB();
-        const list = await new Promise(res => { const req = db.transaction('songs', 'readonly').objectStore('songs').getAll(); req.onsuccess = () => res(req.result || []); req.onerror = () => res([]); });
-        if (!list.length) { el.innerHTML = '<div style="color:var(--text-dim);">None</div>'; return; }
-        el.innerHTML = list.map(r => `<div class="row-between recessed-well" style="padding:4px 8px;"><span class="truncate mono">${escapeHtml(r.pilotName)}: <strong>${escapeHtml(r.fileName)}</strong></span><button type="button" class="btn btn-xs btn-danger" onclick="deleteCustomSongByUid('${escapeHtml(r.uid)}')">✕</button></div>`).join('');
-    } catch (e) {}
+    }catch(e){}
 }
 
-// =========================================================================
-// 10. GAME STATE, PHYSICS & FAIR SPAWNER
-// =========================================================================
-const gameState = {
-    running: false, paused: false, score: 0, epoch: 1, combo: 1.0, nearMisses: 0,
-    armor: 100, nitroFuel: 100, empCharge: 100, distanceM: 0, speedMps: 25,
-    targetLane: 0, egoLaneX: 0, egoRoll: 0, boosting: false, braking: false,
-    slowMoTimer: 0, invulnTimer: 0, hitFlashTimer: 0,
-    empWaveRadius: 0, empFlashAlpha: 0, screenShake: 0,
-    ep250WarnTriggered: false, ep250WarnTimer: 0,
-    viewW: window.innerWidth, viewH: window.innerHeight,
-    hazards: [], pickups: [], FloatingTexts: [], empFX: [], stars: []
+async function removeCurrentPilotCustomSong(){
+    await deleteCustomSongByKey(getActiveAccountStorageKey());
+    await loadCustomSongForActivePilot();
+    playGameSfx('uiClick');
+}
+
+async function deleteCustomSongByKey(accKey){
+    try{
+        const db=await openCustomSongsIDB();
+        await new Promise((res)=>{
+            const tx=db.transaction('songs','readwrite');
+            tx.objectStore('songs').delete(accKey);
+            tx.oncomplete=()=>res();
+            tx.onerror=()=>res();
+        });
+        if(accKey===getActiveAccountStorageKey())await loadCustomSongForActivePilot();
+        else renderDevCustomSongsList();
+    }catch(e){}
+}
+
+async function devRemoveAllCustomSongs(){
+    if(currentPilot.id!=='1117')return;
+    try{
+        const db=await openCustomSongsIDB();
+        await new Promise((res)=>{
+            const tx=db.transaction('songs','readwrite');
+            tx.objectStore('songs').clear();
+            tx.oncomplete=()=>res();
+        });
+        await loadCustomSongForActivePilot();
+        showDevConsoleFeedback("✓ All Custom Uploaded Songs Removed!");
+        playGameSfx('pickup');
+    }catch(e){}
+}
+
+async function renderDevCustomSongsList(){
+    const container=document.getElementById('devCustomSongsList');
+    if(!container||currentPilot.id!=='1117')return;
+    try{
+        const db=await openCustomSongsIDB();
+        const allRecords=await new Promise((res)=>{
+            const tx=db.transaction('songs','readonly');
+            const req=tx.objectStore('songs').getAll();
+            req.onsuccess=()=>res(req.result||[]);
+            req.onerror=()=>res([]);
+        });
+        if(allRecords.length===0){
+            container.innerHTML=`<div class="text-gray-500">No custom songs uploaded yet.</div>`;
+            return;
+        }
+        container.innerHTML=allRecords.map(r=>{
+            const mb=(r.sizeBytes/(1024*1024)).toFixed(1);
+            return `<div class="flex items-center justify-between bg-[#121724] px-2 py-1 rounded border border-[#232c42]"><span class="truncate pr-2 text-gray-200">${escapeHtml(r.pilotName)}: <strong>${escapeHtml(r.fileName)}</strong> (${mb}MB)</span><button type="button" onclick="deleteCustomSongByKey('${escapeHtml(r.accountKey)}')" class="px-1.5 py-0.5 rounded bg-red-600/80 hover:bg-red-500 text-white text-[9px] font-bold shrink-0 cursor-pointer">🗑️ Remove</button></div>`;
+        }).join('');
+    }catch(e){}
+}
+
+function scheduleMenuStepAt(noteTime){
+    if(!audioCtx||audioSettings.master<=0.01||audioSettings.menuMusic<=0.01)return;
+    try{
+        const outNode=musicBusNode||masterGainNode;
+        const mmVol=audioSettings.menuMusic;
+        const m16=menuStep%16;
+        const note=MENU_ARP_NOTES[m16];
+        const mOsc1=audioCtx.createOscillator(),mOsc2=audioCtx.createOscillator(),mGain=audioCtx.createGain();
+        mOsc1.type='triangle';mOsc2.type='sine';
+        mOsc1.frequency.setValueAtTime(note,noteTime);
+        mOsc2.frequency.setValueAtTime(note*0.5,noteTime);
+        mGain.gain.setValueAtTime(0.001,noteTime);
+        mGain.gain.linearRampToValueAtTime(0.24*mmVol,noteTime+0.008);
+        mGain.gain.exponentialRampToValueAtTime(0.001,noteTime+0.20);
+        mOsc1.connect(mGain);mOsc2.connect(mGain);mGain.connect(outNode);
+        mOsc1.start(noteTime);mOsc2.start(noteTime);mOsc1.stop(noteTime+0.205);mOsc2.stop(noteTime+0.205);
+        if(m16%2===0){
+            const bNote=MENU_BASS_NOTES[(m16>>1)%MENU_BASS_NOTES.length];
+            const mbOsc=audioCtx.createOscillator(),mbFilter=audioCtx.createBiquadFilter(),mbGain=audioCtx.createGain();
+            mbOsc.type='sawtooth';mbOsc.frequency.setValueAtTime(bNote,noteTime);
+            mbFilter.type='lowpass';mbFilter.frequency.setValueAtTime(380,noteTime);
+            mbGain.gain.setValueAtTime(0.001,noteTime);
+            mbGain.gain.linearRampToValueAtTime(0.20*mmVol,noteTime+0.008);
+            mbGain.gain.exponentialRampToValueAtTime(0.001,noteTime+0.21);
+            mbOsc.connect(mbFilter);mbFilter.connect(mbGain);mbGain.connect(outNode);
+            mbOsc.start(noteTime);mbOsc.stop(noteTime+0.215);
+        }
+        menuStep++;
+    }catch(e){}
+}
+
+function scheduleGameplaySynthStepAt(noteTime){
+    if(!audioCtx||audioSettings.ostMode!=='synth'||audioSettings.master<=0.01||audioSettings.music<=0.01)return;
+    try{
+        const outNode=musicBusNode||masterGainNode;
+        const mVol=audioSettings.music,s16=synthStep%16;
+        if(s16%4===0){
+            const kOsc=audioCtx.createOscillator(),kGain=audioCtx.createGain();
+            kOsc.type='sine';
+            kOsc.frequency.setValueAtTime(146.83,noteTime);
+            kOsc.frequency.exponentialRampToValueAtTime(36.71,noteTime+0.13);
+            kGain.gain.setValueAtTime(0.001,noteTime);
+            kGain.gain.linearRampToValueAtTime(0.46*mVol,noteTime+0.005);
+            kGain.gain.exponentialRampToValueAtTime(0.001,noteTime+0.14);
+            kOsc.connect(kGain);kGain.connect(outNode);
+            kOsc.start(noteTime);kOsc.stop(noteTime+0.145);
+        }else if(s16%4===2){
+            const sOsc=audioCtx.createOscillator(),sGain=audioCtx.createGain();
+            sOsc.type='triangle';
+            sOsc.frequency.setValueAtTime(220.0,noteTime);
+            sOsc.frequency.exponentialRampToValueAtTime(73.42,noteTime+0.085);
+            sGain.gain.setValueAtTime(0.001,noteTime);
+            sGain.gain.linearRampToValueAtTime(0.22*mVol,noteTime+0.005);
+            sGain.gain.exponentialRampToValueAtTime(0.001,noteTime+0.09);
+            sOsc.connect(sGain);sGain.connect(outNode);
+            sOsc.start(noteTime);sOsc.stop(noteTime+0.095);
+        }
+        const bOsc=audioCtx.createOscillator(),bFilter=audioCtx.createBiquadFilter(),bGain=audioCtx.createGain();
+        bOsc.type='sawtooth';bOsc.frequency.setValueAtTime(GAME_BASS_NOTES[s16],noteTime);
+        bFilter.type='lowpass';bFilter.frequency.setValueAtTime(680,noteTime);
+        bGain.gain.setValueAtTime(0.001,noteTime);
+        bGain.gain.linearRampToValueAtTime(0.30*mVol,noteTime+0.006);
+        bGain.gain.exponentialRampToValueAtTime(0.002,noteTime+0.11);
+        bOsc.connect(bFilter);bFilter.connect(bGain);bGain.connect(outNode);
+        bOsc.start(noteTime);bOsc.stop(noteTime+0.115);
+
+        const lOsc=audioCtx.createOscillator(),lOsc2=audioCtx.createOscillator(),lGain=audioCtx.createGain();
+        lOsc.type='sawtooth';lOsc2.type='triangle';
+        lOsc.frequency.setValueAtTime(GAME_ARP_NOTES[s16],noteTime);
+        lOsc2.frequency.setValueAtTime(GAME_ARP_NOTES[s16]*1.004,noteTime);
+        lGain.gain.setValueAtTime(0.001,noteTime);
+        lGain.gain.linearRampToValueAtTime(0.22*mVol,noteTime+0.006);
+        lGain.gain.exponentialRampToValueAtTime(0.002,noteTime+0.13);
+        lOsc.connect(lGain);lOsc2.connect(lGain);lGain.connect(outNode);
+        lOsc.start(noteTime);lOsc2.start(noteTime);lOsc.stop(noteTime+0.135);lOsc2.stop(noteTime+0.135);
+        synthStep++;
+    }catch(e){}
+}
+
+function ensureAudioEngine(){
+    if(audioCtx&&audioCtx.state==='running'){
+        menuUnlockAudio.pause();
+        return audioCtx;
+    }
+    if(!hasTrustedGesture){
+        return null;
+    }
+    if(!audioCtx){
+        const AC=window.AudioContext||window.webkitAudioContext;
+        if(!AC)return null;
+        audioCtx=new AC();
+
+        masterGainNode=audioCtx.createGain();
+        masterGainNode.gain.setValueAtTime(audioSettings.master,audioCtx.currentTime);
+
+        musicBusNode=audioCtx.createGain();
+        musicBusNode.gain.setValueAtTime(0.76,audioCtx.currentTime);
+        sfxBusNode=audioCtx.createGain();
+        sfxBusNode.gain.setValueAtTime(0.82,audioCtx.currentTime);
+
+        musicBusNode.connect(masterGainNode);
+        sfxBusNode.connect(masterGainNode);
+        masterGainNode.connect(audioCtx.destination);
+
+        // Throaty Roadster / V8 "BRUMMMMM" Engine + Twin-Turbo Nitro Whine
+        engineOsc1=audioCtx.createOscillator();
+        engineOsc2=audioCtx.createOscillator();
+        engineSubOsc=audioCtx.createOscillator();
+        engineTurboOsc=audioCtx.createOscillator();
+        engineRumbleLfo=audioCtx.createOscillator();
+
+        engineFilterNode=audioCtx.createBiquadFilter();
+        engineGain=audioCtx.createGain();
+        engineTurboGain=audioCtx.createGain();
+        engineRumbleGain=audioCtx.createGain();
+
+        engineOsc1.type='sawtooth';
+        engineOsc2.type='sawtooth';
+        engineSubOsc.type='square';
+        engineTurboOsc.type='triangle';
+        engineRumbleLfo.type='sine';
+
+        engineOsc1.frequency.setValueAtTime(85,audioCtx.currentTime);
+        engineOsc2.frequency.setValueAtTime(127.5,audioCtx.currentTime);
+        engineSubOsc.frequency.setValueAtTime(42.5,audioCtx.currentTime);
+        engineTurboOsc.frequency.setValueAtTime(420,audioCtx.currentTime);
+        engineRumbleLfo.frequency.setValueAtTime(28,audioCtx.currentTime);
+
+        engineRumbleGain.gain.setValueAtTime(14,audioCtx.currentTime);
+        engineRumbleLfo.connect(engineRumbleGain);
+        engineRumbleGain.connect(engineOsc1.frequency);
+        engineRumbleGain.connect(engineOsc2.frequency);
+
+        engineFilterNode.type='lowpass';
+        engineFilterNode.frequency.setValueAtTime(720,audioCtx.currentTime);
+        engineFilterNode.Q.setValueAtTime(2.8,audioCtx.currentTime);
+
+        engineGain.gain.setValueAtTime(0.0001,audioCtx.currentTime);
+        engineTurboGain.gain.setValueAtTime(0.0001,audioCtx.currentTime);
+
+        engineOsc1.connect(engineFilterNode);
+        engineOsc2.connect(engineFilterNode);
+        engineSubOsc.connect(engineFilterNode);
+        engineFilterNode.connect(engineGain);
+
+        engineTurboOsc.connect(engineTurboGain);
+        engineTurboGain.connect(sfxBusNode);
+        engineGain.connect(sfxBusNode);
+
+        engineOsc1.start();
+        engineOsc2.start();
+        engineSubOsc.start();
+        engineTurboOsc.start();
+        engineRumbleLfo.start();
+    }
+    if(isAppAudible()&&audioCtx.state!=='running'){
+        audioCtx.resume().then(()=>{
+            menuUnlockAudio.pause();
+            nextSynthNoteTime=audioCtx.currentTime+0.015;
+            nextMenuNoteTime=audioCtx.currentTime+0.015;
+        }).catch(()=>{
+            tryStartMenuUnlockAudio();
+        });
+    }
+    return audioCtx;
+}
+
+function silenceAllAudioForBackground(){
+    menuUnlockAudio.pause();
+    mitadruAudio.pause();
+    customAudio.pause();
+    if(engineGain&&audioCtx){
+        try{
+            engineGain.gain.setTargetAtTime(0.0001,audioCtx.currentTime,0.02);
+            if(engineTurboGain)engineTurboGain.gain.setTargetAtTime(0.0001,audioCtx.currentTime,0.02);
+        }catch(e){}
+    }
+    if(audioCtx&&audioCtx.state==='running'){
+        audioCtx.suspend().catch(()=>{});
+    }
+    updateEqVisuals(false);
+}
+
+function resumeAudioForForeground(){
+    if(!isAppAudible())return;
+    if(hasTrustedGesture)ensureAudioEngine();
+    syncExternalTrackPlayback();
+    updateEngineSoundPitch();
+    updateEqVisuals(gameState.running&&!gameState.paused);
+}
+
+function updateEngineSoundPitch(){
+    if(!audioCtx||!engineOsc1||!engineGain)return;
+    if(audioCtx.state==='suspended'&&hasTrustedGesture&&isAppAudible()){
+        audioCtx.resume().catch(()=>{});
+    }
+    const now=audioCtx.currentTime;
+    if(!gameState.running||gameState.paused||!isAppAudible()||audioSettings.master<=0.01||audioSettings.engine<=0.01){
+        engineGain.gain.setTargetAtTime(0.0001,now,0.04);
+        if(engineTurboGain)engineTurboGain.gain.setTargetAtTime(0.0001,now,0.04);
+        return;
+    }
+
+    const speedRatio=Math.max(0.75,Math.min(2.4,gameState.speedMps/24));
+    const nitroBoostHz=gameState.boosting?46:(gameState.braking?-18:0);
+    const baseFreq=78*speedRatio+nitroBoostHz;
+
+    // Continuous throaty "BRUMMMMM" frequencies
+    engineOsc1.frequency.setTargetAtTime(baseFreq,now,0.04);
+    engineOsc2.frequency.setTargetAtTime(baseFreq*1.498,now,0.04);
+    if(engineSubOsc)engineSubOsc.frequency.setTargetAtTime(baseFreq*0.5,now,0.04);
+    if(engineRumbleLfo)engineRumbleLfo.frequency.setTargetAtTime(gameState.boosting?44:26*speedRatio,now,0.05);
+
+    // Open filter wide on NITRO so the engine roars & intensifies
+    if(engineFilterNode){
+        const targetCutoff=gameState.boosting?2400:(gameState.braking?480:780*speedRatio);
+        engineFilterNode.frequency.setTargetAtTime(targetCutoff,now,0.05);
+        engineFilterNode.Q.setTargetAtTime(gameState.boosting?4.2:2.6,now,0.05);
+    }
+
+    // Main engine rumble volume (intensifies in NITRO)
+    const targetVol=audioSettings.engine*(gameState.boosting?0.42:(gameState.braking?0.20:0.28));
+    engineGain.gain.setTargetAtTime(Math.max(0.0001,targetVol),now,0.05);
+
+    // Secondary Twin-Turbo / Roadster Afterburner Whine during NITRO
+    if(engineTurboOsc&&engineTurboGain){
+        const turboFreq=gameState.boosting?(560+speedRatio*220):(280+speedRatio*90);
+        const turboVol=gameState.boosting?(0.22*audioSettings.engine):(0.025*audioSettings.engine);
+        engineTurboOsc.frequency.setTargetAtTime(turboFreq,now,0.06);
+        engineTurboGain.gain.setTargetAtTime(Math.max(0.0001,turboVol),now,0.06);
+    }
+}
+
+function startUnifiedMusicScheduler(){
+    if(synthLoopTimer)clearInterval(synthLoopTimer);
+    const STEP_GAME_SEC=0.1171875;
+    const STEP_MENU_SEC=0.135;
+    const LOOKAHEAD_SEC=0.24;
+    synthLoopTimer=setInterval(()=>{
+        if(!isAppAudible()||audioSettings.master<=0.01||!hasTrustedGesture){
+            menuUnlockAudio.pause();
+            return;
+        }
+        const isMenuOrPaused=!gameState.running||gameState.paused;
+        if(!audioCtx||audioCtx.state!=='running'){
+            if(!audioCtx)ensureAudioEngine();
+            if(isMenuOrPaused)tryStartMenuUnlockAudio();
+            else menuUnlockAudio.pause();
+            return;
+        }
+        menuUnlockAudio.pause();
+        const now=audioCtx.currentTime;
+        if(isMenuOrPaused){
+            if(nextMenuNoteTime<now||nextMenuNoteTime>now+1.0)nextMenuNoteTime=now+0.015;
+            while(nextMenuNoteTime<now+LOOKAHEAD_SEC){
+                scheduleMenuStepAt(nextMenuNoteTime);
+                nextMenuNoteTime+=STEP_MENU_SEC;
+            }
+            nextSynthNoteTime=0;
+            return;
+        }
+        if(audioSettings.ostMode!=='synth'||audioSettings.music<=0.01)return;
+        if(nextSynthNoteTime<now||nextSynthNoteTime>now+1.0)nextSynthNoteTime=now+0.015;
+        while(nextSynthNoteTime<now+LOOKAHEAD_SEC){
+            scheduleGameplaySynthStepAt(nextSynthNoteTime);
+            nextSynthNoteTime+=STEP_GAME_SEC;
+        }
+        nextMenuNoteTime=0;
+    },25);
+}
+
+function syncExternalTrackPlayback(){
+    const shouldPlay=gameState.running&&!gameState.paused&&isAppAudible();
+    mitadruAudio.volume=Math.min(1,audioSettings.master*audioSettings.music);
+    customAudio.volume=Math.min(1,audioSettings.master*audioSettings.music);
+    menuUnlockAudio.volume=Math.min(1,audioSettings.master*audioSettings.menuMusic*0.85);
+    if(!shouldPlay){
+        mitadruAudio.pause();
+        customAudio.pause();
+        tryStartMenuUnlockAudio();
+        return;
+    }
+    menuUnlockAudio.pause();
+    if(audioSettings.ostMode==='mitadru'){
+        customAudio.pause();
+        if(!mitadruAudio.src||mitadruAudio.src===window.location.href){mitadruIdx=0;mitadruAudio.src=mitadruCandidates[0];}
+        mitadruAudio.play().catch(()=>{});
+    }else if(audioSettings.ostMode==='custom'){
+        mitadruAudio.pause();
+        if(customAudio.src)customAudio.play().catch(()=>{});
+    }else{
+        mitadruAudio.pause();customAudio.pause();
+    }
+}
+
+function selectOstMode(mode){
+    if(mode==='mitadru'&&currentPilot.id!=='1117'){
+        spawnFloatingText("🔒 LOGIN AS ID 1117 (VOID) TO UNLOCK MITADRU.M4A","#f59e0b",0,-25);
+        return;
+    }
+    if(mode==='custom'&&!currentCustomObjectUrl){
+        document.getElementById('customSongStatusText').innerText="⚠️ Upload a song file (≤ 20 MB) first!";
+        return;
+    }
+    audioSettings.ostMode=mode;
+    ['synth','mitadru','custom'].forEach(m=>{
+        const btn=document.getElementById(`ostBtn_${m}`);
+        if(btn)btn.className=(m===mode)?"p-2 rounded-xl text-left border bg-sky-500/20 border-sky-400 text-white cursor-pointer":"p-2 rounded-xl text-left border bg-[#141824] border-[#262f45] text-gray-300 cursor-pointer";
+    });
+    const shortLabel=document.getElementById('hudOstShortLabel');
+    const statusEl=document.getElementById('ostLockStatus');
+    if(shortLabel)shortLabel.innerText=mode==='mitadru'?"MITADRU":(mode==='custom'?"CUSTOM":"SYNTH");
+    if(statusEl)statusEl.innerText=mode==='mitadru'?"Mitadru.m4a Active":(mode==='custom'?"Custom Song Active":"Cyber-Synth Active");
+    syncExternalTrackPlayback();
+    saveSettingsForActiveAccount();
+}
+
+function updateVolumeSetting(ch,val){
+    const num=Math.max(0,Math.min(100,parseInt(val,10)))/100;
+    audioSettings[ch]=num;
+    const lbl=document.getElementById(`volLabel_${ch}`);
+    if(lbl)lbl.innerText=`${Math.round(num*100)}%`;
+    const sld=document.getElementById(`volSlider_${ch}`);
+    if(sld&&String(sld.value)!==String(Math.round(num*100)))sld.value=Math.round(num*100);
+    if(masterGainNode&&audioCtx)masterGainNode.gain.setTargetAtTime(audioSettings.master,audioCtx.currentTime,0.03);
+    mitadruAudio.volume=Math.min(1,audioSettings.master*audioSettings.music);
+    customAudio.volume=Math.min(1,audioSettings.master*audioSettings.music);
+    menuUnlockAudio.volume=Math.min(1,audioSettings.master*audioSettings.menuMusic*0.85);
+    updateEngineSoundPitch();
+    saveSettingsForActiveAccount();
+}
+// ==================== END OF CHUNK 3 OF 6 ====================
+// ==================== START OF CHUNK 4 OF 6 ====================
+function playGameSfx(type){
+    if(audioSettings.master<=0.01||!isAppAudible()||!hasTrustedGesture)return;
+    const nowPerf=performance.now();
+    if(lastSfxTime[type]&&nowPerf-lastSfxTime[type]<55)return;
+    lastSfxTime[type]=nowPerf;
+    try{
+        const actx=ensureAudioEngine();
+        if(!actx||actx.state!=='running')return;
+        const now=actx.currentTime,sVol=audioSettings.sfx,cVol=audioSettings.uiClick;
+        const out=sfxBusNode||masterGainNode;
+        if(type==='uiClick'){
+            if(cVol<=0.01)return;
+            const o=actx.createOscillator(),g=actx.createGain();
+            o.type='sine';o.frequency.setValueAtTime(587.33,now);o.frequency.exponentialRampToValueAtTime(880.0,now+0.045);
+            g.gain.setValueAtTime(0.001,now);
+            g.gain.linearRampToValueAtTime(0.11*cVol,now+0.005);
+            g.gain.exponentialRampToValueAtTime(0.001,now+0.05);
+            o.connect(g);g.connect(out);o.start(now);o.stop(now+0.055);
+            return;
+        }
+        if(sVol<=0.01)return;
+        if(type==='steer'){
+            const o=actx.createOscillator(),g=actx.createGain();
+            o.type='sine';o.frequency.setValueAtTime(349.23,now);o.frequency.exponentialRampToValueAtTime(587.33,now+0.05);
+            g.gain.setValueAtTime(0.001,now);
+            g.gain.linearRampToValueAtTime(0.11*sVol,now+0.005);
+            g.gain.exponentialRampToValueAtTime(0.001,now+0.055);
+            o.connect(g);g.connect(out);o.start(now);o.stop(now+0.06);
+        }else if(type==='nitro'){
+            const roarOsc=actx.createOscillator(),roarSub=actx.createOscillator(),roarFilter=actx.createBiquadFilter(),roarGain=actx.createGain();
+            roarOsc.type='sawtooth';roarSub.type='square';
+            roarOsc.frequency.setValueAtTime(95,now);
+            roarOsc.frequency.exponentialRampToValueAtTime(240,now+0.34);
+            roarSub.frequency.setValueAtTime(48,now);
+            roarSub.frequency.exponentialRampToValueAtTime(120,now+0.34);
+            roarFilter.type='lowpass';
+            roarFilter.frequency.setValueAtTime(450,now);
+            roarFilter.frequency.exponentialRampToValueAtTime(2600,now+0.28);
+            roarFilter.Q.setValueAtTime(3.5,now);
+            roarGain.gain.setValueAtTime(0.001,now);
+            roarGain.gain.linearRampToValueAtTime(0.28*sVol,now+0.015);
+            roarGain.gain.exponentialRampToValueAtTime(0.001,now+0.38);
+            roarOsc.connect(roarFilter);roarSub.connect(roarFilter);roarFilter.connect(roarGain);roarGain.connect(out);
+            roarOsc.start(now);roarSub.start(now);roarOsc.stop(now+0.39);roarSub.stop(now+0.39);
+
+            const spoolOsc=actx.createOscillator(),spoolGain=actx.createGain();
+            spoolOsc.type='triangle';
+            spoolOsc.frequency.setValueAtTime(320,now);
+            spoolOsc.frequency.exponentialRampToValueAtTime(980,now+0.32);
+            spoolGain.gain.setValueAtTime(0.001,now);
+            spoolGain.gain.linearRampToValueAtTime(0.16*sVol,now+0.02);
+            spoolGain.gain.exponentialRampToValueAtTime(0.001,now+0.35);
+            spoolOsc.connect(spoolGain);spoolGain.connect(out);
+            spoolOsc.start(now);spoolOsc.stop(now+0.36);
+        }else if(type==='siren250'){
+            for(let c=0;c<6;c++){
+                const st=now+c*0.5,o=actx.createOscillator(),g=actx.createGain();
+                o.type='triangle';o.frequency.setValueAtTime(440.0,st);o.frequency.linearRampToValueAtTime(880.0,st+0.25);o.frequency.linearRampToValueAtTime(440.0,st+0.48);
+                g.gain.setValueAtTime(0.001,st);
+                g.gain.linearRampToValueAtTime(0.20*sVol,st+0.01);
+                g.gain.exponentialRampToValueAtTime(0.001,st+0.49);
+                o.connect(g);g.connect(out);o.start(st);o.stop(st+0.495);
+            }
+        }else if(type==='phantom'){
+            [587.33,698.46,880.0,1174.66].forEach((f,idx)=>{
+                const o=actx.createOscillator(),g=actx.createGain(),st=now+idx*0.03;
+                o.type='triangle';o.frequency.setValueAtTime(f,st);
+                g.gain.setValueAtTime(0.001,st);
+                g.gain.linearRampToValueAtTime(0.15*sVol,st+0.005);
+                g.gain.exponentialRampToValueAtTime(0.001,st+0.22);
+                o.connect(g);g.connect(out);o.start(st);o.stop(st+0.225);
+            });
+        }else if(type==='pickup'){
+            [587.33,880.0,1174.66].forEach((f,idx)=>{
+                const o=actx.createOscillator(),g=actx.createGain(),st=now+idx*0.035;
+                o.type='sine';o.frequency.setValueAtTime(f,st);
+                g.gain.setValueAtTime(0.001,st);
+                g.gain.linearRampToValueAtTime(0.15*sVol,st+0.005);
+                g.gain.exponentialRampToValueAtTime(0.001,st+0.14);
+                o.connect(g);g.connect(out);o.start(st);o.stop(st+0.145);
+            });
+        }else if(type==='emp'){
+            const o1=actx.createOscillator(),o2=actx.createOscillator(),g=actx.createGain();
+            o1.type='sawtooth';o2.type='triangle';
+            o1.frequency.setValueAtTime(880.0,now);o1.frequency.exponentialRampToValueAtTime(73.42,now+0.52);
+            o2.frequency.setValueAtTime(1174.66,now);o2.frequency.exponentialRampToValueAtTime(146.83,now+0.52);
+            g.gain.setValueAtTime(0.001,now);
+            g.gain.linearRampToValueAtTime(0.20*sVol,now+0.008);
+            g.gain.exponentialRampToValueAtTime(0.001,now+0.55);
+            o1.connect(g);o2.connect(g);g.connect(out);
+            o1.start(now);o2.start(now);o1.stop(now+0.56);o2.stop(now+0.56);
+        }else if(type==='hit'){
+            if(!actx._crashNoiseBuf){
+                const len=Math.floor(actx.sampleRate*0.45);
+                const buf=actx.createBuffer(1,len,actx.sampleRate);
+                const data=buf.getChannelData(0);
+                for(let i=0;i<len;i++){
+                    const n=(Math.random()*2-1);
+                    data[i]=Math.tanh(n*2.2)*Math.pow(1-i/len,0.55);
+                }
+                actx._crashNoiseBuf=buf;
+            }
+
+            // Layer 1: Metallic Crunch & Chassis Scrape
+            const noiseSrc=actx.createBufferSource();
+            noiseSrc.buffer=actx._crashNoiseBuf;
+            const crunchFilter=actx.createBiquadFilter();
+            crunchFilter.type='bandpass';
+            crunchFilter.frequency.setValueAtTime(1850,now);
+            crunchFilter.frequency.exponentialRampToValueAtTime(320,now+0.32);
+            crunchFilter.Q.setValueAtTime(1.4,now);
+            const crunchGain=actx.createGain();
+            crunchGain.gain.setValueAtTime(0.001,now);
+            crunchGain.gain.linearRampToValueAtTime(0.48*sVol,now+0.004);
+            crunchGain.gain.exponentialRampToValueAtTime(0.001,now+0.34);
+            noiseSrc.connect(crunchFilter);
+            crunchFilter.connect(crunchGain);
+            crunchGain.connect(out);
+            noiseSrc.start(now);
+            noiseSrc.stop(now+0.35);
+
+            // Layer 2: High-Frequency Glass / Carbon Shatter Snap
+            const glassSrc=actx.createBufferSource();
+            glassSrc.buffer=actx._crashNoiseBuf;
+            const glassFilter=actx.createBiquadFilter();
+            glassFilter.type='highpass';
+            glassFilter.frequency.setValueAtTime(3200,now);
+            const glassGain=actx.createGain();
+            glassGain.gain.setValueAtTime(0.001,now);
+            glassGain.gain.linearRampToValueAtTime(0.28*sVol,now+0.002);
+            glassGain.gain.exponentialRampToValueAtTime(0.001,now+0.11);
+            glassSrc.connect(glassFilter);
+            glassFilter.connect(glassGain);
+            glassGain.connect(out);
+            glassSrc.start(now);
+            glassSrc.stop(now+0.12);
+
+            // Layer 3: Deep Kinetic Sub-Bass Body Thud
+            const punchOsc=actx.createOscillator(),punchGain=actx.createGain();
+            punchOsc.type='sine';
+            punchOsc.frequency.setValueAtTime(165,now);
+            punchOsc.frequency.exponentialRampToValueAtTime(28,now+0.26);
+            punchGain.gain.setValueAtTime(0.001,now);
+            punchGain.gain.linearRampToValueAtTime(0.52*sVol,now+0.004);
+            punchGain.gain.exponentialRampToValueAtTime(0.001,now+0.28);
+            punchOsc.connect(punchGain);
+            punchGain.connect(out);
+            punchOsc.start(now);
+            punchOsc.stop(now+0.29);
+        }
+    }catch(e){}
+}
+function handleFirstGestureAudioUnlock(e){
+    if(e&&e.isTrusted){
+        hasTrustedGesture=true;
+        if(!isBootSplashDismissed){
+            enterMainMenuFromSplash();
+            return;
+        }
+        if(!audioCtx||audioCtx.state!=='running'){
+            ensureAudioEngine();
+        }else{
+            menuUnlockAudio.pause();
+        }
+    }
+}
+['touchstart','touchend','pointerdown','mousedown','keydown','click'].forEach(evt=>{
+    window.addEventListener(evt,handleFirstGestureAudioUnlock,{capture:true,passive:true});
+});
+
+document.addEventListener('pointerdown',(e)=>{
+    if(e.isTrusted)hasTrustedGesture=true;
+    const btn=e.target.closest('button');
+    if(btn&&!btn.disabled&&!btn.classList.contains('touch-paddle'))playGameSfx('uiClick');
+},{passive:true});
+
+function updateEqVisuals(playing){
+    document.querySelectorAll('.eq-bar').forEach(b=>b.classList.toggle('eq-paused',!(playing&&audioSettings.master>0.01&&audioSettings.music>0.01)));
+}
+
+const LB_STORAGE_KEY='roadSense_overdrive_leaderboard_v8';
+const CLOUD_SYNC_TOPIC='roadsense_overdrive_global_lb_sync_v8';
+const CLOUD_SYNC_URL=`https://ntfy.sh/${CLOUD_SYNC_TOPIC}`;
+const lbChannel=('BroadcastChannel' in window)?new BroadcastChannel('roadsense_overdrive_lb_v8'):null;
+let isPullingCloud=false,liveEventSource=null;
+let lastCloudResetTs=Number(localStorage.getItem('roadSense_overdrive_resetTs_v8')||0);
+
+function getLocalLeaderboard(){
+    try{
+        const parsed=JSON.parse(localStorage.getItem(LB_STORAGE_KEY)||'[]');
+        const delSet=new Set(getDeletedAccountKeys());
+        return(Array.isArray(parsed)?parsed:[]).filter(e=>e&&e.score>0&&!delSet.has(e.accountKey||e.id));
+    }catch(e){return [];}
+}
+
+function saveLocalLeaderboard(list){
+    const delSet=new Set(getDeletedAccountKeys());
+    const valid=(Array.isArray(list)?list:[])
+        .filter(e=>e&&e.score>0&&!delSet.has(e.accountKey||e.id))
+        .sort((a,b)=>b.score-a.score)
+        .slice(0,100);
+    localStorage.setItem(LB_STORAGE_KEY,JSON.stringify(valid));
+    updateTopLeaderBanner(valid);
+    return valid;
+}
+
+function mergeRemoteLeaderboardPacket(packet){
+    if(!packet||typeof packet!=='object')return;
+    if(packet.resetTs&&Number(packet.resetTs)>lastCloudResetTs){
+        lastCloudResetTs=Number(packet.resetTs);
+        localStorage.setItem('roadSense_overdrive_resetTs_v8',String(lastCloudResetTs));
+        localStorage.setItem(LB_STORAGE_KEY,JSON.stringify([]));
+    }
+    if(Array.isArray(packet.deletedAccounts)&&packet.deletedAccounts.length>0){
+        saveDeletedAccountKeys(Array.from(new Set([...getDeletedAccountKeys(),...packet.deletedAccounts])));
+    }
+    const delSet=new Set(getDeletedAccountKeys());
+    const mapByKey=new Map();
+    getLocalLeaderboard().forEach(item=>{
+        const k=item.accountKey||item.id;
+        if(!delSet.has(k)&&item.score>0)mapByKey.set(k,item);
+    });
+    (Array.isArray(packet.entries)?packet.entries:[]).forEach(rem=>{
+        if(!rem||!rem.score||rem.score<=0)return;
+        if(rem.ts&&lastCloudResetTs&&rem.ts<lastCloudResetTs)return;
+        const k=rem.accountKey||rem.id;
+        if(delSet.has(k))return;
+        const ex=mapByKey.get(k);
+        if(!ex||rem.score>ex.score){
+            mapByKey.set(k,{id:rem.id||'GUEST',guestId:rem.guestId||'',accountKey:k,name:rem.name||'Guest Pilot',score:Number(rem.score),epoch:Number(rem.epoch||1),ts:Number(rem.ts||Date.now())});
+        }
+    });
+    saveLocalLeaderboard(Array.from(mapByKey.values()));
+    if(document.getElementById('leaderboardModal').style.display!=='none')renderLeaderboardList();
+}
+
+function pushCloudLeaderboardPacket(extra={}){
+    const payload={type:'lb_sync_v8',resetTs:lastCloudResetTs,entries:getLocalLeaderboard().slice(0,35),deletedAccounts:getDeletedAccountKeys(),...extra};
+    if(lbChannel){try{lbChannel.postMessage(payload);}catch(e){}}
+    fetch(CLOUD_SYNC_URL,{method:'POST',body:JSON.stringify(payload)}).catch(()=>{});
+}
+
+function startLiveLeaderboardStream(){
+    if(liveEventSource||typeof EventSource==='undefined')return;
+    try{
+        liveEventSource=new EventSource(`${CLOUD_SYNC_URL}/sse`);
+        liveEventSource.onmessage=(ev)=>{
+            try{
+                const data=JSON.parse(ev.data);
+                if(data&&data.message){
+                    const pkt=JSON.parse(data.message);
+                    if(pkt&&pkt.type==='lb_sync_v8')mergeRemoteLeaderboardPacket(pkt);
+                }
+            }catch(e){}
+        };
+        liveEventSource.onerror=()=>{
+            try{liveEventSource.close();}catch(e){}
+            liveEventSource=null;
+            setTimeout(startLiveLeaderboardStream,5000);
+        };
+    }catch(e){}
+}
+
+async function pullGlobalCloudLeaderboard(){
+    if(isPullingCloud||document.hidden)return;
+    isPullingCloud=true;
+    const ctrl=new AbortController();
+    const tid=setTimeout(()=>ctrl.abort(),2800);
+    try{
+        const res=await fetch(`${CLOUD_SYNC_URL}/json?poll=1&since=24h`,{signal:ctrl.signal});
+        if(res.ok){
+            const text=await res.text();
+            for(const line of text.trim().split('\n')){
+                if(!line)continue;
+                try{
+                    const w=JSON.parse(line);
+                    if(w&&w.event==='message'&&w.message){
+                        const pkt=JSON.parse(w.message);
+                        if(pkt&&pkt.type==='lb_sync_v8')mergeRemoteLeaderboardPacket(pkt);
+                    }
+                }catch(e){}
+            }
+        }
+    }catch(e){}finally{
+        clearTimeout(tid);
+        isPullingCloud=false;
+    }
+}
+
+function recordScoreToLeaderboard(scoreVal,epochVal,pushRemote=true){
+    if(!scoreVal||scoreVal<=0)return;
+    const accountKey=getActiveAccountStorageKey();
+    const pid=currentPilot.isCore?currentPilot.id:'GUEST';
+    const gid=currentPilot.isCore?'':ensureGuestHas4DigitId();
+    const pName=currentPilot.isCore?currentPilot.name:getEffectiveGuestFullLabel();
+    saveDeletedAccountKeys(getDeletedAccountKeys().filter(k=>k!==accountKey));
+    const list=getLocalLeaderboard();
+    const idx=list.findIndex(e=>(e.accountKey||e.id)===accountKey);
+    let changed=false;
+    if(idx>=0){
+        if(scoreVal>list[idx].score){
+            list[idx].score=scoreVal;
+            list[idx].epoch=Math.max(list[idx].epoch||1,epochVal);
+            list[idx].name=pName;
+            list[idx].guestId=gid;
+            list[idx].ts=Date.now();
+            changed=true;
+        }
+    }else{
+        list.push({id:pid,guestId:gid,accountKey,name:pName,score:scoreVal,epoch:epochVal,ts:Date.now()});
+        changed=true;
+    }
+    if(changed){
+        saveLocalLeaderboard(list);
+        if(pushRemote)pushCloudLeaderboardPacket();
+    }
+}
+
+function updateTopLeaderBanner(list=null){
+    const arr=list||getLocalLeaderboard();
+    const top=arr[0]||null;
+    if(top&&top.score>0){
+        setTextCached('bootTopLeaderName',top.name);
+        setTextCached('bootTopLeaderScore',`(${top.score.toLocaleString()})`);
+        setTextCached('hudLeaderMini',`${top.name.split(' ')[0]} (${top.score.toLocaleString()})`);
+    }else{
+        setTextCached('bootTopLeaderName',"Unclaimed");
+        setTextCached('bootTopLeaderScore',"");
+        setTextCached('hudLeaderMini',"Unclaimed");
+    }
+}
+
+function extractGuestIdTag(entry){
+    if(entry.guestId)return entry.guestId;
+    const m1=String(entry.accountKey||'').match(/(\d{4})$/);
+    if(m1)return m1[1];
+    const m2=String(entry.name||'').match(/#(\d{4})/);
+    if(m2)return m2[1];
+    return "GUEST";
+}
+
+function renderLeaderboardList(){
+    const container=document.getElementById('leaderboardListContainer');
+    if(!container)return;
+    const list=getLocalLeaderboard();
+    const isAdmin=(currentPilot.id==='1117');
+    if(list.length===0){
+        container.innerHTML=`<div class="recessed-well p-6 rounded-xl text-center space-y-1"><div class="text-sm font-bold text-white">No Runs Recorded Yet</div><p class="text-xs text-gray-400">Complete a run to claim #1 on the Global Leaderboard!</p></div>`;
+        return;
+    }
+    const medals=["🥇 #1","🥈 #2","🥉 #3"];
+    container.innerHTML=list.map((entry,idx)=>{
+        const prof=PILOT_PROFILES[entry.id]||PILOT_PROFILES["GUEST"];
+        const isCore=Boolean(PILOT_PROFILES[entry.id]&&entry.id!=='GUEST');
+        const accKey=entry.accountKey||entry.id;
+        const gTag=isCore?'':extractGuestIdTag(entry);
+        const dispName=(!isCore&&gTag!=='GUEST'&&!String(entry.name).includes(`#${gTag}`))?`${entry.name} (#${gTag})`:entry.name;
+        const delBtn=isAdmin?`<button type="button" onclick="adminDeleteIndividualScore('${escapeHtml(accKey)}')" class="ml-2 px-2 py-1 rounded bg-red-600/85 hover:bg-red-500 text-white text-[9px] mono-num font-bold cursor-pointer">🗑️ Delete</button>`:'';
+        const badge=prof.isVoidChroma
+            ?`<span class="px-1.5 py-0.5 text-[9px] mono-num font-extrabold rounded bg-cyan-500/20 text-cyan-300 border border-cyan-400/50">👑 ARCHITECT VOID</span>`
+            :(isCore
+                ?`<span class="px-1.5 py-0.5 text-[9px] mono-num font-bold rounded bg-white/10 text-gray-200">⚡ CORE #${entry.id}</span>`
+                :`<span class="px-1.5 py-0.5 text-[9px] mono-num rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">👤 GUEST #${escapeHtml(gTag)}</span>`);
+        return `<div class="p-3 rounded-xl flex items-center justify-between gap-2 transition ${prof.lbClass}"><div class="flex items-center gap-2.5 min-w-0"><span class="mono-num text-xs font-black text-white px-2 py-1 rounded bg-black/40 border border-white/10 shrink-0">${medals[idx]||`#${idx+1}`}</span><div class="min-w-0"><div class="flex items-center gap-1.5 flex-wrap"><span class="text-xs sm:text-sm truncate ${prof.nameClass}">${escapeHtml(dispName)}</span>${badge}</div><div class="text-[10px] mono-num text-gray-400">Epoch ${entry.epoch||1} &bull; ${prof.liveryName}</div></div></div><div class="flex items-center shrink-0"><span class="mono-num text-sm sm:text-base font-black text-emerald-400">${entry.score.toLocaleString()}</span>${delBtn}</div></div>`;
+    }).join('');
+}
+
+function adminDeleteIndividualScore(targetKey){
+    if(currentPilot.id!=='1117')return;
+    const delList=getDeletedAccountKeys();
+    if(!delList.includes(targetKey)){delList.push(targetKey);saveDeletedAccountKeys(delList);}
+    const db=getAccountsDatabase();
+    if(db[targetKey]){
+        if(PILOT_PROFILES[targetKey]&&PILOT_PROFILES[targetKey].isCore){db[targetKey].bestScore=0;db[targetKey].bestEpoch=1;}
+        else delete db[targetKey];
+        saveAccountsDatabase(db);
+    }
+    saveLocalLeaderboard(getLocalLeaderboard().filter(e=>(e.accountKey||e.id)!==targetKey));
+    pushCloudLeaderboardPacket();
+    renderLeaderboardList();
+    refreshAccountStatsUI();
+}
+
+function adminDeleteAllGuestAccounts(){
+    if(currentPilot.id!=='1117')return;
+    const db=getAccountsDatabase();
+    const delSet=new Set(getDeletedAccountKeys());
+    Object.keys(db).forEach(k=>{if(!PILOT_PROFILES[k]||!PILOT_PROFILES[k].isCore){delSet.add(k);delete db[k];}});
+    getLocalLeaderboard().forEach(e=>{const k=e.accountKey||e.id;if(!PILOT_PROFILES[e.id]||!PILOT_PROFILES[e.id].isCore)delSet.add(k);});
+    saveDeletedAccountKeys(Array.from(delSet));
+    saveAccountsDatabase(db);
+    saveLocalLeaderboard(getLocalLeaderboard().filter(e=>PILOT_PROFILES[e.id]&&PILOT_PROFILES[e.id].isCore));
+    pushCloudLeaderboardPacket();
+    renderLeaderboardList();
+    refreshAccountStatsUI();
+    showDevConsoleFeedback("✓ All Guest Accounts & Guest Votes Deleted!");
+}
+
+function adminResetAllLeaderboardScores(){
+    if(currentPilot.id!=='1117')return;
+    const db=getAccountsDatabase();
+    Object.keys(db).forEach(k=>{
+        if(!PILOT_PROFILES[k]||!PILOT_PROFILES[k].isCore)delete db[k];
+        else{db[k].bestScore=0;db[k].bestEpoch=1;}
+    });
+    saveAccountsDatabase(db);
+    lastCloudResetTs=Date.now();
+    localStorage.setItem('roadSense_overdrive_resetTs_v8',String(lastCloudResetTs));
+    saveLocalLeaderboard([]);
+    pushCloudLeaderboardPacket({resetTs:lastCloudResetTs,entries:[]});
+    renderLeaderboardList();
+    refreshAccountStatsUI();
+    showDevConsoleFeedback("✓ All Leaderboard Scores (Including Core) Reset!");
+}
+
+function syncDevDimensionsButtonLabel(){
+    const btn=document.getElementById('devToggleDimsBtn');
+    if(!btn)return;
+    btn.innerText=devAllDimensionsUnlocked?"🔒 Relock All Dimensions":"🔓 Unlock All Dimensions";
+    btn.className=devAllDimensionsUnlocked
+        ?"p-2 rounded-xl bg-amber-950/70 hover:bg-amber-800/80 text-amber-200 border border-amber-500/40 text-[10.5px] mono-num font-bold cursor-pointer text-center"
+        :"p-2 rounded-xl bg-purple-950/70 hover:bg-purple-800/80 text-purple-200 border border-purple-500/40 text-[10.5px] mono-num font-bold cursor-pointer text-center";
+}
+
+function devToggleAllDimensionsLock(){
+    if(currentPilot.id!=='1117')return;
+    devAllDimensionsUnlocked=!devAllDimensionsUnlocked;
+    if(!devAllDimensionsUnlocked&&biomeIdx!==0){
+        biomeIdx=0;cachedGradients.key='';
+        setTextCached('hudBiomeName',BIOME_THEMES[0].label);
+    }
+    syncDevDimensionsButtonLabel();
+    buildBiomeSelectorGrid();
+    showDevConsoleFeedback(devAllDimensionsUnlocked?"✓ All 14 Dimensions Unlocked!":"🔒 Dimensions Relocked to 10-Epoch Progression!");
+    playGameSfx('pickup');
+}
+
+function showDevConsoleFeedback(msg){
+    const fb=document.getElementById('devConsoleFeedback');
+    if(fb){fb.innerText=msg;fb.classList.remove('hidden');}
+}
+
+function getDistanceForEpoch(ep){
+    const e=Math.max(1,Math.floor(ep));
+    return e<=250?(e-1)*70:249*70+EPOCH_250_LENGTH_M+(e-251)*70;
+}
+
+function getEpochFromDistance(distM){
+    const d250Start=249*70,d250End=d250Start+EPOCH_250_LENGTH_M;
+    if(distM<d250Start)return 1+Math.floor(distM/70);
+    if(distM<d250End)return 250;
+    return 251+Math.floor((distM-d250End)/70);
+}
+
+function devStartAtCustomEpoch(){
+    if(currentPilot.id!=='1117')return;
+    const inp=document.getElementById('devEpochInput');
+    startGameSession(Math.max(1,Math.min(99999,parseInt(inp?inp.value:'250',10)||250)));
+}
+
+function devRefillAllSystems(){
+    if(currentPilot.id!=='1117')return;
+    gameState.armor=100;gameState.nitroFuel=100;gameState.empCharge=100;
+    updateHudDOM(true);
+    spawnFloatingText("⚡ ARCHITECT OVERRIDE: 100% HULL + NITRO + EMP!","#00f5d4",0,-45);
+    playGameSfx('pickup');
+}
+
+function openLeaderboardModal(){
+    renderLeaderboardList();
+    pullGlobalCloudLeaderboard();
+    document.getElementById('leaderboardModal').style.display='flex';
+    syncCursorVisibility();
+}
+
+function closeLeaderboardModal(){
+    document.getElementById('leaderboardModal').style.display='none';
+    syncCursorVisibility();
+}
+
+const DIFFICULTY_PRESETS={
+    easy:{label:"🟢 Assisted Easy",speedMul:0.72,spawnMeters:32.0,hitboxScale:0.78,scoreMul:1.0,nitroRegen:6.8,empRegen:4.8,pickupSpacing:21.0,pickupScale:1.00},
+    normal:{label:"🔵 Telemetry Normal",speedMul:0.84,spawnMeters:26.5,hitboxScale:0.84,scoreMul:1.2,nitroRegen:4.2,empRegen:3.0,pickupSpacing:25.0,pickupScale:0.86},
+    hard:{label:"🟠 Overdrive Hard",speedMul:0.95,spawnMeters:22.5,hitboxScale:0.89,scoreMul:1.5,nitroRegen:2.3,empRegen:1.6,pickupSpacing:29.0,pickupScale:0.74},
+    void:{label:"🔮 Void Max",speedMul:1.06,spawnMeters:19.0,hitboxScale:0.93,scoreMul:2.0,nitroRegen:1.1,empRegen:0.7,pickupSpacing:34.0,pickupScale:0.62}
+};
+let currentDiffKey='easy';
+
+const GRAPHICS_PRESETS={
+    low:{title:"Low",resScale:0.75,roadSlices:18,particles:0.25,bloom:false,shake:false,transitions:true,scanlines:false,pillars:false,reflections:false,speedLines:false,hudBoxes:true},
+    medium:{title:"Medium",resScale:1.00,roadSlices:26,particles:0.65,bloom:true,shake:true,transitions:true,scanlines:false,pillars:true,reflections:false,speedLines:false,hudBoxes:true},
+    high:{title:"High",resScale:1.25,roadSlices:36,particles:1.00,bloom:true,shake:true,transitions:true,scanlines:false,pillars:true,reflections:true,speedLines:true,hudBoxes:true},
+    ultra:{title:"Ultra",resScale:1.50,roadSlices:48,particles:1.50,bloom:true,shake:true,transitions:true,scanlines:false,pillars:true,reflections:true,speedLines:true,hudBoxes:true}
 };
 
-const STAR_COLORS = ['#ffffff', '#7dd3fc', '#f472b6', '#c084fc', '#fde68a', '#00f5d4'];
-for (let i = 0; i < 85; i++) gameState.stars.push({ x: Math.random(), y: Math.random() * 0.41, s: Math.random() * 1.8 + 0.6, sp: Math.random() * 0.25 + 0.06, col: STAR_COLORS[i % STAR_COLORS.length] });
+const gfxSettings={
+    preset:'medium',filter:'filter-standard',resScale:1.00,roadSlices:26,particles:0.65,
+    bloom:true,shake:true,transitions:true,scanlines:false,
+    pillars:true,reflections:false,speedLines:false,hudBoxes:true
+};
 
-const IDD_HAZARD_CLASSES = [
-    { id: 0, name: 'auto_rickshaw', speedMul: 0.55, color: '#f59e0b', roof: '#1e293b', points: 120 },
-    { id: 1, name: 'bus_truck',     speedMul: 0.45, color: '#ef4444', roof: '#450a0a', points: 180 },
-    { id: 2, name: 'car',           speedMul: 0.65, color: '#38bdf8', roof: '#0c4a6e', points: 140 },
-    { id: 3, name: 'two_wheeler',   speedMul: 0.75, color: '#a855f7', roof: '#3b0764', points: 160 },
-    { id: 4, name: 'pedestrian',    speedMul: 0.12, color: '#fb7185', roof: '#881337', points: 200 },
-    { id: 5, name: 'stray_animal',  speedMul: 0.08, color: '#fbbf24', roof: '#78350f', points: 190 },
-    { id: 6, name: 'pothole',       speedMul: 0.00, color: '#64748b', roof: '#0f172a', points: 100, flat: true },
-    { id: 7, name: 'speed_bump',    speedMul: 0.00, color: '#eab308', roof: '#422006', points: 90,  flat: true }
+const GFX_TOGGLE_META=[
+    {k:'bloom',lbl:'💡 Glow'},
+    {k:'shake',lbl:'📳 Shake'},
+    {k:'transitions',lbl:'🌀 FX Anim'},
+    {k:'scanlines',lbl:'📺 Scanline'},
+    {k:'pillars',lbl:'🏛️ Sky Art'},
+    {k:'reflections',lbl:'✨ Road Sheen'},
+    {k:'speedLines',lbl:'💨 Warp Lines'},
+    {k:'hudBoxes',lbl:'📦 YOLO Boxes'}
 ];
 
-const REAL_LIFE_HAZARD_DIMS = { 0: { w: 20, h: 22 }, 1: { w: 28, h: 29 }, 2: { w: 24, h: 21 }, 3: { w: 13, h: 21 }, 4: { w: 13, h: 22 }, 5: { w: 18, h: 17 }, 6: { w: 22, h: 10 }, 7: { w: 26, h: 9 } };
-const CLASS_SCALE_STOPPERS = {
-    0: { laneFrac: 0.38, zStop: 2.25, unitW: 20 }, 1: { laneFrac: 0.48, zStop: 2.35, unitW: 28 },
-    2: { laneFrac: 0.44, zStop: 2.20, unitW: 24 }, 3: { laneFrac: 0.26, zStop: 2.30, unitW: 13 },
-    4: { laneFrac: 0.24, zStop: 2.35, unitW: 13 }, 5: { laneFrac: 0.27, zStop: 2.40, unitW: 18 },
-    6: { laneFrac: 0.46, zStop: 2.20, unitW: 22 }, 7: { laneFrac: 0.56, zStop: 2.15, unitW: 26 },
-    pickup: { laneFrac: 0.22, zStop: 2.30, unitW: 12 }
+function buildGraphicsUI(){
+    const pGrid=document.getElementById('gfxPresetButtonsGrid');
+    if(pGrid){
+        pGrid.innerHTML=['low','medium','high','ultra'].map(k=>{
+            const p=GRAPHICS_PRESETS[k];
+            const active=(gfxSettings.preset===k);
+            return `<button type="button" onclick="applyGraphicsPreset('${k}',true)" class="py-1.5 px-2 rounded-lg text-[10.5px] font-bold cursor-pointer border truncate ${active?'bg-sky-500 text-black border-sky-400':'bg-[#151a26] text-gray-300 border-[#262f45] hover:text-white'}">${p.title}</button>`;
+        }).join('');
+    }
+    const tGrid=document.getElementById('gfxTogglesGrid');
+    if(tGrid){
+        tGrid.innerHTML=GFX_TOGGLE_META.map(t=>`<button type="button" id="gfxToggle_${t.k}" onclick="toggleGfxOption('${t.k}')" class="p-1.5 rounded-lg text-[10px] font-bold cursor-pointer truncate"></button>`).join('');
+        GFX_TOGGLE_META.forEach(t=>applyGfxOptionState(t.k,gfxSettings[t.k],false));
+    }
+    const fGrid=document.getElementById('gfxFilterButtonsGrid');
+    const filters=[
+        {k:'filter-standard',lbl:'✨ Standard Optic'},
+        {k:'filter-requiem-noir',lbl:'🖤 RE: Requiem Noir'},
+        {k:'filter-requiem-ash',lbl:'🌫️ RE: Requiem Ash'},
+        {k:'filter-dl2-grit',lbl:'🌇 DL2: Harran Grit'},
+        {k:'filter-dl2-darkzone',lbl:'🌑 DL2: Darkzone'},
+        {k:'filter-stark-mono',lbl:'⚡ High-Contrast B&W'}
+    ];
+    if(fGrid){
+        fGrid.innerHTML=filters.map(f=>`<button type="button" onclick="setVisualFilter('${f.k}')" id="flt_${f.k}" class="p-2 rounded-lg text-[10.5px] font-semibold cursor-pointer truncate"></button>`).join('');
+        setVisualFilter(gfxSettings.filter,false);
+    }
+}
+
+function applyGraphicsPreset(presetKey,shouldSave=true){
+    const p=GRAPHICS_PRESETS[presetKey]||GRAPHICS_PRESETS.medium;
+    gfxSettings.preset=GRAPHICS_PRESETS[presetKey]?presetKey:'medium';
+    const pLbl=document.getElementById('gfxPresetActiveLabel');
+    if(pLbl)pLbl.innerText=p.title.toUpperCase();
+    updateGfxResolution(Math.round(p.resScale*100),false);
+    updateGfxDrawSlices(p.roadSlices,false);
+    updateGfxParticles(Math.round(p.particles*100),false);
+    GFX_TOGGLE_META.forEach(t=>applyGfxOptionState(t.k,p[t.k],false));
+    buildGraphicsUI();
+    resizeGameCanvas();
+    if(shouldSave)saveSettingsForActiveAccount();
+}
+
+function updateGfxResolution(val,shouldSave=true){
+    const num=Math.max(60,Math.min(150,parseInt(val,10)||100));
+    gfxSettings.resScale=num/100;
+    const lbl=document.getElementById('gfxResLabel');
+    if(lbl)lbl.innerText=`${gfxSettings.resScale.toFixed(2)}x`;
+    const sld=document.getElementById('gfxResSlider');
+    if(sld&&String(sld.value)!==String(num))sld.value=num;
+    resizeGameCanvas();
+    if(shouldSave)saveSettingsForActiveAccount();
+}
+
+function updateGfxDrawSlices(val,shouldSave=true){
+    const num=Math.max(16,Math.min(48,parseInt(val,10)||32));
+    gfxSettings.roadSlices=num;
+    const lbl=document.getElementById('gfxSlicesLabel');
+    if(lbl)lbl.innerText=`${num} Seg`;
+    const sld=document.getElementById('gfxSlicesSlider');
+    if(sld&&String(sld.value)!==String(num))sld.value=num;
+    if(shouldSave)saveSettingsForActiveAccount();
+}
+
+function updateGfxParticles(val,shouldSave=true){
+    const num=Math.max(0,Math.min(150,parseInt(val,10)||100));
+    gfxSettings.particles=num/100;
+    const lbl=document.getElementById('gfxParticleLabel');
+    if(lbl)lbl.innerText=`${num}%`;
+    const sld=document.getElementById('gfxParticleSlider');
+    if(sld&&String(sld.value)!==String(num))sld.value=num;
+    if(shouldSave)saveSettingsForActiveAccount();
+}
+
+function applyGfxOptionState(opt,val,shouldSave=true){
+    gfxSettings[opt]=Boolean(val);
+    const btn=document.getElementById(`gfxToggle_${opt}`);
+    const meta=GFX_TOGGLE_META.find(m=>m.k===opt);
+    if(btn&&meta){
+        btn.innerText=`${meta.lbl}: ${gfxSettings[opt]?'ON':'OFF'}`;
+        btn.className=gfxSettings[opt]
+            ?"p-1.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold cursor-pointer truncate"
+            :"p-1.5 rounded-lg bg-[#151a26] text-gray-400 border border-[#262f45] text-[10px] font-bold cursor-pointer truncate";
+    }
+    if(opt==='scanlines'){
+        const ov=document.getElementById('atmosphereOverlay');
+        if(ov)ov.classList.toggle('scanlines-active',gfxSettings.scanlines);
+    }
+    if(shouldSave)saveSettingsForActiveAccount();
+}
+
+function toggleGfxOption(opt){applyGfxOptionState(opt,!gfxSettings[opt],true);}
+
+function setVisualFilter(fc,shouldSave=true){
+    gfxSettings.filter=fc;
+    canvas.className=fc;
+    ['filter-standard','filter-requiem-noir','filter-requiem-ash','filter-dl2-grit','filter-dl2-darkzone','filter-stark-mono'].forEach(k=>{
+        const btn=document.getElementById(`flt_${k}`);
+        if(!btn)return;
+        const titles={'filter-standard':'✨ Standard Optic','filter-requiem-noir':'🖤 RE: Requiem Noir','filter-requiem-ash':'🌫️ RE: Requiem Ash','filter-dl2-grit':'🌇 DL2: Harran Grit','filter-dl2-darkzone':'🌑 DL2: Darkzone','filter-stark-mono':'⚡ High-Contrast B&W'};
+        btn.innerText=titles[k];
+        btn.className=(k===fc)?"p-2 rounded-lg text-[10.5px] font-bold bg-sky-500 text-black cursor-pointer truncate":"p-2 rounded-lg text-[10.5px] font-semibold bg-[#151a26] text-gray-300 border border-[#262f45] cursor-pointer truncate";
+    });
+    if(shouldSave)saveSettingsForActiveAccount();
+}
+// ==================== END OF CHUNK 4 OF 6 ====================
+// ==================== START OF CHUNK 5 OF 6 ====================
+let isPortalExiting=false;
+const CLOUD_SYNC_URL_V10='https://ntfy.sh/roadsense_overdrive_global_lb_sync_v10';
+const CLEAN_SLATE_KEY_V10='roadSense_overdrive_clean_slate_v10';
+
+// One-time cleanup to wipe out the old false/cached scores & phantom flashes from v8
+(function enforceCleanSlateV10(){
+    if(localStorage.getItem(CLEAN_SLATE_KEY_V10)!=='true'){
+        localStorage.removeItem(ACCOUNTS_DB_KEY);
+        localStorage.removeItem(LB_STORAGE_KEY);
+        localStorage.removeItem(DELETED_ACCOUNTS_KEY);
+        lastCloudResetTs=Date.now();
+        localStorage.setItem('roadSense_overdrive_resetTs_v8',String(lastCloudResetTs));
+        localStorage.setItem(CLEAN_SLATE_KEY_V10,'true');
+    }
+})();
+
+// Glitch-proof DOM text & bar updater
+function setTextCached(id,val){
+    const strVal=String(val);
+    domCache[id]=strVal;
+    const el=document.getElementById(id);
+    if(el&&el.innerText!==strVal)el.innerText=strVal;
+}
+function setStyleWidthCached(id,wStr){
+    const k=id+'_w';
+    domCache[k]=wStr;
+    const el=document.getElementById(id);
+    if(el&&el.style.width!==wStr)el.style.width=wStr;
+}
+
+// Match Core Pilot by 4-digit ID or typed name (Mitadru/Void, Ritam, Meraj, Sourajita, Debankita)
+function resolveCorePilotFromInputs(rawIdStr,rawNameStr){
+    const cleanId=(rawIdStr||"").trim();
+    if(PILOT_PROFILES[cleanId]&&cleanId!=="GUEST")return cleanId;
+    const cleanName=(rawNameStr||"").trim().toLowerCase();
+    if(!cleanName)return null;
+    if(cleanName==="1117"||cleanName.includes("mitadru")||cleanName==="void")return "1117";
+    if(cleanName==="1183"||cleanName.includes("ritam"))return "1183";
+    if(cleanName==="1134"||cleanName.includes("meraj"))return "1134";
+    if(cleanName==="1075"||cleanName.includes("sourajita"))return "1075";
+    if(cleanName==="1174"||cleanName.includes("debankita"))return "1174";
+    return null;
+}
+
+// Never allow Core Pilot IDs to be added to deleted accounts
+function sanitizeDeletedAccountKeys(){
+    const raw=getDeletedAccountKeys();
+    const cleaned=(Array.isArray(raw)?raw:[]).filter(k=>k&&!CORE_IDS.has(String(k)));
+    if(cleaned.length!==raw.length)saveDeletedAccountKeys(cleaned);
+    return cleaned;
+}
+
+function getActiveAccountStorageKey(){
+    if(currentPilot&&currentPilot.isCore)return currentPilot.id;
+    return `GUEST_ID_${ensureGuestHas4DigitId()}`;
+}
+
+function normalizeEntryAccountKey(entry){
+    if(!entry)return "";
+    const idStr=String(entry.id||"");
+    const accStr=String(entry.accountKey||"");
+    if(CORE_IDS.has(idStr))return idStr;
+    if(CORE_IDS.has(accStr))return accStr;
+    const matchedCore=resolveCorePilotFromInputs(idStr,entry.name);
+    if(matchedCore)return matchedCore;
+    if(accStr.startsWith("GUEST_ID_"))return accStr;
+    if(entry.guestId&&/^\d{4}$/.test(String(entry.guestId)))return `GUEST_ID_${entry.guestId}`;
+    const m=String(entry.name||"").match(/#(\d{4})/);
+    if(m)return `GUEST_ID_${m[1]}`;
+    return accStr||`GUEST_ID_${ensureGuestHas4DigitId()}`;
+}
+
+// Syncs Personal Best DB and Leaderboard DB while respecting resets (never invents false scores)
+function reconcileAllPilotScores(){
+    const delSet=new Set(sanitizeDeletedAccountKeys());
+    const db=getAccountsDatabase();
+    let rawLb=[];
+    try{rawLb=JSON.parse(localStorage.getItem(LB_STORAGE_KEY)||'[]');}catch(e){rawLb=[];}
+    if(!Array.isArray(rawLb))rawLb=[];
+
+    const lbMap=new Map();
+
+    // 1. Fold valid leaderboard entries (ignoring any entry older than lastCloudResetTs)
+    rawLb.forEach(item=>{
+        if(!item)return;
+        const sc=Number(item.score)||0;
+        const itemTs=Number(item.ts)||0;
+        if(sc<=0)return;
+        if(lastCloudResetTs&&itemTs>0&&itemTs<lastCloudResetTs)return;
+        const k=normalizeEntryAccountKey(item);
+        if(!k||delSet.has(k))return;
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const gid=isCore?"":(item.guestId||extractGuestIdTag(item));
+        const canonicalName=isCore?prof.name:(item.name||'Guest Pilot');
+        const ep=Math.max(1,Number(item.epoch)||1);
+        const prev=lbMap.get(k);
+        if(!prev||sc>prev.score||(sc===prev.score&&ep>prev.epoch)){
+            lbMap.set(k,{
+                id:isCore?k:'GUEST',
+                guestId:isCore?'':(gid==='GUEST'?'':gid),
+                accountKey:k,
+                name:canonicalName,
+                score:Math.max(sc,prev?prev.score:0),
+                epoch:Math.max(ep,prev?prev.epoch:1),
+                ts:Math.max(itemTs,prev?prev.ts:0)||Date.now()
+            });
+        }
+    });
+
+    // 2. Sync Account DB <-> Leaderboard (always keeping the true highest score after reset)
+    let dbChanged=false;
+    Object.keys(db).forEach(rawKey=>{
+        const rec=db[rawKey];
+        if(!rec)return;
+        if(lastCloudResetTs&&rec.updatedAt&&Number(rec.updatedAt)<lastCloudResetTs){
+            delete db[rawKey];
+            dbChanged=true;
+            return;
+        }
+        const k=CORE_IDS.has(rawKey)?rawKey:(resolveCorePilotFromInputs(rawKey,rec.name)||rawKey);
+        if(delSet.has(k))return;
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const dbScore=Math.max(0,Number(rec.bestScore)||0);
+        const dbEpoch=Math.max(1,Number(rec.bestEpoch)||1);
+        const lbEntry=lbMap.get(k);
+        const maxScore=Math.max(dbScore,lbEntry?lbEntry.score:0);
+        const maxEpoch=maxScore>0?Math.max(dbEpoch,lbEntry?lbEntry.epoch:1):1;
+
+        if(maxScore!==dbScore||maxEpoch!==dbEpoch||k!==rawKey){
+            db[k]={
+                ...rec,
+                id:isCore?k:k,
+                guestId:isCore?"":(rec.guestId||k.replace('GUEST_ID_','')),
+                name:isCore?prof.name:(rec.name||`Pilot #${k.replace('GUEST_ID_','')}`),
+                isCore,
+                bestScore:maxScore,
+                bestEpoch:maxEpoch,
+                totalFlashes:Math.max(0,Number(rec.totalFlashes)||0),
+                completedEpoch250:Boolean(rec.completedEpoch250||maxEpoch>250),
+                updatedAt:rec.updatedAt||Date.now()
+            };
+            if(k!==rawKey)delete db[rawKey];
+            dbChanged=true;
+        }
+        if(maxScore>0){
+            lbMap.set(k,{
+                id:isCore?k:'GUEST',
+                guestId:isCore?'':(db[k].guestId||k.replace('GUEST_ID_','')),
+                accountKey:k,
+                name:isCore?prof.name:(db[k].name||'Guest Pilot'),
+                score:maxScore,
+                epoch:maxEpoch,
+                ts:lbEntry?lbEntry.ts:(db[k].updatedAt||Date.now())
+            });
+        }
+    });
+
+    // 3. Ensure every valid leaderboard entry is reflected in Account DB
+    lbMap.forEach((entry,k)=>{
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const prev=db[k]||{bestScore:0,bestEpoch:1,totalFlashes:0,completedEpoch250:false};
+        if((Number(prev.bestScore)||0)<entry.score||(Number(prev.bestEpoch)||1)<entry.epoch){
+            db[k]={
+                id:isCore?k:k,
+                guestId:isCore?"":(entry.guestId||k.replace('GUEST_ID_','')),
+                name:isCore?prof.name:(entry.name||prev.name||'Guest Pilot'),
+                isCore,
+                bestScore:Math.max(Number(prev.bestScore)||0,entry.score),
+                bestEpoch:Math.max(Number(prev.bestEpoch)||1,entry.epoch),
+                totalFlashes:Math.max(0,Number(prev.totalFlashes)||0),
+                completedEpoch250:Boolean(prev.completedEpoch250||entry.epoch>250),
+                updatedAt:entry.ts||Date.now()
+            };
+            dbChanged=true;
+        }
+    });
+
+    if(dbChanged)saveAccountsDatabase(db);
+    const sorted=Array.from(lbMap.values()).sort((a,b)=>b.score-a.score).slice(0,100);
+    localStorage.setItem(LB_STORAGE_KEY,JSON.stringify(sorted));
+    updateTopLeaderBanner(sorted);
+    return sorted;
+}
+
+function getLocalLeaderboard(){
+    return reconcileAllPilotScores();
+}
+
+function saveLocalLeaderboard(list){
+    const delSet=new Set(sanitizeDeletedAccountKeys());
+    const valid=(Array.isArray(list)?list:[])
+        .filter(e=>e&&(Number(e.score)||0)>0&&!delSet.has(normalizeEntryAccountKey(e)))
+        .sort((a,b)=>b.score-a.score)
+        .slice(0,100);
+    localStorage.setItem(LB_STORAGE_KEY,JSON.stringify(valid));
+    return reconcileAllPilotScores();
+}
+
+function getActiveAccountStats(){
+    reconcileAllPilotScores();
+    const db=getAccountsDatabase();
+    const key=getActiveAccountStorageKey();
+    const rec=db[key];
+    if(!rec){
+        return {bestScore:0,bestEpoch:1,totalFlashes:0,completedEpoch250:false};
+    }
+    const bs=Math.max(0,Number(rec.bestScore)||0);
+    const be=bs>0?Math.max(1,Number(rec.bestEpoch)||1):Math.max(1,Number(rec.bestEpoch)||1);
+    const tf=Math.max(0,Number(rec.totalFlashes)||0);
+    return {
+        bestScore:bs,
+        bestEpoch:be,
+        totalFlashes:tf,
+        completedEpoch250:Boolean(rec.completedEpoch250||be>250)
+    };
+}
+
+function saveActiveAccountStats(scoreVal,epochVal,flashesVal){
+    const key=getActiveAccountStorageKey();
+    if(!CORE_IDS.has(key)){
+        saveDeletedAccountKeys(sanitizeDeletedAccountKeys().filter(k=>k!==key));
+    }
+    const db=getAccountsDatabase();
+    const prev=db[key]||{bestScore:0,bestEpoch:1,totalFlashes:0,completedEpoch250:false};
+    const dispName=currentPilot.isCore?currentPilot.name:getEffectiveGuestFullLabel();
+    const cleanScore=Math.max(0,Math.round(Number(scoreVal)||0));
+    const cleanEpoch=Math.max(1,Math.round(Number(epochVal)||1));
+    const cleanFlashes=Math.max(0,Math.round(Number(flashesVal)||0));
+    const newBestScore=Math.max(Number(prev.bestScore)||0,cleanScore);
+    const newBestEpoch=Math.max(Number(prev.bestEpoch)||1,cleanEpoch);
+
+    db[key]={
+        id:currentPilot.isCore?currentPilot.id:key,
+        guestId:currentPilot.isCore?"":ensureGuestHas4DigitId(),
+        name:dispName,
+        isCore:Boolean(currentPilot.isCore),
+        bestScore:newBestScore,
+        bestEpoch:newBestEpoch,
+        totalFlashes:(Number(prev.totalFlashes)||0)+cleanFlashes,
+        completedEpoch250:Boolean(prev.completedEpoch250||newBestEpoch>250),
+        updatedAt:Date.now()
+    };
+    saveAccountsDatabase(db);
+    reconcileAllPilotScores();
+    refreshAccountStatsUI();
+}
+
+function recordScoreToLeaderboard(scoreVal,epochVal,pushRemote=true){
+    const accountKey=getActiveAccountStorageKey();
+    const pid=currentPilot.isCore?currentPilot.id:'GUEST';
+    const gid=currentPilot.isCore?'':ensureGuestHas4DigitId();
+    const pName=currentPilot.isCore?currentPilot.name:getEffectiveGuestFullLabel();
+
+    if(!CORE_IDS.has(accountKey)){
+        saveDeletedAccountKeys(sanitizeDeletedAccountKeys().filter(k=>k!==accountKey));
+    }
+
+    const st=getActiveAccountStats();
+    const effectiveScore=Math.max(Math.round(Number(scoreVal)||0),st.bestScore||0);
+    const effectiveEpoch=Math.max(Math.round(Number(epochVal)||1),st.bestEpoch||1);
+    if(effectiveScore<=0)return;
+
+    const nowTs=Date.now();
+    const list=getLocalLeaderboard();
+    const idx=list.findIndex(e=>normalizeEntryAccountKey(e)===accountKey);
+    if(idx>=0){
+        list[idx].score=Math.max(Number(list[idx].score)||0,effectiveScore);
+        list[idx].epoch=Math.max(Number(list[idx].epoch)||1,effectiveEpoch);
+        list[idx].name=pName;
+        list[idx].id=pid;
+        list[idx].guestId=gid;
+        list[idx].accountKey=accountKey;
+        list[idx].ts=nowTs;
+    }else{
+        list.push({id:pid,guestId:gid,accountKey,name:pName,score:effectiveScore,epoch:effectiveEpoch,ts:nowTs});
+    }
+    saveLocalLeaderboard(list);
+    refreshAccountStatsUI();
+    if(pushRemote)pushCloudLeaderboardPacket();
+}
+
+// Strict reset-aware cloud packet merger (blocks old pre-reset scores from ever returning)
+function mergeRemoteLeaderboardPacket(packet){
+    if(!packet||typeof packet!=='object')return;
+
+    if(packet.resetTs&&Number(packet.resetTs)>lastCloudResetTs){
+        lastCloudResetTs=Number(packet.resetTs);
+        localStorage.setItem('roadSense_overdrive_resetTs_v8',String(lastCloudResetTs));
+        localStorage.setItem(ACCOUNTS_DB_KEY,JSON.stringify({}));
+        localStorage.setItem(LB_STORAGE_KEY,JSON.stringify([]));
+        refreshAccountStatsUI();
+        updateTopLeaderBanner([]);
+        if(document.getElementById('leaderboardModal').style.display!=='none')renderLeaderboardList();
+    }
+
+    if(Array.isArray(packet.deletedAccounts)&&packet.deletedAccounts.length>0){
+        const safeIncoming=packet.deletedAccounts.filter(k=>k&&!CORE_IDS.has(String(k)));
+        saveDeletedAccountKeys(Array.from(new Set([...sanitizeDeletedAccountKeys(),...safeIncoming])));
+    }
+
+    const delSet=new Set(sanitizeDeletedAccountKeys());
+    const mapByKey=new Map();
+    getLocalLeaderboard().forEach(item=>{
+        const k=normalizeEntryAccountKey(item);
+        if(k&&!delSet.has(k)&&item.score>0)mapByKey.set(k,item);
+    });
+
+    (Array.isArray(packet.entries)?packet.entries:[]).forEach(rem=>{
+        const remScore=Number(rem&&rem.score)||0;
+        const remTs=Number(rem&&rem.ts)||0;
+        if(remScore<=0)return;
+        // Reject any cloud score older than or missing timestamp after a reset
+        if(lastCloudResetTs&&(!remTs||remTs<=lastCloudResetTs))return;
+        const k=normalizeEntryAccountKey(rem);
+        if(!k||delSet.has(k))return;
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const ex=mapByKey.get(k);
+        const remEpoch=Math.max(1,Number(rem.epoch)||1);
+        if(!ex||remScore>ex.score){
+            mapByKey.set(k,{
+                id:isCore?k:'GUEST',
+                guestId:isCore?'':(rem.guestId||extractGuestIdTag(rem)),
+                accountKey:k,
+                name:isCore?prof.name:(rem.name||'Guest Pilot'),
+                score:Math.max(remScore,ex?ex.score:0),
+                epoch:Math.max(remEpoch,ex?ex.epoch:1),
+                ts:remTs||Date.now()
+            });
+        }
+    });
+
+    saveLocalLeaderboard(Array.from(mapByKey.values()));
+    refreshAccountStatsUI();
+    if(document.getElementById('leaderboardModal').style.display!=='none')renderLeaderboardList();
+}
+
+function pushCloudLeaderboardPacket(extra={}){
+    const payload={
+        type:'lb_sync_v10',
+        resetTs:lastCloudResetTs,
+        entries:getLocalLeaderboard().slice(0,35),
+        deletedAccounts:sanitizeDeletedAccountKeys(),
+        ...extra
+    };
+    if(lbChannel){try{lbChannel.postMessage(payload);}catch(e){}}
+    fetch(CLOUD_SYNC_URL_V10,{method:'POST',body:JSON.stringify(payload)}).catch(()=>{});
+}
+
+function startLiveLeaderboardStream(){
+    if(liveEventSource){
+        try{liveEventSource.close();}catch(e){}
+        liveEventSource=null;
+    }
+    if(typeof EventSource==='undefined')return;
+    try{
+        liveEventSource=new EventSource(`${CLOUD_SYNC_URL_V10}/sse`);
+        liveEventSource.onmessage=(ev)=>{
+            try{
+                const data=JSON.parse(ev.data);
+                if(data&&data.message){
+                    const pkt=JSON.parse(data.message);
+                    if(pkt&&pkt.type==='lb_sync_v10')mergeRemoteLeaderboardPacket(pkt);
+                }
+            }catch(e){}
+        };
+        liveEventSource.onerror=()=>{
+            try{liveEventSource.close();}catch(e){}
+            liveEventSource=null;
+            setTimeout(startLiveLeaderboardStream,5000);
+        };
+    }catch(e){}
+}
+
+async function pullGlobalCloudLeaderboard(){
+    if(isPullingCloud||document.hidden)return;
+    isPullingCloud=true;
+    const ctrl=new AbortController();
+    const tid=setTimeout(()=>ctrl.abort(),2800);
+    try{
+        const res=await fetch(`${CLOUD_SYNC_URL_V10}/json?poll=1&since=24h`,{signal:ctrl.signal});
+        if(res.ok){
+            const text=await res.text();
+            for(const line of text.trim().split('\n')){
+                if(!line)continue;
+                try{
+                    const w=JSON.parse(line);
+                    if(w&&w.event==='message'&&w.message){
+                        const pkt=JSON.parse(w.message);
+                        if(pkt&&pkt.type==='lb_sync_v10')mergeRemoteLeaderboardPacket(pkt);
+                    }
+                }catch(e){}
+            }
+        }
+    }catch(e){}finally{
+        clearTimeout(tid);
+        isPullingCloud=false;
+    }
+}
+
+// Leaderboard Renderer: Core Pilots NEVER show a Delete button; only Guest accounts can be individually deleted
+function renderLeaderboardList(){
+    const container=document.getElementById('leaderboardListContainer');
+    if(!container)return;
+    const list=getLocalLeaderboard();
+    const isAdmin=(currentPilot.id==='1117');
+    if(list.length===0){
+        container.innerHTML=`<div class="recessed-well p-6 rounded-xl text-center space-y-1"><div class="text-sm font-bold text-white">No Runs Recorded Yet</div><p class="text-xs text-gray-400">Complete a run to claim #1 on the Global Leaderboard!</p></div>`;
+        return;
+    }
+    const medals=["🥇 #1","🥈 #2","🥉 #3"];
+    container.innerHTML=list.map((entry,idx)=>{
+        const k=normalizeEntryAccountKey(entry);
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const accKey=k||entry.accountKey||entry.id;
+        const gTag=isCore?'':extractGuestIdTag(entry);
+        const dispName=isCore?prof.name:((gTag!=='GUEST'&&!String(entry.name).includes(`#${gTag}`))?`${entry.name} (#${gTag})`:entry.name);
+        // Remove Delete button from Core members (only show on Guest rows for Admin 1117)
+        const delBtn=(isAdmin&&!isCore)?`<button type="button" onclick="adminDeleteIndividualScore('${escapeHtml(accKey)}')" class="ml-2 px-2 py-1 rounded bg-red-600/85 hover:bg-red-500 text-white text-[9px] mono-num font-bold cursor-pointer">🗑️ Delete</button>`:'';
+        const badge=prof.isVoidChroma
+            ?`<span class="px-1.5 py-0.5 text-[9px] mono-num font-extrabold rounded bg-cyan-500/20 text-cyan-300 border border-cyan-400/50">👑 ARCHITECT VOID</span>`
+            :(isCore
+                ?`<span class="px-1.5 py-0.5 text-[9px] mono-num font-bold rounded bg-white/10 text-gray-200">⚡ CORE #${k}</span>`
+                :`<span class="px-1.5 py-0.5 text-[9px] mono-num rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">👤 GUEST #${escapeHtml(gTag)}</span>`);
+        return `<div class="p-3 rounded-xl flex items-center justify-between gap-2 transition ${prof.lbClass}"><div class="flex items-center gap-2.5 min-w-0"><span class="mono-num text-xs font-black text-white px-2 py-1 rounded bg-black/40 border border-white/10 shrink-0">${medals[idx]||`#${idx+1}`}</span><div class="min-w-0"><div class="flex items-center gap-1.5 flex-wrap"><span class="text-xs sm:text-sm truncate ${prof.nameClass}">${escapeHtml(dispName)}</span>${badge}</div><div class="text-[10px] mono-num text-gray-400">Epoch ${entry.epoch||1} &bull; ${prof.liveryName}</div></div></div><div class="flex items-center shrink-0"><span class="mono-num text-sm sm:text-base font-black text-emerald-400">${entry.score.toLocaleString()}</span>${delBtn}</div></div>`;
+    }).join('');
+}
+
+function adminDeleteIndividualScore(targetKey){
+    if(currentPilot.id!=='1117')return;
+    // Protect Core accounts from individual deletion
+    if(CORE_IDS.has(String(targetKey)))return;
+    const delList=sanitizeDeletedAccountKeys();
+    if(!delList.includes(targetKey)){delList.push(targetKey);saveDeletedAccountKeys(delList);}
+    const db=getAccountsDatabase();
+    if(db[targetKey]){
+        delete db[targetKey];
+        saveAccountsDatabase(db);
+    }
+    const rawLb=getLocalLeaderboard().filter(e=>normalizeEntryAccountKey(e)!==targetKey);
+    localStorage.setItem(LB_STORAGE_KEY,JSON.stringify(rawLb));
+    reconcileAllPilotScores();
+    pushCloudLeaderboardPacket();
+    renderLeaderboardList();
+    refreshAccountStatsUI();
+}
+
+function adminDeleteAllGuestAccounts(){
+    if(currentPilot.id!=='1117')return;
+    const db=getAccountsDatabase();
+    const delSet=new Set(sanitizeDeletedAccountKeys());
+    Object.keys(db).forEach(k=>{
+        if(!CORE_IDS.has(k)){
+            delSet.add(k);
+            delete db[k];
+        }
+    });
+    getLocalLeaderboard().forEach(e=>{
+        const k=normalizeEntryAccountKey(e);
+        if(!CORE_IDS.has(k))delSet.add(k);
+    });
+    saveDeletedAccountKeys(Array.from(delSet));
+    saveAccountsDatabase(db);
+    const coreOnly=getLocalLeaderboard().filter(e=>CORE_IDS.has(normalizeEntryAccountKey(e)));
+    localStorage.setItem(LB_STORAGE_KEY,JSON.stringify(coreOnly));
+    reconcileAllPilotScores();
+    pushCloudLeaderboardPacket();
+    renderLeaderboardList();
+    refreshAccountStatsUI();
+    showDevConsoleFeedback("✓ All Guest Accounts & Guest Scores Deleted!");
+}
+
+// Completely resets Best Score (0), Max Epoch (Epoch 1), AND Phantom Flashes (0) for all Core & Guest accounts
+function adminResetAllLeaderboardScores(){
+    if(currentPilot.id!=='1117')return;
+    lastCloudResetTs=Date.now();
+    localStorage.setItem('roadSense_overdrive_resetTs_v8',String(lastCloudResetTs));
+    localStorage.setItem(ACCOUNTS_DB_KEY,JSON.stringify({}));
+    localStorage.setItem(LB_STORAGE_KEY,JSON.stringify([]));
+    saveDeletedAccountKeys([]);
+
+    updateTopLeaderBanner([]);
+    refreshAccountStatsUI();
+    renderLeaderboardList();
+    pushCloudLeaderboardPacket({resetTs:lastCloudResetTs,entries:[],deletedAccounts:[]});
+    showDevConsoleFeedback("✓ All Scores, Epochs & Phantom Flashes Reset to 0!");
+    playGameSfx('pickup');
+}
+
+function loginPilotById(){
+    const input=document.getElementById('pilotIdInput');
+    const gInput=document.getElementById('guestCallsignInput');
+    let raw=(input?input.value:'').trim();
+    const typedName=(gInput?gInput.value:'').trim();
+
+    const matchedCoreId=resolveCorePilotFromInputs(raw,typedName);
+    if(matchedCoreId){
+        isAccountSessionLocked=true;
+        localStorage.setItem('roadSense_overdrive_accountLocked','true');
+        customGuestId="";
+        localStorage.removeItem('roadSense_overdrive_customGuestId');
+        applyPilotProfile(matchedCoreId);
+        if(input)input.value='';
+        showLoginBanner(`✓ Core Pilot Authenticated: ${currentPilot.name}`,true);
+        playGameSfx('pickup');
+        return;
+    }
+
+    if(!raw){
+        raw=customGuestId&&/^\d{4}$/.test(customGuestId)&&!CORE_IDS.has(customGuestId)?customGuestId:generateRandomGuest4DigitId();
+    }else if(!/^\d{4}$/.test(raw)){
+        showLoginBanner("✕ Enter a 4-digit numeric ID (or leave blank for Auto-ID).",false);
+        playGameSfx('hit');
+        return;
+    }
+
+    isAccountSessionLocked=true;
+    localStorage.setItem('roadSense_overdrive_accountLocked','true');
+    customGuestId=raw;
+    localStorage.setItem('roadSense_overdrive_customGuestId',customGuestId);
+    const db=getAccountsDatabase();
+    const existingAcc=db[`GUEST_ID_${customGuestId}`];
+    if(typedName){
+        customGuestName=typedName;
+    }else if(existingAcc&&existingAcc.name&&!existingAcc.name.startsWith('Pilot #')){
+        customGuestName=existingAcc.name.replace(/\s*\(#\d{4}\)$/,'');
+    }else{
+        customGuestName="";
+    }
+    localStorage.setItem('roadSense_overdrive_guestName',customGuestName);
+    applyPilotProfile("GUEST");
+    if(input)input.value='';
+    showLoginBanner(`✓ Guest Account Logged In: ${getEffectiveGuestFullLabel()}`,true);
+    playGameSfx('pickup');
+}
+
+function confirmGuestAccountLogin(){
+    const idInput=document.getElementById('pilotIdInput');
+    const gInput=document.getElementById('guestCallsignInput');
+    const rawId=(idInput?idInput.value:'').trim();
+    const rawName=(gInput?gInput.value:'').trim();
+    const matchedCore=resolveCorePilotFromInputs(rawId,rawName);
+    if(matchedCore||(rawId&&/^\d{4}$/.test(rawId))){
+        loginPilotById();
+        return;
+    }
+    ensureGuestHas4DigitId();
+    if(gInput)updateGuestCallsign(rawName);
+    isAccountSessionLocked=true;
+    localStorage.setItem('roadSense_overdrive_accountLocked','true');
+    applyPilotProfile("GUEST");
+    showLoginBanner(`✓ Guest Session Active: ${getEffectiveGuestFullLabel()}`,true);
+    playGameSfx('pickup');
+}
+
+const controlConfig={
+    mobileMode:'buttons',doubleTapNitro:true,tiltCenterOffset:0,invertGyro:false,gyroSensitivity:0.65,lastTouchTime:0,
+    binds:{left:['a','arrowleft'],right:['d','arrowright'],nitro:['shift','w','arrowup'],brake:['s','arrowdown'],emp:[' ','e'],hideui:['h']}
 };
 
-let spawnAccum = 0, pickupAccum = 0, radarAngle = Math.PI, lastHudTs = 0;
-let fairBag = [], variantCounters = { 0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0 };
-let cachedGradients = { key: '', sky: null, sun: null };
+function buildKeybindGridUI(){
+    const items=[
+        {k:'left',lbl:'STEER LEFT',col:'sky'},
+        {k:'right',lbl:'STEER RIGHT',col:'sky'},
+        {k:'nitro',lbl:'NITRO ACCEL',col:'amber'},
+        {k:'brake',lbl:'AEB BRAKE',col:'red'},
+        {k:'emp',lbl:'NEURAL EMP PULSE',col:'emerald'},
+        {k:'hideui',lbl:'HIDE / SHOW HUD',col:'purple'}
+    ];
+    const grid=document.getElementById('pcKeybindGrid');
+    if(!grid)return;
+    grid.innerHTML=items.map(it=>`<button type="button" onclick="startKeyRebind('${it.k}')" class="p-2.5 rounded-lg bg-[#141824] border border-[#262f45] hover:border-${it.col}-400 text-left cursor-pointer"><div class="text-[9px] text-gray-400">${it.lbl}</div><div class="text-${it.col}-300 font-bold mt-0.5" id="bindVal_${it.k}"></div></button>`).join('');
+    refreshKeybindLabels();
+}
 
-function getNextFairHazardClass() {
-    if (!fairBag.length) {
-        fairBag = [0, 1, 2, 3, 4, 5, 6, 7];
-        for (let i = fairBag.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = fairBag[i]; fairBag[i] = fairBag[j]; fairBag[j] = t; }
+function updateGyroSpeedSetting(val){
+    const pct=Math.max(20,Math.min(100,parseInt(val,10)||65));
+    controlConfig.gyroSensitivity=pct/100;
+    const lbl=document.getElementById('gyroSpeedLabel');
+    if(lbl)lbl.innerText=`${pct}% (${pct<=45?'Gentle':(pct<=75?'Responsive':'Ultra-Fast')})`;
+    const sld=document.getElementById('gyroSpeedSlider');
+    if(sld&&String(sld.value)!==String(pct))sld.value=pct;
+    saveSettingsForActiveAccount();
+}
+
+function setDifficulty(key){
+    currentDiffKey=DIFFICULTY_PRESETS[key]?key:'easy';
+    const lbl=document.getElementById('diffCurrentLabel');
+    if(lbl)lbl.innerText=DIFFICULTY_PRESETS[currentDiffKey].label;
+    ['easy','normal','hard','void'].forEach(k=>{
+        const btn=document.getElementById(`diffBtn_${k}`);
+        if(btn)btn.className=(k===currentDiffKey)?"py-1.5 px-2 rounded-lg text-[11px] font-bold bg-emerald-500 text-black cursor-pointer":"py-1.5 px-2 rounded-lg text-[11px] font-semibold bg-[#151a26] text-gray-300 border border-[#262f45] cursor-pointer";
+    });
+    saveSettingsForActiveAccount();
+}
+
+function setMobileControlMode(mode){
+    controlConfig.mobileMode=mode;
+    const tapLaneBtn=document.getElementById('mobCtrl_drag');
+    if(tapLaneBtn)tapLaneBtn.innerText="👆 Tap Lane";
+    ['buttons','drag','tilt'].forEach(m=>{
+        const btn=document.getElementById(`mobCtrl_${m}`);
+        if(btn)btn.className=(m===mode)?"p-2 rounded-lg text-[11px] font-bold bg-sky-500 text-black cursor-pointer text-center":"p-2 rounded-lg text-[11px] font-semibold bg-[#151a26] text-gray-300 border border-[#262f45] cursor-pointer text-center";
+    });
+    const leftGroup=document.getElementById('mobileLeftTouchGroup');
+    if(leftGroup)leftGroup.style.display=(mode==='buttons')?'flex':'none';
+    const gyroBox=document.getElementById('gyroCalibrationBox');
+    if(gyroBox){
+        gyroBox.classList.toggle('opacity-40',mode!=='tilt');
+        gyroBox.classList.toggle('pointer-events-none',mode!=='tilt');
     }
-    return IDD_HAZARD_CLASSES[fairBag.pop()];
-}
-
-function initHazardVariant(hz) {
-    const cid = hz.cls.id, vCount = (variantCounters[cid] = (variantCounters[cid] || 0) + 1), rngBit = vCount + (Math.random() < 0.35 ? 1 : 0);
-    if (cid === 0) {
-        hz.variantIdx = rngBit % 2;
-        hz.palette = hz.variantIdx === 0 ? { roof: '#fde047', bodyTop: '#facc15', bodyBot: '#111827', trim: '#f59e0b', glass: '#7dd3fc' } : { roof: '#fde047', bodyTop: '#0ea5e9', bodyBot: '#0c4a6e', trim: '#38bdf8', glass: '#e0f2fe' };
-    } else if (cid === 1) {
-        hz.subType = (rngBit % 2 === 0) ? 'bus' : 'truck';
-        hz.palette = hz.subType === 'bus'
-            ? ((vCount >> 1) % 2 === 0 ? { top: '#3b82f6', body: '#1d4ed8', bot: '#0f172a', stripe: '#38bdf8', trim: '#93c5fd' } : { top: '#f43f5e', body: '#dc2626', bot: '#1f080c', stripe: '#facc15', trim: '#fda4af' })
-            : [{ cab: '#f97316', cargo: '#c2410c', trim: '#facc15' }, { cab: '#10b981', cargo: '#047857', trim: '#6ee7b7' }, { cab: '#38bdf8', cargo: '#1d4ed8', trim: '#bae6fd' }][(vCount >> 1) % 3];
-    } else if (cid === 2) {
-        hz.palette = [{ top: '#0ea5e9', bot: '#0c4a6e', trim: '#38bdf8', canopy: '#bae6fd' }, { top: '#ef4444', bot: '#7f1d1d', trim: '#fda4af', canopy: '#fecdd3' }, { top: '#f59e0b', bot: '#78350f', trim: '#fde047', canopy: '#fef08a' }, { top: '#10b981', bot: '#064e3b', trim: '#6ee7b7', canopy: '#a7f3d0' }, { top: '#a855f7', bot: '#4c1d95', trim: '#d8b4fe', canopy: '#f3e8ff' }][vCount % 5];
-    } else if (cid === 3) {
-        hz.palette = [{ main: '#22c55e', trim: '#86efac', visor: '#00f5d4' }, { main: '#ef4444', trim: '#fca5a5', visor: '#fde047' }, { main: '#3b82f6', trim: '#c084fc', visor: '#38bdf8' }][vCount % 3];
-    } else if (cid === 4) {
-        hz.subType = (rngBit % 2 === 0) ? 'boy' : 'girl';
-        hz.palette = hz.subType === 'boy'
-            ? ((vCount >> 1) % 2 === 0 ? { top: '#0ea5e9', trim: '#7dd3fc', hair: '#0f172a', skin: '#fed7aa' } : { top: '#ef4444', trim: '#fca5a5', hair: '#1c1917', skin: '#fdba74' })
-            : ((vCount >> 1) % 2 === 0 ? { top: '#ec4899', trim: '#f9a8d4', hair: '#1c1917', skin: '#fed7aa' } : { top: '#a855f7', trim: '#d8b4fe', hair: '#27170e', skin: '#fdba74' });
-    } else if (cid === 5) {
-        hz.subType = (rngBit % 2 === 0) ? 'dog' : 'cat';
-        hz.palette = hz.subType === 'dog'
-            ? ((vCount >> 1) % 2 === 0 ? { coat: '#f59e0b', dark: '#b45309', belly: '#fef3c7', collar: '#ef4444', outline: '#fde68a' } : { coat: '#d97706', dark: '#78350f', belly: '#ffedd5', collar: '#00f5d4', outline: '#fed7aa' })
-            : ((vCount >> 1) % 2 === 0 ? { coat: '#fb923c', dark: '#c2410c', belly: '#ffedd5', eye: '#4ade80', outline: '#fed7aa' } : { coat: '#cbd5e1', dark: '#475569', belly: '#ffffff', eye: '#facc15', outline: '#f8fafc' });
-    } else if (cid === 7) hz.variantIdx = rngBit % 2;
-}
-
-function getDistanceForEpoch(ep) { const e = Math.max(1, Math.floor(ep)); return e <= 250 ? (e - 1) * 70 : 249 * 70 + EPOCH_250_LENGTH_M + (e - 251) * 70; }
-function getEpochFromDistance(distM) { const s = 249 * 70, e = s + EPOCH_250_LENGTH_M; if (distM < s) return 1 + Math.floor(distM / 70); if (distM < e) return 250; return 251 + Math.floor((distM - e) / 70); }
-
-function isBiomeUnlockedForAccount(idx) {
-    if (activeAccount && activeAccount.isDev) return true;
-    const b = BIOME_THEMES[idx]; if (!b) return false;
-    const maxEp = Math.max((activeAccount && activeAccount.stats.bestEpoch) || 1, gameState.epoch || 1);
-    if (b.isEpoch250Special) return Boolean((activeAccount && activeAccount.stats.completedEpoch250) || maxEp >= 251);
-    return maxEp >= (b.unlockEpoch || 1);
-}
-
-function projectX(laneOffset, zSafe, W, H, roadCurve = 0) {
-    const scale = (H * 0.85) / zSafe, zNorm = zSafe * 0.0181818;
-    return W * 0.5 + ((laneOffset - gameState.egoLaneX * 0.82) * LANE_WIDTH_M) * scale * 0.24 + roadCurve * (zNorm * zNorm) * (W * 0.22);
-}
-function projectY(zSafe, yMeters, H) { return (H * 0.42) + (1.72 - yMeters) * ((H * 0.85) / zSafe) * 0.36; }
-function getRigidPerspectiveScale(zSafe, W, H, key) {
-    const st = CLASS_SCALE_STOPPERS[key] || CLASS_SCALE_STOPPERS.pickup;
-    const zC = Math.max(1.25, Math.min(60.0, zSafe));
-    const sAt = (LANE_WIDTH_M * ((H * 0.85) / st.zStop) * 0.24 * st.laneFrac) / st.unitW;
-    return zC >= st.zStop ? sAt * Math.pow(st.zStop / zC, 0.85) : sAt * Math.pow(st.zStop / zC, 0.22);
-}
-
-function spawnFloat(text, color, oy = -42) {
-    if (!globalSettings.graphics.transitions) return;
-    if (gameState.FloatingTexts.length > 4) gameState.FloatingTexts.shift();
-    gameState.FloatingTexts.push({ text, color, x: gameState.viewW * 0.5, y: gameState.viewH * 0.42 + oy, life: 1.0 });
-}
-
-function syncEpoch250Banners() {
-    const alertEl = document.getElementById('epoch250Alert'), banEl = document.getElementById('singularityBanner');
-    if (!gameState.running) { if (alertEl) alertEl.style.display = 'none'; if (banEl) banEl.style.display = 'none'; return; }
-    if (gameState.ep250WarnTimer > 0) { if (alertEl) alertEl.style.display = 'flex'; if (banEl) banEl.style.display = 'none'; }
-    else { if (alertEl) alertEl.style.display = 'none'; if (banEl) banEl.style.display = (gameState.epoch === 250) ? 'flex' : 'none'; }
-}
-
-function triggerEpoch250Warning() { gameState.ep250WarnTriggered = true; gameState.ep250WarnTimer = 2.8; syncEpoch250Banners(); playSfx('siren250'); }
-
-function syncBiomeForEpoch(isInit = false) {
-    if (gameState.epoch === 250) {
-        biomeIdx = EPOCH_250_INDEX; cachedGradients.key = '';
-        if (!gameState.ep250WarnTriggered) triggerEpoch250Warning(); else syncEpoch250Banners();
-    } else {
-        syncEpoch250Banners();
-        if (gameState.epoch === 251 && !isInit) {
-            if (activeAccount) { activeAccount.stats.completedEpoch250 = true; activeAccount.updatedAt = Date.now(); saveAccountsCache(); publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) }); }
-            spawnFloat('🏆 EPOCH 250 SURVIVED! COSMIC SINGULARITY UNLOCKED!', '#fbbf24', -58);
-        }
-        if (globalSettings.autoCycleBiomes) {
-            const pool = isBiomeUnlockedForAccount(EPOCH_250_INDEX) ? 14 : 13, nextIdx = Math.floor((gameState.epoch - 1) / 10) % pool;
-            if (nextIdx !== biomeIdx || isInit) { biomeIdx = nextIdx; cachedGradients.key = ''; if (!isInit) spawnFloat(`🌍 ${BIOME_THEMES[biomeIdx].label.toUpperCase()}`, '#38bdf8', -48); }
-        } else { biomeIdx = isBiomeUnlockedForAccount(globalSettings.selectedBiomeIdx) ? globalSettings.selectedBiomeIdx : 0; cachedGradients.key = ''; }
+    const mapTitle=document.getElementById('mobileModeMapTitle');
+    const mapSteer=document.getElementById('mapSteerDesc');
+    if(mapTitle&&mapSteer){
+        if(mode==='buttons'){mapTitle.innerText="ACTIVE CONTROL MAP // ARROW PADDLES";mapSteer.innerText="Left ◀ / ▶ Right Dock";}
+        else if(mode==='drag'){mapTitle.innerText="ACTIVE CONTROL MAP // TAP LANE";mapSteer.innerText="Tap Any Road Lane to Glide There";}
+        else{mapTitle.innerText="ACTIVE CONTROL MAP // PHONE TILT (GYRO)";mapSteer.innerText="Auto-Zeroed Magnetic Lane-Lock Tilt";}
     }
-    setTextCached('hudBiomeName', BIOME_THEMES[biomeIdx].label);
-}
-
-function checkPhantomFlash(prevLane) {
-    for (let i = 0; i < gameState.hazards.length; i++) {
-        const h = gameState.hazards[i];
-        if (!h.nearMissed && Math.abs(h.lane - prevLane) < 0.72 && h.z > EGO_Z_REAR && h.z < 10.5) {
-            h.nearMissed = true; gameState.nearMisses++;
-            gameState.combo = Math.min(8.0, +(gameState.combo + 0.5).toFixed(1));
-            const bonus = Math.round(250 * gameState.combo);
-            gameState.score += bonus; gameState.nitroFuel = Math.min(100, gameState.nitroFuel + 18); gameState.empCharge = Math.min(100, gameState.empCharge + 14);
-            if (globalSettings.graphics.transitions) gameState.slowMoTimer = 0.42;
-            playSfx('phantom'); spawnFloat(`⚡ PHANTOM FLASH +${bonus}`, '#00f5d4', -45); break;
+    if(mode==='tilt'){
+        calibrateTiltSensor(true);
+        if(typeof DeviceOrientationEvent!=='undefined'&&typeof DeviceOrientationEvent.requestPermission==='function'){
+            DeviceOrientationEvent.requestPermission().catch(()=>{});
         }
     }
+    saveSettingsForActiveAccount();
 }
 
-function setDiscreteTargetLane(laneInt) {
-    const c = Math.max(-2, Math.min(2, Math.round(laneInt))), prev = Math.round(gameState.targetLane);
-    if (c !== prev) { gameState.targetLane = c; gameState.egoRoll = (c > prev ? 1 : -1) * 0.14; playSfx('steer'); checkPhantomFlash(prev); }
-}
-function steerLane(dir) { if (gameState.running && !gameState.paused) setDiscreteTargetLane(Math.round(gameState.targetLane) + dir); }
-function setBoosting(active) { const next = Boolean(active && gameState.nitroFuel > 2); if (next && !gameState.boosting && gameState.running && !gameState.paused) playSfx('nitro'); gameState.boosting = next; }
-function setBraking(active) { gameState.braking = Boolean(active); }
-
-function triggerNeuralEmp() {
-    if (!gameState.running || gameState.paused) return;
-    const god = Boolean(devGodModeActive && activeAccount && activeAccount.isDev);
-    if (!god && gameState.empCharge < 100) { spawnFloat('⚡ EMP CHARGING...', '#94a3b8', -20); return; }
-    if (!god) gameState.empCharge = 0;
-    gameState.empWaveRadius = 1; gameState.empFlashAlpha = 0.45;
-    if (globalSettings.graphics.shake) gameState.screenShake = 10;
-    playSfx('emp');
-
-    const cust = activeAccount ? activeAccount.custom : DEFAULT_VEHICLE_CUST, chroma = getSkinChromaPalette(cust.nitroSkin, cust, performance.now());
-    const empCol = chroma.empPrimary, empSec = chroma.empSecondary;
-
-    for (let i = 0; i < gameState.hazards.length; i++) {
-        const h = gameState.hazards[i], shards = [], cnt = isMobileHardware ? 10 : 16;
-        const mainCol = (h.palette && (h.palette.top || h.palette.main || h.palette.coat || h.palette.bodyTop)) || h.cls.color || '#38bdf8';
-        for (let s = 0; s < cnt; s++) {
-            const ang = (s / cnt) * Math.PI * 2 + Math.random() * 0.35, spd = 24 + Math.random() * 50;
-            shards.push({ vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 22, sz: 2 + Math.random() * 2.4, col: s % 3 === 0 ? '#ffffff' : (s % 2 === 0 ? empCol : (chroma.isAllInOne ? empSec : mainCol)) });
-        }
-        gameState.empFX.push({ lane: h.lane, z: Math.max(0.9, h.z), cls: h.cls, mainCol, empCol, empSec, life: 1.0, shards });
+function toggleInvertGyro(){
+    controlConfig.invertGyro=!controlConfig.invertGyro;
+    needsSilentGyroCalib=true;
+    const btn=document.getElementById('invertGyroBtn');
+    if(btn){
+        btn.innerText=`⇄ Flip Axis: ${controlConfig.invertGyro?'ON':'OFF'}`;
+        btn.className=controlConfig.invertGyro?"px-2 py-1 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] mono-num font-bold cursor-pointer":"px-2 py-1 rounded bg-[#182032] hover:bg-[#232f47] text-gray-200 border border-gray-600/40 text-[10px] mono-num font-bold cursor-pointer";
     }
-    const cleared = gameState.hazards.length, bonus = cleared * Math.round(160 * gameState.combo);
-    gameState.score += bonus; gameState.hazards = [];
-    spawnFloat(`⚡ EMP VAPORIZED ${cleared} HAZARDS! +${bonus}`, empCol, -60);
+    saveSettingsForActiveAccount();
+}
+
+function calibrateTiltSensor(silent=true){
+    if(hasGyroReading){
+        controlConfig.tiltCenterOffset=lastRawLandscapeTilt;
+        smoothedGyroDelta=0;
+        needsSilentGyroCalib=false;
+    }else{
+        needsSilentGyroCalib=true;
+    }
+    const angleLbl=document.getElementById('gyroLiveAngleLabel');
+    if(angleLbl)angleLbl.innerText="0.0°";
+    if(!silent)playGameSfx('pickup');
+}
+
+function applyDoubleTapNitroState(enabled){
+    controlConfig.doubleTapNitro=Boolean(enabled);
+    const btn=document.getElementById('doubleTapNitroBtn');
+    if(btn){
+        btn.innerText=controlConfig.doubleTapNitro?'ENABLED':'DISABLED';
+        btn.className=controlConfig.doubleTapNitro?"px-3 py-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] mono-num font-bold cursor-pointer":"px-3 py-1 rounded bg-gray-800 text-gray-400 border border-gray-600 text-[10px] mono-num font-bold cursor-pointer";
+    }
+    saveSettingsForActiveAccount();
+}
+function toggleDoubleTapNitro(){applyDoubleTapNitroState(!controlConfig.doubleTapNitro);}
+
+function resetGameSettingsOnly(){
+    setDifficulty('easy');
+    activeLiveryProfile=currentPilot;
+    buildVehicleLiverySelector();
+    biomeIdx=0;cachedGradients.key='';autoCycleBiomes=true;
+    syncAutoBiomeButtonUI();
+    setTextCached('hudBiomeName',BIOME_THEMES[0].label);
+    buildBiomeSelectorGrid();
+    saveSettingsForActiveAccount();
+}
+
+function resetSoundSettingsOnly(){
+    updateVolumeSetting('master',95);
+    updateVolumeSetting('music',90);
+    updateVolumeSetting('menuMusic',85);
+    updateVolumeSetting('engine',80);
+    updateVolumeSetting('sfx',92);
+    updateVolumeSetting('uiClick',85);
+    selectOstMode('synth');
+    saveSettingsForActiveAccount();
+}
+
+function resetControlSettingsOnly(){
+    setMobileControlMode('buttons');
+    applyDoubleTapNitroState(true);
+    updateGyroSpeedSetting(65);
+    controlConfig.tiltCenterOffset=lastRawLandscapeTilt;
+    controlConfig.invertGyro=false;
+    const invBtn=document.getElementById('invertGyroBtn');
+    if(invBtn){
+        invBtn.innerText="⇄ Flip Axis: OFF";
+        invBtn.className="px-2 py-1 rounded bg-[#182032] hover:bg-[#232f47] text-gray-200 border border-gray-600/40 text-[10px] mono-num font-bold cursor-pointer";
+    }
+    resetDefaultKeybinds();
+    saveSettingsForActiveAccount();
+}
+
+function resetGraphicsSettingsOnly(){
+    setVisualFilter('filter-standard',false);
+    applyGraphicsPreset('medium',true);
+}
+
+function setDiscreteTargetLane(newLaneInt){
+    const clamped=Math.max(-2,Math.min(2,Math.round(newLaneInt)));
+    const prevLane=Math.round(gameState.targetLane);
+    if(clamped!==prevLane){
+        const dir=clamped>prevLane?1:-1;
+        gameState.targetLane=clamped;
+        playGameSfx('steer');
+        gameState.egoRoll=dir*0.12;
+        checkPhantomFlashNearMiss(prevLane);
+    }
+}
+
+function setMagneticTargetLane(continuousFloat){
+    const clamped=Math.max(-2,Math.min(2,continuousFloat));
+    const curLane=Math.round(gameState.targetLane);
+    const diff=clamped-curLane;
+    if(Math.abs(diff)>=0.42){
+        const step=diff>0?Math.ceil(diff-0.42):Math.floor(diff+0.42);
+        const nextLane=Math.max(-2,Math.min(2,curLane+(step!==0?step:(diff>0?1:-1))));
+        setDiscreteTargetLane(nextLane);
+        return true;
+    }
+    return false;
+}
+
+function getPointerGameCoords(e){
+    const W=gameState.viewW||window.innerWidth||800;
+    const H=gameState.viewH||window.innerHeight||450;
+    const isRot=isMobileHardware&&(window.innerHeight>window.innerWidth);
+    if(isRot){
+        return {x:e.clientY,y:window.innerWidth-e.clientX,W,H};
+    }
+    return {x:e.clientX,y:e.clientY,W,H};
+}
+
+function handleCanvasTapLane(e){
+    const {x,y,W,H}=getPointerGameCoords(e);
+    const horizonY=H*0.42;
+    const roadCurve=Math.sin(gameState.distanceM*0.012)*0.65;
+    let zTap=EGO_Z_CENTER;
+    if(y>horizonY+12){
+        const scale=(y-horizonY)/(1.72*0.36);
+        zTap=Math.max(1.1,Math.min(18.0,(H*0.85)/Math.max(1,scale)));
+    }
+    let bestLane=Math.round(gameState.targetLane);
+    let minDist=Infinity;
+    for(let i=0;i<LANES.length;i++){
+        const l=LANES[i];
+        const lx=projectX(l,zTap,W,H,roadCurve);
+        const d=Math.abs(x-lx);
+        if(d<minDist){
+            minDist=d;
+            bestLane=l;
+        }
+    }
+    setDiscreteTargetLane(bestLane);
+}
+
+function startKeyRebind(actionKey){
+    awaitingRebindAction=actionKey;
+    const el=document.getElementById(`bindVal_${actionKey}`);
+    if(el)el.innerText="PRESS KEY...";
+}
+
+function resetDefaultKeybinds(){
+    controlConfig.binds={left:['a','arrowleft'],right:['d','arrowright'],nitro:['shift','w','arrowup'],brake:['s','arrowdown'],emp:[' ','e'],hideui:['h']};
+    refreshKeybindLabels();
+}
+
+function refreshKeybindLabels(){
+    Object.entries(controlConfig.binds).forEach(([act,keys])=>{
+        const el=document.getElementById(`bindVal_${act}`);
+        if(el)el.innerText=keys.map(k=>k===' '?'SPACE':k.toUpperCase()).join(' / ');
+    });
+    const hintBadge=document.getElementById('pcHideUiHintBadge');
+    if(hintBadge&&controlConfig.binds.hideui&&controlConfig.binds.hideui[0]){
+        const k=controlConfig.binds.hideui[0]===' '?'SPACE':controlConfig.binds.hideui[0].toUpperCase();
+        hintBadge.innerText=`[${k}] UI • [ESC] Menu`;
+    }
+}
+
+function syncCursorVisibility(){
+    const bootSplash=document.getElementById('bootSplashGateModal');
+    const splashOpen=bootSplash&&bootSplash.style.display!=='none';
+    const anyModal=splashOpen||document.getElementById('startModal').style.display!=='none'||document.getElementById('pauseSettingsModal').style.display!=='none'||document.getElementById('leaderboardModal').style.display!=='none'||document.getElementById('gameOverModal').style.display!=='none';
+    document.body.classList.toggle('gameplay-active',gameState.running&&!gameState.paused&&!anyModal);
+}
+
+function openPauseSettingsModal(defaultTab='game'){
+    ensureAudioEngine();
+    if(gameState.running&&!gameState.paused){
+        gameState.paused=true;
+        nextSynthNoteTime=0;
+        nextMenuNoteTime=0;
+        syncExternalTrackPlayback();updateEngineSoundPitch();updateEqVisuals(false);
+    }
+    const resumeBtn=document.getElementById('resumeOrCloseSettingsBtn');
+    const restartBtn=document.getElementById('inGameRestartBtn');
+    const menuBtn=document.getElementById('inGameMenuBtn');
+    if(gameState.running){
+        if(resumeBtn)resumeBtn.innerText="▶ Resume";
+        if(restartBtn)restartBtn.classList.remove('hidden');
+        if(menuBtn)menuBtn.classList.remove('hidden');
+    }else{
+        if(resumeBtn)resumeBtn.innerText="← Back";
+        if(restartBtn)restartBtn.classList.add('hidden');
+        if(menuBtn)menuBtn.classList.add('hidden');
+    }
+    switchSettingsTab(defaultTab);
+    buildVehicleLiverySelector();
+    buildBiomeSelectorGrid();
+    buildGraphicsUI();
+    renderDevCustomSongsList();
+    document.getElementById('pauseSettingsModal').style.display='flex';
+    syncCursorVisibility();
+}
+
+function resumeFromSettings(){
+    ensureAudioEngine();
+    document.getElementById('pauseSettingsModal').style.display='none';
+    if(gameState.running){
+        requestMobileFullscreenSafe();
+        if(controlConfig.mobileMode==='tilt')calibrateTiltSensor(true);
+        gameState.paused=false;
+        nextMenuNoteTime=0;
+        nextSynthNoteTime=0;
+        syncExternalTrackPlayback();updateEngineSoundPitch();updateEqVisuals(true);
+    }
+    syncCursorVisibility();
+}
+
+function returnToMainMenu(){
+    hasTrustedGesture=true;
+    isBootSplashDismissed=true;
+    const gate=document.getElementById('bootSplashGateModal');
+    if(gate)gate.style.display='none';
+    ensureAudioEngine();
+    gameState.running=false;gameState.paused=false;gameState.ep250WarnTimer=0;
+    nextSynthNoteTime=0;nextMenuNoteTime=0;
+    syncExternalTrackPlayback();updateEngineSoundPitch();updateEqVisuals(false);
+    ['epoch250RedAlertModal','singularityAlertBanner','pauseSettingsModal','gameOverModal','leaderboardModal'].forEach(id=>document.getElementById(id).style.display='none');
+    document.getElementById('startModal').style.display='flex';
+    reconcileAllPilotScores();
+    applyPilotProfile(currentPilot.id);
+    refreshAccountStatsUI();
+    updateTopLeaderBanner();
+    syncCursorVisibility();
+}
+
+function switchSettingsTab(tabName){
+    ['game','sounds','controls','graphics','dev'].forEach(t=>{
+        const p=document.getElementById(`setTab_${t}`),b=document.getElementById(`setTabBtn_${t}`);
+        if(p)p.classList.toggle('hidden',t!==tabName);
+        if(b){
+            if(t==='dev'&&currentPilot.id!=='1117')b.classList.add('hidden');
+            else b.className=(t===tabName)?"py-1.5 px-2 rounded-lg text-[10px] sm:text-[11px] font-bold bg-sky-500 text-black cursor-pointer text-center truncate":"py-1.5 px-2 rounded-lg text-[10px] sm:text-[11px] font-semibold bg-[#131722] text-gray-300 border border-[#232836] cursor-pointer text-center truncate";
+        }
+    });
+}
+
+const IDD_HAZARD_CLASSES=[
+    {id:0,name:"auto_rickshaw",wPx:30,hPx:26,w:1.18,speedMul:0.55,color:"#f59e0b",roof:"#1e293b",points:120},
+    {id:1,name:"bus_truck",    wPx:30,hPx:26,w:1.18,speedMul:0.45,color:"#ef4444",roof:"#450a0a",points:180},
+    {id:2,name:"car",          wPx:30,hPx:26,w:1.18,speedMul:0.65,color:"#38bdf8",roof:"#0c4a6e",points:140},
+    {id:3,name:"two_wheeler",  wPx:30,hPx:26,w:1.18,speedMul:0.75,color:"#a855f7",roof:"#3b0764",points:160,weaves:false},
+    {id:4,name:"pedestrian",   wPx:30,hPx:26,w:1.18,speedMul:0.12,color:"#fb7185",roof:"#881337",points:200},
+    {id:5,name:"stray_animal", wPx:30,hPx:26,w:1.18,speedMul:0.08,color:"#fbbf24",roof:"#78350f",points:190},
+    {id:6,name:"pothole",      wPx:30,hPx:26,w:1.18,speedMul:0.00,color:"#64748b",roof:"#0f172a",points:100,flat:true},
+    {id:7,name:"speed_bump",   wPx:30,hPx:26,w:1.18,speedMul:0.00,color:"#eab308",roof:"#422006",points:90, flat:true}
+];
+
+const EGO_Z_REAR=1.24,EGO_Z_CENTER=1.48,EGO_Z_FRONT=1.78,EGO_HALF_LANE_W=0.33;
+
+function resizeGameCanvas(){
+    detectDeviceHardware();
+    const wrapper=document.getElementById('gameViewportWrapper');
+    const vv=window.visualViewport;
+    const winW=Math.round(vv?vv.width:(window.innerWidth||document.documentElement.clientWidth||800));
+    const winH=Math.round(vv?vv.height:(window.innerHeight||document.documentElement.clientHeight||450));
+    let w=winW,h=winH;
+    if(isMobileHardware&&winH>winW){
+        w=winH;h=winW;
+        if(wrapper){
+            wrapper.style.position='fixed';wrapper.style.top='0px';wrapper.style.left=`${winW}px`;
+            wrapper.style.width=`${winH}px`;wrapper.style.height=`${winW}px`;
+            wrapper.style.transformOrigin='top left';wrapper.style.transform='rotate(90deg)';
+        }
+    }else if(wrapper){
+        wrapper.style.position='fixed';wrapper.style.top='0px';wrapper.style.left='0px';
+        wrapper.style.width=`${winW}px`;wrapper.style.height=`${winH}px`;
+        wrapper.style.transformOrigin='';wrapper.style.transform='none';
+    }
+    const baseDpr=Math.min(window.devicePixelRatio||1,isMobileHardware?1.15:1.45);
+    const effDpr=Math.max(0.6,Math.min(2.0,baseDpr*(gfxSettings.resScale||1.0)));
+    canvas.width=Math.max(1,Math.floor(w*effDpr));
+    canvas.height=Math.max(1,Math.floor(h*effDpr));
+    ctx.setTransform(effDpr,0,0,effDpr,0,0);
+    gameState.viewW=w;gameState.viewH=h;
+    cachedGradients.key='';
+}
+
+function requestMobileFullscreenSafe(){
+    if(!isMobileHardware||isPortalExiting)return;
+    const docEl=document.documentElement;
+    if(!document.fullscreenElement&&docEl.requestFullscreen){
+        docEl.requestFullscreen({navigationUI:'hide'}).then(()=>{
+            if(screen.orientation&&screen.orientation.lock)screen.orientation.lock('landscape').catch(()=>{});
+            setTimeout(resizeGameCanvas,50);setTimeout(resizeGameCanvas,200);
+        }).catch(()=>resizeGameCanvas());
+    }else resizeGameCanvas();
+}
+
+document.addEventListener('fullscreenchange',()=>{
+    resizeGameCanvas();
+    setTimeout(resizeGameCanvas,120);
+    setTimeout(resizeGameCanvas,300);
+});
+
+if(window.visualViewport){
+    window.visualViewport.addEventListener('resize',resizeGameCanvas);
+    window.visualViewport.addEventListener('scroll',resizeGameCanvas);
+}
+
+function triggerEpoch250BigRedWarning(){
+    gameState.ep250WarnTriggered=true;
+    gameState.ep250WarnTimer=3.0;
+    document.getElementById('epoch250RedAlertModal').style.display='flex';
+    playGameSfx('siren250');
+}
+
+function startGameSession(startEpochOverride=1){
+    if(isPortalExiting)return;
+    hasTrustedGesture=true;
+    isBootSplashDismissed=true;
+    const gate=document.getElementById('bootSplashGateModal');
+    if(gate)gate.style.display='none';
+    ensureAudioEngine();
+    menuUnlockAudio.pause();
+
+    const loginRow=document.getElementById('pilotLoginInputRow');
+    const idInp=document.getElementById('pilotIdInput');
+    const gInp=document.getElementById('guestCallsignInput');
+    const rawId=(idInp?idInp.value:'').trim();
+    const rawName=(gInp?gInp.value:'').trim();
+
+    if(loginRow&&!loginRow.classList.contains('hidden')&&(rawId||rawName)){
+        const matchedCore=resolveCorePilotFromInputs(rawId,rawName);
+        if(matchedCore){
+            customGuestId="";
+            localStorage.removeItem('roadSense_overdrive_customGuestId');
+            applyPilotProfile(matchedCore);
+            if(idInp)idInp.value='';
+        }else if(!currentPilot.isCore){
+            if(/^\d{4}$/.test(rawId)&&!CORE_IDS.has(rawId)){
+                customGuestId=rawId;
+                localStorage.setItem('roadSense_overdrive_customGuestId',customGuestId);
+            }else{
+                ensureGuestHas4DigitId();
+            }
+            if(rawName)updateGuestCallsign(rawName);
+            applyPilotProfile("GUEST");
+        }
+    }else if(!currentPilot.isCore){
+        ensureGuestHas4DigitId();
+    }
+
+    requestMobileFullscreenSafe();
+    resizeGameCanvas();
+    if(controlConfig.mobileMode==='tilt')calibrateTiltSensor(true);
+
+    isAccountSessionLocked=true;
+    localStorage.setItem('roadSense_overdrive_accountLocked','true');
+    ['startModal','pauseSettingsModal','leaderboardModal','gameOverModal','epoch250RedAlertModal'].forEach(id=>document.getElementById(id).style.display='none');
+    try{if(isMobileHardware)history.pushState({inGame:true},'');}catch(e){}
+
+    const initEpoch=Math.max(1,Math.floor(startEpochOverride||1));
+    Object.assign(gameState,{
+        running:true,paused:false,score:0,epoch:initEpoch,combo:1.0,nearMisses:0,
+        armor:100,nitroFuel:100,empCharge:100,distanceM:getDistanceForEpoch(initEpoch),
+        speedMps:25,targetLane:0,egoLaneX:0,egoRoll:0,boosting:false,braking:false,
+        slowMoTimer:0,empWaveRadius:0,screenShake:0,ep250WarnTriggered:(initEpoch>250),
+        ep250WarnTimer:0,hazards:[],pickups:[],FloatingTexts:[]
+    });
+    nextMenuNoteTime=0;
+    nextSynthNoteTime=0;
+    syncBiomeForCurrentEpoch(true);
+    if(initEpoch===249||initEpoch===250)triggerEpoch250BigRedWarning();
+    syncExternalTrackPlayback();updateEngineSoundPitch();updateEqVisuals(true);
+    updateHudDOM(true);renderMiniRadar();syncCursorVisibility();
+}
+
+function syncBiomeForCurrentEpoch(isInitial=false){
+    const alertBanner=document.getElementById('singularityAlertBanner');
+    if(gameState.epoch===250){
+        biomeIdx=EPOCH_250_INDEX;cachedGradients.key='';
+        if(alertBanner)alertBanner.style.display='flex';
+        if(!gameState.ep250WarnTriggered)triggerEpoch250BigRedWarning();
+    }else{
+        if(alertBanner)alertBanner.style.display='none';
+        if(gameState.epoch===251&&!isInitial){
+            saveActiveAccountStats(gameState.score,251,0);
+            spawnFloatingText("🏆 EPOCH 250 SURVIVED! COSMIC SINGULARITY UNLOCKED!","#fbbf24",0,-60);
+        }
+        if(autoCycleBiomes){
+            const poolCount=isBiomeUnlockedForPilot(EPOCH_250_INDEX)?14:13;
+            const nextIdx=Math.floor((gameState.epoch-1)/10)%poolCount;
+            if(nextIdx!==biomeIdx||isInitial){
+                biomeIdx=nextIdx;
+                cachedGradients.key='';
+                if(!isInitial)spawnFloatingText(`🌍 DIMENSION SHIFT: ${BIOME_THEMES[biomeIdx].label.toUpperCase()}`,"#38bdf8",0,-50);
+            }
+        }
+    }
+    setTextCached('hudBiomeName',BIOME_THEMES[biomeIdx].label);
+}
+
+function exitGamePortal(){
+    isPortalExiting=true;
+    hasTrustedGesture=false;
+    gameState.running=false;
+    gameState.paused=true;
+    if(synthLoopTimer){clearInterval(synthLoopTimer);synthLoopTimer=null;}
+    try{menuUnlockAudio.pause();menuUnlockAudio.src='';}catch(e){}
+    try{mitadruAudio.pause();customAudio.pause();}catch(e){}
+    if(audioCtx){
+        try{audioCtx.suspend();audioCtx.close();}catch(e){}
+        audioCtx=null;
+    }
+    if(document.fullscreenElement&&document.exitFullscreen){
+        try{document.exitFullscreen().catch(()=>{});}catch(e){}
+    }
+    syncCursorVisibility();
+    try{window.open('','_self','');window.close();}catch(e){}
+    setTimeout(()=>{
+        try{window.location.replace('about:blank');}catch(e){}
+        document.body.innerHTML=`<div style="position:fixed;inset:0;background:#03050a;color:#94a3b8;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:monospace;text-align:center;padding:24px;"><div style="color:#38bdf8;font-weight:800;font-size:16px;margin-bottom:8px;">ROADSENSE INTERCEPTOR OFFLINE</div><div style="font-size:12px;">Telemetry &amp; Audio Powered Down. You may now close this tab.</div></div>`;
+    },80);
+}
+
+function checkPhantomFlashNearMiss(prevLane){
+    for(let i=0;i<gameState.hazards.length;i++){
+        const h=gameState.hazards[i];
+        if(!h.nearMissed&&Math.abs(h.lane-prevLane)<0.72&&h.z>EGO_Z_REAR&&h.z<10.5){
+            h.nearMissed=true;gameState.nearMisses++;
+            gameState.combo=Math.min(8.0,+(gameState.combo+0.5).toFixed(1));
+            const bonus=Math.round(250*gameState.combo);
+            gameState.score+=bonus;
+            gameState.nitroFuel=Math.min(100,gameState.nitroFuel+18);
+            gameState.empCharge=Math.min(100,gameState.empCharge+14);
+            if(gfxSettings.transitions)gameState.slowMoTimer=0.42;
+            playGameSfx('phantom');
+            spawnFloatingText(`⚡ PHANTOM FLASH +${bonus}`,"#00f5d4",0,-45);
+            break;
+        }
+    }
+}
+
+function steerLane(dir){if(gameState.running&&!gameState.paused)setDiscreteTargetLane(Math.round(gameState.targetLane)+dir);}
+function setBoosting(active){
+    const nextBoost=(active&&gameState.nitroFuel>2);
+    if(nextBoost&&!gameState.boosting&&gameState.running&&!gameState.paused){
+        playGameSfx('nitro');
+    }
+    gameState.boosting=nextBoost;
+}
+function setBraking(active){gameState.braking=active;}
+
+function triggerNeuralEmp(){
+    if(!gameState.running||gameState.paused)return;
+    if(gameState.empCharge<100){spawnFloatingText("⚡ EMP CHARGING...","#94a3b8",0,-20);return;}
+    gameState.empCharge=0;gameState.empWaveRadius=1;
+    if(gfxSettings.shake)gameState.screenShake=8;
+    playGameSfx('emp');
+    const cleared=gameState.hazards.length,bonus=cleared*Math.round(160*gameState.combo);
+    gameState.score+=bonus;gameState.hazards=[];
+    spawnFloatingText(`⚡ NEURAL EMP VAPORIZED ${cleared} HAZARDS! +${bonus}`,"#38bdf8",0,-60);
     updateHudDOM(true);
 }
 
-function updateGamePhysics(dt, now) {
-    if (!gameState.running) {
-        menuCruiseDist += dt * 16;
-        return;
+function spawnFloatingText(text,color,ox=0,oy=0){
+    if(!gfxSettings.transitions)return;
+    if(gameState.FloatingTexts.length>4)gameState.FloatingTexts.shift();
+    gameState.FloatingTexts.push({text,color,x:(gameState.viewW||800)*0.5+ox,y:(gameState.viewH||450)*0.42+oy,life:1.0});
+}
+
+function projectX(laneOffset,zSafe,W,H,roadCurve=0){
+    const scale=(H*0.85)/zSafe;
+    const zNorm=zSafe*0.0181818;
+    const curveShift=roadCurve*(zNorm*zNorm)*(W*0.22);
+    const worldX=(laneOffset-gameState.egoLaneX*0.32)*LANE_WIDTH_M;
+    return W*0.5+worldX*scale*0.24+curveShift;
+}
+
+function projectY(zSafe,yMeters,H){
+    const scale=(H*0.85)/zSafe;
+    return(H*0.42)+(1.72-yMeters)*scale*0.36;
+}
+
+function updateGamePhysics(dt,now){
+    if(!gameState.running||gameState.paused)return;
+    if(gameState.ep250WarnTimer>0){
+        gameState.ep250WarnTimer=Math.max(0,gameState.ep250WarnTimer-dt);
+        if(gameState.ep250WarnTimer<=0)document.getElementById('epoch250RedAlertModal').style.display='none';
     }
-    if (gameState.paused) return;
+    const activeDiffKey=(gameState.epoch===250)?'void':currentDiffKey;
+    const diff=DIFFICULTY_PRESETS[activeDiffKey]||DIFFICULTY_PRESETS.easy;
+    let timeScale=1.0;
+    if(gameState.slowMoTimer>0){gameState.slowMoTimer=Math.max(0,gameState.slowMoTimer-dt);timeScale=0.50;}
+    const effDt=dt*timeScale;
 
-    const god = Boolean(devGodModeActive && activeAccount && activeAccount.isDev);
-    if (god) { gameState.armor = 100; gameState.nitroFuel = 100; gameState.empCharge = 100; }
+    const distTo250=(249*70)-gameState.distanceM;
+    if(!gameState.ep250WarnTriggered&&distTo250>0&&distTo250<=gameState.speedMps*3.1)triggerEpoch250BigRedWarning();
 
-    if (gameState.ep250WarnTimer > 0) { gameState.ep250WarnTimer = Math.max(0, gameState.ep250WarnTimer - dt); if (gameState.ep250WarnTimer <= 0) syncEpoch250Banners(); }
-    if (gameState.invulnTimer > 0) gameState.invulnTimer = Math.max(0, gameState.invulnTimer - dt);
-    if (gameState.hitFlashTimer > 0) { gameState.hitFlashTimer = Math.max(0, gameState.hitFlashTimer - dt); if (gameState.hitFlashTimer <= 0) document.getElementById('atmosphereOverlay').classList.remove('hit-flash'); }
+    const prevEpoch=gameState.epoch;
+    gameState.epoch=getEpochFromDistance(gameState.distanceM);
+    if(gameState.epoch!==prevEpoch)syncBiomeForCurrentEpoch(false);
 
-    const activeDiffKey = (gameState.epoch === 250) ? 'void' : globalSettings.difficulty;
-    const diff = DIFFICULTY_PRESETS[activeDiffKey] || DIFFICULTY_PRESETS.easy;
-    let timeScale = 1.0;
-    if (gameState.slowMoTimer > 0) { gameState.slowMoTimer = Math.max(0, gameState.slowMoTimer - dt); timeScale = 0.50; }
-    const effDt = dt * timeScale;
+    const levelScale=Math.max(0.55,1.0-Math.min(0.45,(gameState.epoch-1)*0.0025));
+    if(gameState.boosting){
+        gameState.nitroFuel=Math.max(0,gameState.nitroFuel-dt*24);
+        if(gameState.nitroFuel<=0)gameState.boosting=false;
+    }else{
+        gameState.nitroFuel=Math.min(100,gameState.nitroFuel+dt*diff.nitroRegen*levelScale);
+    }
+    gameState.empCharge=Math.min(100,gameState.empCharge+dt*diff.empRegen*levelScale);
 
-    const distTo250 = (249 * 70) - gameState.distanceM;
-    if (!gameState.ep250WarnTriggered && distTo250 > 0 && distTo250 <= gameState.speedMps * 3.1) triggerEpoch250Warning();
+    const endlessSpeedBonus=Math.min(15,Math.log2(1+gameState.epoch)*2.1);
+    const baseCruise=(24+endlessSpeedBonus)*diff.speedMul;
+    const targetSpeed=gameState.boosting?baseCruise*1.44:(gameState.braking?baseCruise*0.52:baseCruise);
 
-    const prevEp = gameState.epoch;
-    gameState.epoch = getEpochFromDistance(gameState.distanceM);
-    if (gameState.epoch !== prevEp) syncBiomeForEpoch(false);
+    gameState.speedMps+=(targetSpeed-gameState.speedMps)*(1-Math.exp(-8*dt));
+    gameState.distanceM+=gameState.speedMps*effDt;
+    gameState.score+=Math.round(gameState.speedMps*effDt*gameState.combo*diff.scoreMul*1.35);
+    updateEngineSoundPitch();
 
-    const lvlScale = Math.max(0.55, 1.0 - Math.min(0.45, (gameState.epoch - 1) * 0.0025));
-    if (!god) {
-        if (gameState.boosting) { gameState.nitroFuel = Math.max(0, gameState.nitroFuel - dt * 24); if (gameState.nitroFuel <= 0) gameState.boosting = false; }
-        else gameState.nitroFuel = Math.min(100, gameState.nitroFuel + dt * diff.nitroRegen * lvlScale);
-        gameState.empCharge = Math.min(100, gameState.empCharge + dt * diff.empRegen * lvlScale);
+    gameState.targetLane=Math.max(-2,Math.min(2,Math.round(gameState.targetLane)));
+    const laneDiff=gameState.targetLane-gameState.egoLaneX;
+    const smoothAlpha=1-Math.exp(-18*dt);
+    if(Math.abs(laneDiff)<0.003){
+        gameState.egoLaneX=gameState.targetLane;
+        gameState.egoRoll*=Math.exp(-16*dt);
+    }else{
+        gameState.egoLaneX+=laneDiff*smoothAlpha;
+        const targetRoll=Math.max(-0.14,Math.min(0.14,laneDiff*0.12));
+        gameState.egoRoll+=(targetRoll-gameState.egoRoll)*(1-Math.exp(-16*dt));
     }
 
-    const endlessBonus = Math.min(15, Math.log2(1 + gameState.epoch) * 2.1), baseCruise = (24 + endlessBonus) * diff.speedMul;
-    const targetSpd = gameState.boosting ? baseCruise * 1.44 : (gameState.braking ? baseCruise * 0.52 : baseCruise);
-    gameState.speedMps += (targetSpd - gameState.speedMps) * (1 - Math.exp(-8 * dt));
-    gameState.distanceM += gameState.speedMps * effDt;
-    gameState.score += Math.round(gameState.speedMps * effDt * gameState.combo * diff.scoreMul * 1.35);
-    updateEnginePitch();
+    if(gameState.screenShake>0)gameState.screenShake=Math.max(0,gameState.screenShake-dt*28);
+    if(gameState.empWaveRadius>0){gameState.empWaveRadius+=dt*1400;if(gameState.empWaveRadius>1500)gameState.empWaveRadius=0;}
 
-    const laneDiff = gameState.targetLane - gameState.egoLaneX;
-    if (Math.abs(laneDiff) < 0.003) { gameState.egoLaneX = gameState.targetLane; gameState.egoRoll *= Math.exp(-16 * dt); }
-    else { gameState.egoLaneX += laneDiff * (1 - Math.exp(-18 * dt)); gameState.egoRoll += (Math.max(-0.16, Math.min(0.16, laneDiff * 0.14)) - gameState.egoRoll) * (1 - Math.exp(-16 * dt)); }
-
-    if (gameState.screenShake > 0) gameState.screenShake = Math.max(0, gameState.screenShake - dt * 28);
-    if (gameState.empWaveRadius > 0) { gameState.empWaveRadius += dt * 1400; if (gameState.empWaveRadius > 1500) gameState.empWaveRadius = 0; }
-    if (gameState.empFlashAlpha > 0) gameState.empFlashAlpha = Math.max(0, gameState.empFlashAlpha - dt * 1.35);
-
-    spawnAccum += gameState.speedMps * effDt;
-    const spawnInt = Math.max(17.0, diff.spawnMeters - Math.min(8.5, Math.log2(1 + gameState.epoch) * 1.25));
-    if (spawnAccum >= spawnInt) {
-        spawnAccum = 0;
-        const occ = new Set();
-        for (let i = 0; i < gameState.hazards.length; i++) if (gameState.hazards[i].z > 46) occ.add(Math.round(gameState.hazards[i].lane));
-        const free = LANES.filter(l => !occ.has(l));
-        if (free.length >= 2) {
-            const cls = getNextFairHazardClass(), lane = free[Math.floor(Math.random() * free.length)];
-            const hz = { cls, lane, z: 60.0, speedMps: cls.speedMul * baseCruise * 0.52, dgi: +(Math.random() * 0.18 + 0.02).toFixed(2), phase: Math.random() * Math.PI * 2, nearMissed: false };
-            initHazardVariant(hz); gameState.hazards.push(hz);
+    spawnAccumulator+=gameState.speedMps*effDt;
+    const spawnInterval=Math.max(17.0,diff.spawnMeters-Math.min(8.5,Math.log2(1+gameState.epoch)*1.25));
+    if(spawnAccumulator>=spawnInterval){
+        spawnAccumulator=0;
+        const occupied=new Set();
+        for(let i=0;i<gameState.hazards.length;i++)if(gameState.hazards[i].z>46)occupied.add(Math.round(gameState.hazards[i].lane));
+        const free=LANES.filter(l=>!occupied.has(l));
+        if(free.length>=2){
+            const cls=IDD_HAZARD_CLASSES[Math.floor(Math.random()*IDD_HAZARD_CLASSES.length)];
+            const lane=free[Math.floor(Math.random()*free.length)];
+            gameState.hazards.push({cls,lane,baseLane:lane,z:60.0,speedMps:cls.speedMul*baseCruise*0.52,dgi:+(Math.random()*0.18+0.02).toFixed(2),phase:Math.random()*Math.PI*2,nearMissed:false});
         }
     }
 
-    pickupAccum += gameState.speedMps * effDt;
-    if (pickupAccum >= (diff.pickupSpacing / lvlScale) && gameState.pickups.length < 2) {
-        pickupAccum = 0; const r = Math.random();
-        gameState.pickups.push({ lane: LANES[Math.floor(Math.random() * LANES.length)], z: 58.0, type: r < 0.3333 ? 'nitro' : (r < 0.6667 ? 'emp' : 'hull'), spin: 0 });
+    pickupAccumulator+=gameState.speedMps*effDt;
+    if(pickupAccumulator>=(diff.pickupSpacing/levelScale)&&gameState.pickups.length<2){
+        pickupAccumulator=0;
+        const rng=Math.random();
+        gameState.pickups.push({lane:LANES[Math.floor(Math.random()*LANES.length)],z:58.0,type:rng<0.3333?'nitro':(rng<0.6667?'emp':'hull'),spin:0});
     }
 
-    const hitThresh = 0.56 + (diff.hitboxScale - 0.75) * 0.50;
-    for (let i = gameState.hazards.length - 1; i >= 0; i--) {
-        const h = gameState.hazards[i];
-        h.z -= Math.max(4, gameState.speedMps - h.speedMps) * effDt;
-        if (h.z <= EGO_Z_FRONT + 0.35 && h.z >= EGO_Z_REAR - 0.22) {
-            const lat = Math.min(Math.abs(h.lane - gameState.egoLaneX), Math.abs(h.lane - gameState.targetLane));
-            if (lat < hitThresh) {
-                gameState.hazards.splice(i, 1);
-                if (gameState.invulnTimer <= 0) {
-                    playSfx('hit');
-                    if (globalSettings.graphics.shake) gameState.screenShake = 9;
-                    if (!god) {
-                        gameState.combo = 1.0;
-                        const dmg = Math.round((h.cls.flat ? 12 : 19) * diff.hitboxScale);
-                        gameState.armor = Math.max(0, gameState.armor - dmg);
-                        gameState.invulnTimer = 0.36; gameState.hitFlashTimer = 0.22;
-                        document.getElementById('atmosphereOverlay').classList.add('hit-flash');
-                        spawnFloat(`💥 IMPACT: ${h.cls.name.toUpperCase()} (-${dmg}% HULL)`, '#ef4444', -26);
-                    }
-                    updateHudDOM(true);
-                    if (gameState.armor <= 0 && !god) { triggerGameOver(); return; }
-                }
+    const hitThresh=0.56+(diff.hitboxScale-0.75)*0.50;
+    for(let i=gameState.hazards.length-1;i>=0;i--){
+        const h=gameState.hazards[i];
+        h.z-=Math.max(4,gameState.speedMps-h.speedMps)*effDt;
+        h.lane=h.baseLane;
+        if(h.z<=EGO_Z_FRONT+0.35&&h.z>=EGO_Z_REAR-0.22){
+            const latDist=Math.min(Math.abs(h.lane-gameState.egoLaneX),Math.abs(h.lane-gameState.targetLane));
+            if(latDist<hitThresh){
+                playGameSfx('hit');
+                if(gfxSettings.shake)gameState.screenShake=9;
+                gameState.combo=1.0;
+                const dmg=Math.round((h.cls.flat?12:19)*diff.hitboxScale);
+                gameState.armor=Math.max(0,gameState.armor-dmg);
+                spawnFloatingText(`💥 IMPACT: ${h.cls.name.toUpperCase()} (-${dmg}% HULL)`,"#ef4444",0,-30);
+                gameState.hazards.splice(i,1);
+                updateHudDOM(true);
+                if(gameState.armor<=0){triggerGameOver();return;}
                 continue;
             }
         }
-        if (h.z < 0.70) { gameState.score += Math.round(h.cls.points * gameState.combo * diff.scoreMul); gameState.hazards.splice(i, 1); }
+        if(h.z<0.70){gameState.score+=Math.round(h.cls.points*gameState.combo*diff.scoreMul);gameState.hazards.splice(i,1);}
     }
 
-    const fillMul = diff.pickupScale * lvlScale;
-    for (let i = gameState.pickups.length - 1; i >= 0; i--) {
-        const p = gameState.pickups[i]; p.z -= gameState.speedMps * effDt; p.spin += dt * 4.5;
-        if (p.z <= EGO_Z_FRONT + 0.8 && p.z >= EGO_Z_REAR - 0.35 && Math.abs(p.lane - gameState.egoLaneX) < 0.68) {
-            playSfx('pickup');
-            if (p.type === 'nitro') { const g = Math.max(15, Math.round(42 * fillMul)); gameState.nitroFuel = Math.min(100, gameState.nitroFuel + g); gameState.score += Math.round(280 * gameState.combo); spawnFloat(`🟨 NITRO +${g}%`, '#fbbf24', -34); }
-            else if (p.type === 'emp') { const g = Math.max(14, Math.round(38 * fillMul)); gameState.empCharge = Math.min(100, gameState.empCharge + g); gameState.score += Math.round(280 * gameState.combo); spawnFloat(`🟦 EMP +${g}%`, '#38bdf8', -34); }
-            else { const g = Math.max(10, Math.round(26 * fillMul)); gameState.armor = Math.min(100, gameState.armor + g); gameState.score += Math.round(280 * gameState.combo); spawnFloat(`🟩 HULL +${g}%`, '#10b981', -34); }
-            gameState.pickups.splice(i, 1); updateHudDOM(true); continue;
+    const fillMul=diff.pickupScale*levelScale;
+    for(let i=gameState.pickups.length-1;i>=0;i--){
+        const p=gameState.pickups[i];
+        p.z-=gameState.speedMps*effDt;p.spin+=dt*4.5;
+        if(p.z<=EGO_Z_FRONT+0.8&&p.z>=EGO_Z_REAR-0.35&&Math.abs(p.lane-gameState.egoLaneX)<0.68){
+            playGameSfx('pickup');
+            if(p.type==='nitro'){
+                const g=Math.max(15,Math.round(42*fillMul));
+                gameState.nitroFuel=Math.min(100,gameState.nitroFuel+g);gameState.score+=Math.round(280*gameState.combo);
+                spawnFloatingText(`🟨 NITRO CORE +${g}% NITRO`,"#fbbf24",0,-38);
+            }else if(p.type==='emp'){
+                const g=Math.max(14,Math.round(38*fillMul));
+                gameState.empCharge=Math.min(100,gameState.empCharge+g);gameState.score+=Math.round(280*gameState.combo);
+                spawnFloatingText(`🟦 EMP CORE +${g}% EMP`,"#38bdf8",0,-38);
+            }else{
+                const g=Math.max(10,Math.round(26*fillMul));
+                gameState.armor=Math.min(100,gameState.armor+g);gameState.score+=Math.round(280*gameState.combo);
+                spawnFloatingText(`🟩 HULL NANITES +${g}% HULL`,"#10b981",0,-38);
+            }
+            gameState.pickups.splice(i,1);updateHudDOM(true);continue;
         }
-        if (p.z < 0.70) gameState.pickups.splice(i, 1);
+        if(p.z<0.70)gameState.pickups.splice(i,1);
     }
 
-    for (let i = gameState.FloatingTexts.length - 1; i >= 0; i--) {
-        const ft = gameState.FloatingTexts[i]; ft.y -= dt * 42; ft.life -= dt * 1.15;
-        if (ft.life <= 0) gameState.FloatingTexts.splice(i, 1);
+    for(let i=gameState.FloatingTexts.length-1;i>=0;i--){
+        const ft=gameState.FloatingTexts[i];
+        ft.y-=dt*42;ft.life-=dt*1.15;
+        if(ft.life<=0)gameState.FloatingTexts.splice(i,1);
     }
 
-    if (now - lastHudTs >= 100) { lastHudTs = now; updateHudDOM(false); if (!isHudHidden) renderMiniRadar(now); }
+    if(now-lastHudUpdateTime>=100){
+        lastHudUpdateTime=now;
+        updateHudDOM(false);
+        if(!isHudHidden)renderMiniRadar();
+    }
 }
 
-function triggerGameOver() {
-    gameState.running = false; gameState.ep250WarnTimer = 0; gameState.hitFlashTimer = 0; gameState.boosting = false; gameState.braking = false;
-    nextGameNoteT = 0; nextMenuNoteT = 0;
-    document.getElementById('atmosphereOverlay').classList.remove('hit-flash');
-    syncEpoch250Banners(); syncExternalTracks(); updateEnginePitch(); updateEqVisuals(false);
+// High score & leaderboard are updated ONLY when the endless run ends (when you die)
+function triggerGameOver(){
+    gameState.running=false;gameState.ep250WarnTimer=0;
+    nextSynthNoteTime=0;nextMenuNoteTime=0;
+    document.getElementById('epoch250RedAlertModal').style.display='none';
+    syncExternalTrackPlayback();updateEngineSoundPitch();
 
-    const score = Math.max(0, Math.round(gameState.score)), ep = Math.max(1, Math.round(gameState.epoch)), st = seasonStatusCache;
-    if (activeAccount) {
-        activeAccount.stats.allTimeBest = Math.max(activeAccount.stats.allTimeBest || 0, score);
-        activeAccount.stats.bestEpoch = Math.max(activeAccount.stats.bestEpoch || 1, ep);
-        activeAccount.stats.totalFlashes = (activeAccount.stats.totalFlashes || 0) + gameState.nearMisses;
-        activeAccount.stats.totalRuns = (activeAccount.stats.totalRuns || 0) + 1;
-        if (ep > 250) activeAccount.stats.completedEpoch250 = true;
-        if (!activeAccount.stats.seasonScores) activeAccount.stats.seasonScores = {};
-        if (st.phase === 'ACTIVE') activeAccount.stats.seasonScores[st.seasonNum] = Math.max(activeAccount.stats.seasonScores[st.seasonNum] || 0, score);
-        activeAccount.updatedAt = Date.now();
-        saveAccountsCache(); recordScoreToLeaderboards(activeAccount, score, ep);
-    }
+    const finalRunScore=Math.max(0,Math.round(gameState.score||0));
+    const finalRunEpoch=Math.max(1,Math.round(gameState.epoch||1));
+    saveActiveAccountStats(finalRunScore,finalRunEpoch,gameState.nearMisses);
+    recordScoreToLeaderboard(finalRunScore,finalRunEpoch,true);
 
-    const sBest = (activeAccount && activeAccount.stats.seasonScores[st.seasonNum]) || 0;
-    const aBest = (activeAccount && activeAccount.stats.allTimeBest) || score;
-    document.getElementById('finalScoreVal').innerText = score.toLocaleString();
-    document.getElementById('finalBestVal').innerText = st.phase === 'ACTIVE' ? `S${st.seasonNum}: ${sBest.toLocaleString()} / All: ${aBest.toLocaleString()}` : aBest.toLocaleString();
-    document.getElementById('finalEpochVal').innerText = `Ep ${ep} • ${BIOME_THEMES[biomeIdx].label}`;
-    document.getElementById('finalNearMissVal').innerText = String(gameState.nearMisses);
-    document.getElementById('gameOverSeasonNote').innerText = st.phase === 'ACTIVE' ? `Season ${st.seasonNum} Ranked` : 'Off-Season Gap (All-Time Recorded)';
-
-    refreshMenuAccountUI(); refreshInboxBadgeUI();
-    document.getElementById('gameOverModal').style.display = 'flex';
+    const st=getActiveAccountStats();
+    const overallBest=Math.max(st.bestScore||0,finalRunScore);
+    document.getElementById('finalScoreVal').innerText=finalRunScore.toLocaleString();
+    document.getElementById('finalBestVal').innerText=overallBest.toLocaleString();
+    document.getElementById('finalEpochVal').innerText=`Epoch ${finalRunEpoch} • ${BIOME_THEMES[biomeIdx].label}`;
+    document.getElementById('finalNearMissVal').innerText=String(gameState.nearMisses);
+    refreshAccountStatsUI();
+    document.getElementById('gameOverModal').style.display='flex';
     syncCursorVisibility();
 }
 
-// =========================================================================
-// 11. RENDERER
-// =========================================================================
-function ensureCachedBiomeGradients(W, H, horizonY, theme) {
-    const key = `${W}_${H}_${biomeIdx}`;
-    if (cachedGradients.key === key) return;
-    cachedGradients.key = key;
-    const skyGrad = ctx.createLinearGradient(0, 0, 0, H);
-    skyGrad.addColorStop(0, theme.skyTop); skyGrad.addColorStop(0.42, theme.skyBot);
-    skyGrad.addColorStop(0.43, theme.roadDark); skyGrad.addColorStop(1, theme.roadDark);
-    cachedGradients.sky = skyGrad;
+function updateHudDOM(force=false){
+    if(isHudHidden&&!force)return;
+    setTextCached('hudScore',String(gameState.score).padStart(6,'0'));
+    setTextCached('hudEpoch',`EP ${gameState.epoch}`);
+    setTextCached('hudCombo',`${gameState.combo.toFixed(1)}x`);
+    setTextCached('hudSpeedKmh',`${Math.round(gameState.speedMps*3.6)} km/h`);
+    setStyleWidthCached('hudArmorBar',`${gameState.armor}%`);
+    setTextCached('hudArmorPct',`${gameState.armor}%`);
 
-    const sunGrad = ctx.createRadialGradient(W * 0.5, horizonY - 16, 6, W * 0.5, horizonY - 16, H * 0.34);
-    sunGrad.addColorStop(0, '#ffffff'); sunGrad.addColorStop(0.26, theme.sun); sunGrad.addColorStop(1, 'transparent');
-    cachedGradients.sun = sunGrad;
-}
+    const nitroPct=Math.max(0,Math.min(100,Math.floor(gameState.nitroFuel)));
+    const empPct=Math.max(0,Math.min(100,Math.floor(gameState.empCharge)));
+    setTextCached('hudNitroPct',`${nitroPct}%`);setStyleWidthCached('hudNitroBar',`${nitroPct}%`);
+    setTextCached('hudEmpPct',empPct>=100?"READY!":`${empPct}%`);setStyleWidthCached('hudEmpBar',`${empPct}%`);
 
-function renderUniqueDimensionHorizon(W, H, horizonY, theme, now, dynamicWorldColor, cosmicHue) {
-    const cx = W * 0.5, hType = theme.horizonType || 'cyber', u = Math.min(W, H), showP = globalSettings.graphics.pillars;
-
-    if (hType === 'cosmic250' || gameState.epoch === 250) {
-        const cy = horizonY - 22, bhR = u * 0.115;
-        if (showP) {
-            const jetW = bhR * 0.44; ctx.fillStyle = `hsla(${cosmicHue},95%,65%,0.22)`;
-            ctx.beginPath(); ctx.moveTo(cx - jetW * 0.2, cy); ctx.lineTo(cx - jetW * 1.45, 0); ctx.lineTo(cx + jetW * 1.45, 0); ctx.lineTo(cx + jetW * 0.2, cy); ctx.fill();
-            for (let p = -2; p <= 2; p++) { if (p === 0) continue; const px = cx + p * (W * 0.185); ctx.fillStyle = `hsla(${(cosmicHue + p * 55 + 360) % 360},95%,62%,0.15)`; ctx.fillRect(px - 8, 0, 16, horizonY); }
+    let lead=null,maxRisk=0;
+    for(let i=0;i<gameState.hazards.length;i++){
+        const h=gameState.hazards[i];
+        const latDiff=Math.abs(h.lane-gameState.egoLaneX);
+        const distRisk=Math.max(0,Math.min(1,1-(h.z-2)/50));
+        const overlap=Math.max(0,1-latDiff/1.2);
+        const ttc=h.z/Math.max(1,gameState.speedMps-h.speedMps);
+        const ttcRisk=ttc<=1.8?1.0:Math.max(0,(6.0-ttc)/4.2);
+        const rFinal=Math.min(1,0.35*distRisk+0.35*ttcRisk+0.30*overlap);
+        h.rFinal=rFinal;h.ttc=ttc;
+        if(rFinal>maxRisk){maxRisk=rFinal;lead=h;}
+    }
+    const riskPct=Math.round(maxRisk*100);
+    const warnTier=riskPct>=85?'CRITICAL':(riskPct>=65?'WARNING':(riskPct>=35?'CAUTION':'CLEAR'));
+    if(domCache.warnTier!==warnTier){
+        domCache.warnTier=warnTier;
+        const wb=document.getElementById('hudWarningBadge');
+        if(wb){
+            wb.innerText=warnTier;
+            wb.className=warnTier==='CRITICAL'?"px-1.5 py-0.5 rounded text-[8px] sm:text-[10px] font-bold bg-red-950 text-red-400 border border-red-500 whitespace-nowrap shrink-0":(warnTier==='WARNING'?"px-1.5 py-0.5 rounded text-[8px] sm:text-[10px] font-bold bg-orange-950 text-orange-400 border border-orange-500 whitespace-nowrap shrink-0":(warnTier==='CAUTION'?"px-1.5 py-0.5 rounded text-[8px] sm:text-[10px] font-bold bg-amber-950 text-amber-300 border border-amber-500 whitespace-nowrap shrink-0":"px-1.5 py-0.5 rounded text-[8px] sm:text-[10px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-700 whitespace-nowrap shrink-0"));
         }
-        ctx.fillStyle = cachedGradients.sun; ctx.beginPath(); ctx.arc(cx, cy, bhR * 2.75, 0, Math.PI * 2); ctx.fill();
-        if (showP) {
-            ctx.save(); ctx.translate(cx, cy); ctx.rotate(-0.14 + Math.sin(now * 0.0008) * 0.04);
-            for (let r = 0; r < 3; r++) { ctx.strokeStyle = `hsla(${(cosmicHue + r * 65) % 360},95%,65%,${0.78 - r * 0.18})`; ctx.lineWidth = 3 - r * 0.65; ctx.beginPath(); ctx.ellipse(0, 0, bhR * (1.55 + r * 0.38), bhR * (0.32 + r * 0.08), 0, 0, Math.PI * 2); ctx.stroke(); }
-            ctx.restore();
+    }
+    if(lead){
+        setTextCached('hudLeadName',`${lead.cls.name.toUpperCase()} (${lead.z.toFixed(1)}m)`);
+        setTextCached('hudLeadTtc',`${lead.ttc.toFixed(1)}s`);
+        setTextCached('hudLeadDgi',String(lead.dgi));
+    }else{
+        setTextCached('hudLeadName',"CLEAR");setTextCached('hudLeadTtc',"STABLE");setTextCached('hudLeadDgi',"0.00");
+    }
+}
+
+function renderMiniRadar(){
+    const w=radarCanvas.width,h=radarCanvas.height,cx=w*0.5,cy=h-7;
+    rCtx.clearRect(0,0,w,h);
+    rCtx.strokeStyle='#1e2638';rCtx.lineWidth=1;
+    rCtx.beginPath();
+    rCtx.arc(cx,cy,20,Math.PI,0,false);rCtx.arc(cx,cy,40,Math.PI,0,false);rCtx.arc(cx,cy,60,Math.PI,0,false);
+    rCtx.stroke();
+    rCtx.fillStyle=activeLiveryProfile.dotColor;rCtx.fillRect(cx-3,cy-5,6,5);
+    radarAngle+=0.25;if(radarAngle>Math.PI*2)radarAngle=Math.PI;
+    rCtx.beginPath();rCtx.moveTo(cx,cy);rCtx.lineTo(cx+Math.cos(radarAngle)*65,cy+Math.sin(radarAngle)*65);
+    rCtx.strokeStyle='rgba(56,189,248,0.35)';rCtx.stroke();
+    for(let i=0;i<gameState.hazards.length;i++){
+        const hz=gameState.hazards[i];
+        if(hz.z>55)continue;
+        const bx=cx+(hz.lane-gameState.egoLaneX)*9,by=cy-hz.z*1.18;
+        if(by>2&&by<h){
+            rCtx.fillStyle=(hz.rFinal>=0.85)?'#ef4444':(hz.rFinal>=0.65?'#f97316':(hz.rFinal>=0.35?'#f59e0b':'#38bdf8'));
+            rCtx.fillRect(bx-2,by-2,4,4);
         }
-        ctx.fillStyle = '#010006'; ctx.beginPath(); ctx.arc(cx, cy, bhR * 0.88, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = dynamicWorldColor; ctx.lineWidth = 2.8; ctx.beginPath(); ctx.arc(cx, cy, bhR * 0.90, 0, Math.PI * 2); ctx.stroke();
-        return;
     }
+}
+// ==================== END OF CHUNK 5 OF 6 ====================
+// ==================== START OF CHUNK 6 OF 6 ====================
+// --- START OF MINI-CHUNK 6.1 OF 4 ---
+['low','medium','high','ultra'].forEach(k=>{
+    if(GRAPHICS_PRESETS[k])GRAPHICS_PRESETS[k].legacyModels=false;
+});
+if(typeof gfxSettings==='object'){
+    if(gfxSettings.legacyModels===undefined)gfxSettings.legacyModels=false;
+    if(gfxSettings.voidChromaNitro===undefined)gfxSettings.voidChromaNitro=true;
+}
+if(Array.isArray(GFX_TOGGLE_META)&&!GFX_TOGGLE_META.some(m=>m.k==='legacyModels')){
+    GFX_TOGGLE_META.push({k:'legacyModels',lbl:'👾 Legacy Models'});
+}
 
-    ctx.fillStyle = cachedGradients.sun; ctx.beginPath(); ctx.arc(cx, horizonY - 10, H * 0.28, Math.PI, 0, false); ctx.fill();
+let devGodModeActive=false;
+let lbAdminManageMode=false;
+const PER_ACC_RESET_TS_KEY='roadSense_overdrive_perAccResetTs_v11';
 
-    if (hType === 'cyber') {
-        const sunR = u * 0.135;
-        if (showP) { [-1, 1].forEach((s, i) => { const ang = Math.sin(now * 0.0012 + i) * 0.28; ctx.fillStyle = 'rgba(56,189,248,0.10)'; ctx.beginPath(); ctx.moveTo(cx + s * W * 0.22, horizonY); ctx.lineTo(cx + s * W * 0.22 + Math.sin(ang) * 140 - 28, 0); ctx.lineTo(cx + s * W * 0.22 + Math.sin(ang) * 140 + 28, 0); ctx.closePath(); ctx.fill(); }); }
-        ctx.save(); ctx.beginPath(); ctx.arc(cx, horizonY - 2, sunR, Math.PI, 0, false); ctx.clip();
-        const sg = ctx.createLinearGradient(cx, horizonY - sunR, cx, horizonY);
-        sg.addColorStop(0, '#00f5d4'); sg.addColorStop(0.55, '#38bdf8'); sg.addColorStop(1, '#ec4899');
-        ctx.fillStyle = sg; ctx.fillRect(cx - sunR, horizonY - sunR - 2, sunR * 2, sunR + 2);
-        ctx.fillStyle = theme.skyBot; for (let s = 0; s < 7; s++) ctx.fillRect(cx - sunR, horizonY - s * (sunR * 0.13) - 3, sunR * 2, 1.8 + s * 0.65);
-        ctx.restore();
-        const bCount = 24, bw = W / bCount;
-        for (let b = 0; b < bCount; b++) {
-            const bx = b * bw, distC = Math.abs((bx + bw * 0.5) - cx) / (W * 0.5), bh = (18 + ((b * 41) % 46)) * (0.45 + distC * 0.75);
-            ctx.fillStyle = '#040710'; ctx.fillRect(bx, horizonY - bh, bw + 1, bh);
-            ctx.strokeStyle = 'rgba(56,189,248,0.45)'; ctx.lineWidth = 1; ctx.strokeRect(bx, horizonY - bh, bw, bh);
-            ctx.fillStyle = (b & 1) ? '#38bdf888' : '#f472b688'; ctx.fillRect(bx + 3, horizonY - bh + 4, Math.max(2, bw - 6), 2);
-            if (bh > 34) { ctx.beginPath(); ctx.moveTo(bx + bw * 0.5, horizonY - bh); ctx.lineTo(bx + bw * 0.5, horizonY - bh - 12); ctx.stroke(); }
+function getPerAccountResetMap(){
+    try{return JSON.parse(localStorage.getItem(PER_ACC_RESET_TS_KEY)||'{}');}catch(e){return {};}
+}
+function savePerAccountResetMap(mapObj){
+    localStorage.setItem(PER_ACC_RESET_TS_KEY,JSON.stringify(mapObj||{}));
+}
+
+const OPTIC_FILTER_META=[
+    {k:'filter-standard',lbl:'✨ Standard Optic'},
+    {k:'filter-bw',lbl:'⚫ Black & White'},
+    {k:'filter-negative',lbl:'🔄 Negative'},
+    {k:'filter-warm',lbl:'🌅 Warm & Saturated'},
+    {k:'filter-vintage',lbl:'🎞️ Vintage'},
+    {k:'filter-cinematic',lbl:'🎬 Cinematic'}
+];
+const VALID_OPTIC_FILTERS=new Set(OPTIC_FILTER_META.map(f=>f.k));
+
+function injectCustomFilterAndGodStyles(){
+    let st=document.getElementById('customOpticAndGodStyleTag');
+    if(!st){
+        st=document.createElement('style');
+        st.id='customOpticAndGodStyleTag';
+        document.head.appendChild(st);
+    }
+    st.textContent=`
+        .filter-standard { filter: none !important; }
+        .filter-bw { filter: grayscale(100%) contrast(145%) brightness(96%) !important; }
+        .filter-negative { filter: invert(100%) hue-rotate(180deg) contrast(108%) !important; }
+        .filter-warm { filter: sepia(52%) saturate(310%) hue-rotate(-22deg) contrast(124%) brightness(106%) !important; }
+        .filter-vintage { filter: sepia(82%) saturate(72%) contrast(120%) brightness(88%) !important; }
+        .filter-cinematic { filter: contrast(142%) saturate(168%) brightness(94%) hue-rotate(-14deg) !important; }
+
+        #atmosphereOverlay.atmo-filter-warm {
+            background: radial-gradient(circle at 50% 42%, rgba(251, 146, 60, 0.20) 0%, rgba(225, 29, 72, 0.24) 58%, rgba(28, 6, 4, 0.68) 100%) !important;
         }
-    } else if (hType === 'monsoon') {
-        if ((Math.floor(now * 0.009) % 11) === 0) { ctx.strokeStyle = '#a7f3d0'; ctx.lineWidth = 2.2; ctx.beginPath(); ctx.moveTo(cx + W * 0.12, 0); ctx.lineTo(cx + W * 0.09, horizonY * 0.38); ctx.lineTo(cx + W * 0.13, horizonY * 0.52); ctx.lineTo(cx + W * 0.07, horizonY); ctx.stroke(); }
-        const spanW = W * 0.26, towerH = H * 0.19, deckY = horizonY - H * 0.045;
-        ctx.strokeStyle = 'rgba(16,185,129,0.42)'; ctx.lineWidth = 1.2;
-        for (let x = cx - spanW; x <= cx + spanW; x += 18) { const norm = (x - cx) / spanW, cableY = (horizonY - towerH) + (1 - norm * norm) * (deckY - (horizonY - towerH) - 6); ctx.beginPath(); ctx.moveTo(x, cableY); ctx.lineTo(x, deckY); ctx.stroke(); }
-        ctx.strokeStyle = '#10b981'; ctx.lineWidth = 2.4; ctx.beginPath(); ctx.moveTo(cx - spanW, horizonY - towerH); ctx.quadraticCurveTo(cx, deckY - 6, cx + spanW, horizonY - towerH); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(0, deckY); ctx.lineTo(cx - spanW, horizonY - towerH); ctx.moveTo(cx + spanW, horizonY - towerH); ctx.lineTo(W, deckY); ctx.stroke();
-        ctx.fillStyle = '#041214'; ctx.fillRect(0, deckY, W, 4);
-        [-1, 1].forEach(s => { const tx = cx + s * spanW; ctx.fillStyle = '#061a1e'; ctx.strokeStyle = '#10b981'; ctx.lineWidth = 1.8; ctx.beginPath(); ctx.moveTo(tx - 12, horizonY); ctx.lineTo(tx - 6, horizonY - towerH); ctx.lineTo(tx + 6, horizonY - towerH); ctx.lineTo(tx + 12, horizonY); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.fillStyle = '#34d399'; ctx.beginPath(); ctx.arc(tx, horizonY - towerH - 3, 3, 0, Math.PI * 2); ctx.fill(); });
-    } else if (hType === 'solar') {
-        const r = u * 0.125, cy = horizonY - r * 0.55;
-        ctx.fillStyle = '#fff7ed'; ctx.strokeStyle = '#f97316'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(cx, cy, r, Math.PI * 0.92, Math.PI * 0.08, false); ctx.fill(); ctx.stroke();
-        ctx.strokeStyle = 'rgba(251,146,60,0.65)'; ctx.lineWidth = 2;
-        for (let i = 0; i < 6; i++) { const a = Math.PI + (i / 5) * Math.PI + Math.sin(now * 0.002 + i) * 0.08; ctx.beginPath(); ctx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r, r * 0.24, 0, Math.PI * 2); ctx.stroke(); }
-        [-1, 1].forEach(s => { const px = cx + s * (W * 0.27), py = horizonY - H * 0.11; if (showP) { ctx.fillStyle = 'rgba(245,158,11,0.16)'; ctx.fillRect(px - 5, 0, 10, horizonY); } ctx.fillStyle = '#1c080d'; ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 1.8; ctx.beginPath(); ctx.moveTo(px, py - 26); ctx.lineTo(px + 22, py); ctx.lineTo(px, py + 26); ctx.lineTo(px - 22, py); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.beginPath(); ctx.moveTo(px - 18, horizonY); ctx.lineTo(px, py + 26); ctx.lineTo(px + 18, horizonY); ctx.stroke(); });
-    } else if (hType === 'cryo') {
-        if (showP) { for (let band = 0; band < 3; band++) { ctx.strokeStyle = band === 0 ? 'rgba(56,189,248,0.34)' : (band === 1 ? 'rgba(52,211,153,0.28)' : 'rgba(192,132,252,0.22)'); ctx.lineWidth = 12 - band * 3; ctx.beginPath(); for (let x = 0; x <= W; x += 32) { const y = horizonY * (0.22 + band * 0.12) + Math.sin(x * 0.011 + now * 0.0016 + band) * 14; if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); } ctx.stroke(); } }
-        [[-0.38, 0.11], [-0.22, 0.18], [-0.08, 0.13], [0, 0.22], [0.11, 0.14], [0.25, 0.19], [0.39, 0.12]].forEach(([ox, oh]) => { const px = cx + ox * W, pw = W * 0.13, ph = H * oh; ctx.fillStyle = '#041529'; ctx.strokeStyle = '#7dd3fc'; ctx.lineWidth = 1.4; ctx.beginPath(); ctx.moveTo(px - pw, horizonY); ctx.lineTo(px, horizonY - ph); ctx.lineTo(px + pw, horizonY); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.fillStyle = 'rgba(224,242,254,0.25)'; ctx.beginPath(); ctx.moveTo(px, horizonY - ph); ctx.lineTo(px + pw, horizonY); ctx.lineTo(px + pw * 0.15, horizonY); ctx.closePath(); ctx.fill(); });
-    } else if (hType === 'bio') {
-        const mr = u * 0.095, mcy = horizonY - mr * 1.25, pulse = 1 + Math.sin(now * 0.0035) * 0.08;
-        if (showP) { for (let b = -2; b <= 2; b++) { if (b === 0) continue; const bx = cx + b * (W * 0.18) + Math.sin(now * 0.0015 + b) * 10; ctx.fillStyle = 'rgba(74,222,128,0.11)'; ctx.fillRect(bx - 5, 0, 10, horizonY); } }
-        ctx.save(); ctx.translate(cx, mcy); ctx.fillStyle = '#032211'; ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 2.2; ctx.beginPath(); ctx.arc(0, 0, mr * pulse, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.fillStyle = 'rgba(34,197,94,0.38)'; ctx.beginPath(); ctx.arc(0, 0, mr * 0.58 * pulse, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#bbf7d0'; ctx.beginPath(); ctx.arc(0, 0, mr * 0.24 * pulse, 0, Math.PI * 2); ctx.fill();
-        for (let r = 0; r < 2; r++) { ctx.save(); ctx.rotate(now * (r === 0 ? 0.0012 : -0.0015) + r * 1.1); ctx.strokeStyle = r === 0 ? '#4ade80' : '#00f5d4'; ctx.lineWidth = 1.8; ctx.beginPath(); ctx.ellipse(0, 0, mr * 1.48, mr * 0.38, 0, 0, Math.PI * 2); ctx.stroke(); for (let n = 0; n < 6; n++) { const a = (n / 6) * Math.PI * 2; ctx.fillStyle = '#fef08a'; ctx.beginPath(); ctx.arc(Math.cos(a) * mr * 1.48, Math.sin(a) * mr * 0.38, 2.5, 0, Math.PI * 2); ctx.fill(); } ctx.restore(); }
-        ctx.restore();
-        [-0.35, -0.20, 0.20, 0.35].forEach((ox, i) => { const sway = Math.sin(now * 0.0022 + i) * 6, mx = cx + ox * W + sway, stemH = H * (i % 2 === 0 ? 0.10 : 0.145), capR = u * (i % 2 === 0 ? 0.052 : 0.072), topY = horizonY - stemH; ctx.fillStyle = '#041f11'; ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(cx + ox * W - 6, horizonY); ctx.quadraticCurveTo(mx - 2, horizonY - stemH * 0.5, mx - 4, topY); ctx.lineTo(mx + 4, topY); ctx.quadraticCurveTo(mx + 2, horizonY - stemH * 0.5, cx + ox * W + 6, horizonY); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.fillStyle = '#06371c'; ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 2; ctx.beginPath(); ctx.ellipse(mx, topY, capR, capR * 0.44, 0, Math.PI, 0, false); ctx.closePath(); ctx.fill(); ctx.stroke(); for (let g = -2; g <= 2; g++) { const tendrilH = 10 + Math.sin(now * 0.004 + i + g) * 5; ctx.strokeStyle = 'rgba(0,245,212,0.55)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(mx + g * (capR * 0.32), topY); ctx.lineTo(mx + g * (capR * 0.32) + sway * 0.4, topY + tendrilH); ctx.stroke(); } });
-    } else if (hType === 'eclipse') {
-        const r = u * 0.105, ecy = horizonY - r * 1.12; ctx.strokeStyle = 'rgba(244,63,94,0.35)'; ctx.lineWidth = 8; ctx.beginPath(); ctx.arc(cx, ecy, r * 1.14, 0, Math.PI * 2); ctx.stroke(); ctx.fillStyle = '#040002'; ctx.strokeStyle = '#fb7185'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(cx, ecy, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(cx + r * 0.72, ecy - r * 0.68, 5 + Math.sin(now * 0.005) * 1.5, 0, Math.PI * 2); ctx.fill();
-        for (let s = -5; s <= 5; s++) { if (s === 0) continue; const sx = cx + s * (W * 0.075), sh = H * (Math.abs(s) % 2 === 1 ? 0.15 : 0.10); ctx.fillStyle = '#120307'; ctx.strokeStyle = '#f43f5e88'; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(sx - 10, horizonY); ctx.lineTo(sx - 6, horizonY - sh * 0.55); ctx.lineTo(sx, horizonY - sh); ctx.lineTo(sx + 6, horizonY - sh * 0.55); ctx.lineTo(sx + 10, horizonY); ctx.closePath(); ctx.fill(); ctx.stroke(); }
-    } else if (hType === 'tachyon') {
-        const coreY = horizonY - H * 0.13, coreR = u * 0.055; ctx.fillStyle = '#1e0b3b'; ctx.strokeStyle = '#eab308'; ctx.lineWidth = 2.2; ctx.beginPath(); ctx.arc(cx, coreY, coreR, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.strokeStyle = '#c084fc'; ctx.lineWidth = 1.8; ctx.beginPath(); ctx.ellipse(cx, coreY, coreR * 1.65, coreR * 0.45, now * 0.002, 0, Math.PI * 2); ctx.stroke();
-        [-1, 1].forEach(s => { const tx = cx + s * (W * 0.24), th = H * 0.17; ctx.fillStyle = '#120726'; ctx.strokeStyle = '#c084fc'; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(tx - 14, horizonY); ctx.lineTo(tx - 6, horizonY - th); ctx.lineTo(tx + 6, horizonY - th); ctx.lineTo(tx + 14, horizonY); ctx.closePath(); ctx.fill(); ctx.stroke(); for (let r = 1; r <= 3; r++) ctx.strokeRect(tx - 11, horizonY - th * (0.28 * r), 22, 4); ctx.strokeStyle = '#fde047'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(tx, horizonY - th); ctx.quadraticCurveTo((tx + cx) * 0.5, coreY - 18 + Math.sin(now * 0.018 + s) * 12, cx + s * coreR, coreY); ctx.stroke(); });
-    } else if (hType === 'dune') {
-        ctx.fillStyle = '#fef08a'; ctx.beginPath(); ctx.arc(cx - W * 0.09, horizonY - H * 0.15, u * 0.038, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#f97316'; ctx.beginPath(); ctx.arc(cx + W * 0.10, horizonY - H * 0.10, u * 0.068, 0, Math.PI * 2); ctx.fill();
-        [[-0.23, 0.11, 0.10], [0, 0.16, 0.15], [0.23, 0.11, 0.10]].forEach(([ox, pwR, phR]) => { const px = cx + ox * W, pw = W * pwR, ph = H * phR; ctx.fillStyle = '#120902'; ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px - pw, horizonY); ctx.lineTo(px, horizonY - ph); ctx.lineTo(px + pw * 0.85, horizonY); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.fillStyle = '#291505'; ctx.beginPath(); ctx.moveTo(px, horizonY - ph); ctx.lineTo(px + pw * 0.85, horizonY); ctx.lineTo(px + pw * 0.1, horizonY); ctx.closePath(); ctx.fill(); ctx.fillStyle = '#fde68a'; ctx.beginPath(); ctx.moveTo(px - pw * 0.18, horizonY - ph * 0.82); ctx.lineTo(px, horizonY - ph); ctx.lineTo(px + pw * 0.15, horizonY - ph * 0.82); ctx.closePath(); ctx.fill(); });
-    } else if (hType === 'sakura') {
-        const mr = u * 0.125; ctx.fillStyle = 'rgba(251,207,232,0.88)'; ctx.beginPath(); ctx.arc(cx, horizonY - mr * 0.55, mr, Math.PI, 0, false); ctx.fill();
-        const fw = W * 0.26, fh = H * 0.16; ctx.fillStyle = '#12061c'; ctx.strokeStyle = '#f472b6'; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(cx - fw, horizonY); ctx.quadraticCurveTo(cx - fw * 0.35, horizonY - fh * 0.35, cx - fw * 0.14, horizonY - fh); ctx.lineTo(cx + fw * 0.14, horizonY - fh); ctx.quadraticCurveTo(cx + fw * 0.35, horizonY - fh * 0.35, cx + fw, horizonY); ctx.closePath(); ctx.fill(); ctx.stroke();
-        ctx.fillStyle = '#fdf2f8'; ctx.beginPath(); ctx.moveTo(cx - fw * 0.14, horizonY - fh); ctx.lineTo(cx + fw * 0.14, horizonY - fh); ctx.lineTo(cx + fw * 0.22, horizonY - fh * 0.68); ctx.lineTo(cx, horizonY - fh * 0.76); ctx.lineTo(cx - fw * 0.22, horizonY - fh * 0.68); ctx.closePath(); ctx.fill();
-        const px = cx - W * 0.29; for (let t = 0; t < 4; t++) { const tw = 26 - t * 4, ty = horizonY - 10 - t * 11; ctx.fillStyle = '#1a0826'; ctx.strokeStyle = '#ec4899'; ctx.lineWidth = 1.2; ctx.fillRect(px - tw * 0.5, ty, tw, 8); ctx.beginPath(); ctx.moveTo(px - tw * 0.75, ty); ctx.lineTo(px + tw * 0.75, ty); ctx.stroke(); }
-        const tx = cx + W * 0.29; ctx.fillStyle = '#ec4899'; ctx.fillRect(tx - 14, horizonY - 32, 4, 32); ctx.fillRect(tx + 10, horizonY - 32, 4, 32); ctx.fillRect(tx - 22, horizonY - 34, 44, 4); ctx.fillRect(tx - 17, horizonY - 23, 34, 3);
-    } else if (hType === 'matrix') {
-        if (showP) { ctx.fillStyle = 'rgba(34,197,94,0.28)'; for (let c = 0; c < 22; c++) { const mx = (c / 22) * W, my = (now * 0.09 + c * 53) % (horizonY - 14); ctx.fillRect(mx, my, 2.5, 14); ctx.fillStyle = '#bbf7d0'; ctx.fillRect(mx, my + 12, 2.5, 3); ctx.fillStyle = 'rgba(34,197,94,0.28)'; } }
-        const mr = u * 0.105, cy = horizonY - mr * 1.08; ctx.save(); ctx.translate(cx, cy); ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(0, 0, mr * 1.18, 0, Math.PI * 2); ctx.stroke(); ctx.rotate(now * 0.0008); ctx.fillStyle = '#021407'; ctx.beginPath(); ctx.moveTo(0, -mr); ctx.lineTo(mr, 0); ctx.lineTo(0, mr); ctx.lineTo(-mr, 0); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.strokeRect(-mr * 0.55, -mr * 0.55, mr * 1.1, mr * 1.1); ctx.restore();
-    } else if (hType === 'saturn') {
-        const r = u * 0.105, cy = horizonY - r * 1.02; ctx.save(); ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.clip(); ctx.fillStyle = '#1e1b4b'; ctx.fillRect(cx - r, cy - r, r * 2, r * 2); ctx.fillStyle = 'rgba(129,140,248,0.28)'; for (let b = -3; b <= 3; b++) ctx.fillRect(cx - r, cy + b * (r * 0.24), r * 2, r * 0.11); ctx.restore();
-        ctx.strokeStyle = '#818cf8'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
-        ctx.save(); ctx.translate(cx, cy); ctx.rotate(-0.18 + Math.sin(now * 0.0005) * 0.03); for (let ring = 0; ring < 3; ring++) { ctx.strokeStyle = ring === 1 ? 'rgba(199,210,254,0.85)' : 'rgba(129,140,248,0.55)'; ctx.lineWidth = ring === 1 ? 3.5 : 1.8; ctx.beginPath(); ctx.ellipse(0, 0, r * (1.65 + ring * 0.35), r * (0.28 + ring * 0.07), 0, 0, Math.PI * 2); ctx.stroke(); } ctx.restore();
-        ctx.fillStyle = '#c7d2fe'; ctx.beginPath(); ctx.arc(cx - r * 2.4, cy - r * 0.5, 5, 0, Math.PI * 2); ctx.arc(cx + r * 2.3, cy + r * 0.3, 7, 0, Math.PI * 2); ctx.fill();
-    } else if (hType === 'magma') {
-        const vh = H * 0.17, vw = W * 0.24; ctx.fillStyle = '#170401'; ctx.strokeStyle = '#fb923c'; ctx.lineWidth = 1.8; ctx.beginPath(); ctx.moveTo(0, horizonY); ctx.lineTo(cx - vw, horizonY - vh * 0.42); ctx.lineTo(cx - vw * 0.22, horizonY - vh); ctx.lineTo(cx, horizonY - vh * 0.86); ctx.lineTo(cx + vw * 0.22, horizonY - vh); ctx.lineTo(cx + vw, horizonY - vh * 0.42); ctx.lineTo(W, horizonY); ctx.closePath(); ctx.fill(); ctx.stroke();
-        ctx.fillStyle = '#ef4444'; ctx.beginPath(); ctx.arc(cx, horizonY - vh, 14 + Math.sin(now * 0.012) * 4, Math.PI, 0, false); ctx.fill();
-        ctx.strokeStyle = '#facc15'; ctx.lineWidth = 2.4; ctx.beginPath(); ctx.moveTo(cx - 6, horizonY - vh * 0.9); ctx.quadraticCurveTo(cx - 24, horizonY - vh * 0.4, cx - 38, horizonY); ctx.moveTo(cx + 6, horizonY - vh * 0.9); ctx.quadraticCurveTo(cx + 20, horizonY - vh * 0.45, cx + 32, horizonY); ctx.stroke();
-    } else if (hType === 'astral') {
-        const cy = horizonY - H * 0.12, r = u * 0.075; ctx.save(); ctx.translate(cx, cy); ctx.rotate(now * 0.0008); ctx.strokeStyle = '#f8fafc'; ctx.lineWidth = 1.8; ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke(); ctx.strokeRect(-r * 0.7, -r * 0.7, r * 1.4, r * 1.4); ctx.restore();
-        for (let m = -3; m <= 3; m++) { if (m === 0) continue; const mx = cx + m * (W * 0.105), mh = 34 - Math.abs(m) * 4, fy = horizonY - 18 - Math.sin(now * 0.0022 + m) * 6; ctx.fillStyle = '#0b0f19'; ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(mx - 8, fy); ctx.lineTo(mx - 8, fy - mh); ctx.lineTo(mx, fy - mh - 8); ctx.lineTo(mx + 8, fy - mh); ctx.lineTo(mx + 8, fy); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.fillStyle = '#38bdf8'; ctx.fillRect(mx - 1.5, fy - mh + 4, 3, mh - 10); }
-    }
-}
-
-function renderHighTexturePickup(pk, W, H, roadCurve, now) {
-    const zSafe = Math.max(0.55, pk.z), px = projectX(pk.lane, zSafe, W, H, roadCurve), roadY = projectY(zSafe, 0, H);
-    const s = getRigidPerspectiveScale(zSafe, W, H, 'pickup'), r = 6.0 * s;
-    const mainCol = pk.type === 'nitro' ? '#fbbf24' : (pk.type === 'emp' ? '#38bdf8' : '#10b981');
-    if (globalSettings.graphics.legacyModels) {
-        ctx.save(); ctx.translate(px, roadY - r * 1.4); ctx.rotate(pk.spin);
-        ctx.fillStyle = mainCol; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = Math.max(1.1, 1.4 * s);
-        ctx.fillRect(-r, -r, r * 2, r * 2); ctx.strokeRect(-r, -r, r * 2, r * 2); ctx.fillStyle = '#ffffff'; ctx.fillRect(-r * 0.35, -r * 0.35, r * 0.7, r * 0.7);
-        ctx.restore(); return;
-    }
-    const py = roadY - r * 1.45 + (globalSettings.graphics.transitions ? Math.sin(now * 0.0065 + pk.spin) * 1.6 * s : 0);
-    const coreCol = pk.type === 'nitro' ? '#fef08a' : (pk.type === 'emp' ? '#e0f2fe' : '#a7f3d0'), darkCol = pk.type === 'nitro' ? '#78350f' : (pk.type === 'emp' ? '#0c4a6e' : '#064e3b');
-    const hiDet = globalSettings.graphics.preset === 'high' || globalSettings.graphics.preset === 'ultra';
-    ctx.fillStyle = 'rgba(0,0,0,0.52)'; ctx.beginPath(); ctx.ellipse(px, roadY + 1.2 * s, r * 0.92, r * 0.26, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.save(); ctx.translate(px, py);
-    if (hiDet) { ctx.save(); ctx.rotate(-pk.spin * 0.65); ctx.strokeStyle = colorWithAlpha(mainCol, 0.53); ctx.lineWidth = Math.max(0.9, 1.05 * s); const ro = r * 1.14; ctx.strokeRect(-ro, -ro, ro * 2, ro * 2); ctx.restore(); }
-    ctx.rotate(pk.spin);
-    if (globalSettings.graphics.bloom && !isMobileHardware) { ctx.shadowBlur = 10; ctx.shadowColor = mainCol; }
-    ctx.fillStyle = mainCol; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = Math.max(1.1, 1.4 * s);
-    ctx.fillRect(-r, -r, r * 2, r * 2); ctx.strokeRect(-r, -r, r * 2, r * 2); ctx.shadowBlur = 0;
-    ctx.fillStyle = darkCol; ctx.fillRect(-r * 0.66, -r * 0.66, r * 1.32, r * 1.32);
-    ctx.strokeStyle = coreCol; ctx.lineWidth = Math.max(0.8, 0.95 * s); ctx.strokeRect(-r * 0.66, -r * 0.66, r * 1.32, r * 1.32);
-    ctx.fillStyle = '#ffffff'; ctx.fillRect(-r * 0.35, -r * 0.35, r * 0.70, r * 0.70);
-    ctx.restore();
-}
-
-function renderLegacyHazardModel(hz, bx, by, s, boxW, boxH, primaryCol) {
-    const x1 = bx - boxW * 0.5, y2 = by, y1 = y2 - boxH, cid = hz.cls.id;
-    if (cid === 0) {
-        ctx.fillStyle = '#05070b'; ctx.fillRect(x1 + 1 * s, y2 - 6 * s, 4 * s, 6 * s); ctx.fillRect(x1 + boxW - 5 * s, y2 - 6 * s, 4 * s, 6 * s);
-        ctx.fillStyle = '#111827'; ctx.strokeStyle = primaryCol; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(x1 + 2 * s, y2 - 3 * s); ctx.lineTo(x1 + 3 * s, y1 + boxH * 0.36); ctx.quadraticCurveTo(bx, y1 - 3 * s, x1 + boxW - 3 * s, y1 + boxH * 0.36); ctx.lineTo(x1 + boxW - 2 * s, y2 - 3 * s); ctx.closePath(); ctx.fill(); ctx.stroke();
-        ctx.fillStyle = primaryCol; ctx.fillRect(x1 + 3 * s, y1 + boxH * 0.48, boxW - 6 * s, boxH * 0.40); ctx.fillStyle = '#ff1e42'; ctx.fillRect(x1 + 4 * s, y2 - 7 * s, 5 * s, 3 * s); ctx.fillRect(x1 + boxW - 9 * s, y2 - 7 * s, 5 * s, 3 * s);
-    } else if (cid === 1) {
-        ctx.fillStyle = '#05070b'; ctx.fillRect(x1, y2 - 7 * s, 5 * s, 7 * s); ctx.fillRect(x1 + boxW - 5 * s, y2 - 7 * s, 5 * s, 7 * s);
-        ctx.fillStyle = hz.cls.roof; ctx.strokeStyle = primaryCol; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(x1 + 1 * s, y2 - 2 * s); ctx.lineTo(x1 + 1 * s, y1 + 3 * s); ctx.lineTo(x1 + 4 * s, y1); ctx.lineTo(x1 + boxW - 4 * s, y1); ctx.lineTo(x1 + boxW - 1 * s, y1 + 3 * s); ctx.lineTo(x1 + boxW - 1 * s, y2 - 2 * s); ctx.closePath(); ctx.fill(); ctx.stroke();
-        ctx.fillStyle = primaryCol; ctx.fillRect(x1 + 3 * s, y1 + boxH * 0.22, boxW - 6 * s, boxH * 0.62); ctx.fillStyle = '#09101d'; ctx.fillRect(x1 + 4 * s, y1 + boxH * 0.26, boxW - 8 * s, boxH * 0.22); ctx.fillStyle = '#ff1e42'; ctx.fillRect(x1 + 3 * s, y2 - 6 * s, 6 * s, 3 * s); ctx.fillRect(x1 + boxW - 9 * s, y2 - 6 * s, 6 * s, 3 * s);
-    } else if (cid === 2) {
-        ctx.fillStyle = '#05070b'; ctx.fillRect(x1, y2 - 6 * s, 4.5 * s, 6 * s); ctx.fillRect(x1 + boxW - 4.5 * s, y2 - 6 * s, 4.5 * s, 6 * s);
-        ctx.fillStyle = hz.cls.roof; ctx.strokeStyle = primaryCol; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(bx, y1); ctx.quadraticCurveTo(x1 + 4 * s, y1 + 2 * s, x1 + 2 * s, y1 + boxH * 0.36); ctx.lineTo(x1, y2 - 2 * s); ctx.lineTo(x1 + boxW, y2 - 2 * s); ctx.lineTo(x1 + boxW - 2 * s, y1 + boxH * 0.36); ctx.quadraticCurveTo(x1 + boxW - 4 * s, y1 + 2 * s, bx, y1); ctx.closePath(); ctx.fill(); ctx.stroke();
-        ctx.fillStyle = '#7dd3fc'; ctx.beginPath(); ctx.moveTo(bx, y1 + 5 * s); ctx.lineTo(x1 + 5 * s, y1 + boxH * 0.44); ctx.lineTo(x1 + boxW - 5 * s, y1 + boxH * 0.44); ctx.closePath(); ctx.fill(); ctx.fillStyle = '#ff1e42'; ctx.fillRect(x1 + 3.5 * s, y2 - 7.5 * s, 7 * s, 3 * s); ctx.fillRect(x1 + boxW - 10.5 * s, y2 - 7.5 * s, 7 * s, 3 * s);
-    } else if (cid === 3) {
-        ctx.fillStyle = '#05070b'; ctx.fillRect(bx - 3 * s, y2 - 9 * s, 6 * s, 9 * s); ctx.fillStyle = hz.cls.roof; ctx.strokeStyle = primaryCol; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(bx - 6 * s, y2 - 3 * s); ctx.lineTo(bx - 7 * s, y1 + boxH * 0.44); ctx.lineTo(bx, y1 + 2 * s); ctx.lineTo(bx + 7 * s, y1 + boxH * 0.44); ctx.lineTo(bx + 6 * s, y2 - 3 * s); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.fillStyle = '#f8fafc'; ctx.beginPath(); ctx.arc(bx, y1 + 6 * s, 4.2 * s, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#ff1e42'; ctx.fillRect(bx - 3 * s, y2 - 8 * s, 6 * s, 3 * s);
-    } else if (cid === 4) {
-        ctx.fillStyle = '#0f172a'; ctx.strokeStyle = primaryCol; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(bx, y1 + 4.5 * s, 4.2 * s, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.fillStyle = primaryCol; ctx.fillRect(bx - 5 * s, y1 + 9.5 * s, 10 * s, 9.5 * s); ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1.8; ctx.beginPath(); ctx.moveTo(bx - 2.5 * s, y1 + 19 * s); ctx.lineTo(bx - 3.5 * s, y2); ctx.moveTo(bx + 2.5 * s, y1 + 19 * s); ctx.lineTo(bx + 3.5 * s, y2); ctx.stroke();
-    } else if (cid === 5) {
-        ctx.fillStyle = hz.cls.roof; ctx.strokeStyle = primaryCol; ctx.lineWidth = 1.5; ctx.fillRect(x1 + 4 * s, y1 + 9 * s, boxW - 8 * s, 9 * s); ctx.strokeRect(x1 + 4 * s, y1 + 9 * s, boxW - 8 * s, 9 * s); ctx.fillStyle = primaryCol; ctx.fillRect(x1 + 4 * s, y1 + 18 * s, 3 * s, 7 * s); ctx.fillRect(x1 + boxW - 7 * s, y1 + 18 * s, 3 * s, 7 * s);
-    } else if (cid === 6) {
-        ctx.fillStyle = '#05070c'; ctx.strokeStyle = primaryCol; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.ellipse(bx, y2 - 6 * s, boxW * 0.45, 5 * s, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-    } else {
-        ctx.fillStyle = hz.cls.roof; ctx.strokeStyle = primaryCol; ctx.lineWidth = 1.5; ctx.fillRect(x1, y2 - 11 * s, boxW, 9 * s); ctx.strokeRect(x1, y2 - 11 * s, boxW, 9 * s);
-    }
-}
-
-function renderHighTextureDistinctHazard(hz, zSafe, W, H, roadCurve, dynamicWorldColor, isCosmic250, cosmicHue, now) {
-    const bx = projectX(hz.lane, zSafe, W, H, roadCurve), by = projectY(zSafe, 0, H);
-    const cid = hz.cls.id, s = getRigidPerspectiveScale(zSafe, W, H, cid);
-    const dims = globalSettings.graphics.legacyModels ? { w: 25, h: 23 } : (REAL_LIFE_HAZARD_DIMS[cid] || { w: 24, h: 21 });
-    const boxW = dims.w * s, boxH = dims.h * s, x1 = bx - boxW * 0.5, y2 = by, y1 = y2 - boxH;
-    const tierCol = hz.rFinal >= 0.85 ? '#ef4444' : (hz.rFinal >= 0.65 ? '#f97316' : (hz.rFinal >= 0.35 ? '#f59e0b' : dynamicWorldColor));
-    ctx.fillStyle = 'rgba(0,0,0,0.62)'; ctx.beginPath(); ctx.ellipse(bx, y2 + 1.8 * s, boxW * 0.50, 3.0 * s, 0, 0, Math.PI * 2); ctx.fill();
-
-    if (globalSettings.graphics.legacyModels) {
-        renderLegacyHazardModel(hz, bx, by, s * 0.84, boxW, boxH, isCosmic250 ? `hsl(${(cosmicHue + cid * 45) % 360},90%,58%)` : hz.cls.color);
-    } else {
-        const highDetail = globalSettings.graphics.preset === 'high' || globalSettings.graphics.preset === 'ultra', ms = s * 0.84, pal = hz.palette || {};
-        ctx.save(); ctx.translate(bx, y2); ctx.scale(ms, ms);
-        if (cid === 0) {
-            ctx.fillStyle = '#05070b'; ctx.fillRect(-10.5, -6, 3.2, 6); ctx.fillRect(7.3, -6, 3.2, 6); ctx.fillRect(-1.8, -5, 3.6, 5.5);
-            ctx.fillStyle = pal.bodyBot; ctx.strokeStyle = pal.trim; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.roundRect(-10, -14.5, 20, 12.5, 2); ctx.fill(); ctx.stroke();
-            ctx.fillStyle = pal.bodyTop; ctx.fillRect(-9.2, -14, 18.4, 5.5);
-            ctx.fillStyle = pal.roof; ctx.strokeStyle = '#fde047'; ctx.lineWidth = 1.4; ctx.beginPath(); ctx.moveTo(-10, -14); ctx.lineTo(-8.8, -21.5); ctx.quadraticCurveTo(0, -26, 8.8, -21.5); ctx.lineTo(10, -14); ctx.closePath(); ctx.fill(); ctx.stroke();
-            ctx.fillStyle = pal.glass; ctx.strokeStyle = '#0f172a'; ctx.lineWidth = 1; ctx.beginPath(); ctx.roundRect(-7.6, -20.8, 15.2, 6.2, 1.5); ctx.fill(); ctx.stroke();
-            ctx.beginPath(); ctx.moveTo(0, -20.8); ctx.lineTo(0, -14.6); ctx.stroke(); ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(0, -8.5, 2.2, 0, Math.PI * 2); ctx.fill();
-            ctx.fillStyle = '#ff1e42'; ctx.fillRect(-8.5, -9, 3, 2.2); ctx.fillRect(5.5, -9, 3, 2.2);
-        } else if (cid === 1) {
-            if (hz.subType === 'bus') {
-                ctx.fillStyle = '#05070b'; ctx.fillRect(-15.5, -7, 4.2, 7); ctx.fillRect(11.3, -7, 4.2, 7);
-                ctx.fillStyle = pal.body; ctx.strokeStyle = pal.trim; ctx.lineWidth = 1.7; ctx.beginPath(); ctx.roundRect(-15.5, -32.5, 31, 30.5, 3.5); ctx.fill(); ctx.stroke();
-                if (highDetail) { ctx.fillStyle = pal.top; ctx.fillRect(-14.5, -31.5, 29, 6); }
-                ctx.fillStyle = '#050811'; ctx.fillRect(-11.5, -30.5, 23, 3.5); ctx.fillStyle = '#fde047'; ctx.fillRect(-8.5, -29.4, 17, 1.4);
-                ctx.fillStyle = '#38bdf8'; ctx.beginPath(); ctx.roundRect(-13.5, -26, 27, 10.5, 2); ctx.fill();
-                if (highDetail) { ctx.fillStyle = '#e0f2fe'; ctx.fillRect(-12.5, -25.2, 25, 2.2); }
-                ctx.fillStyle = pal.stripe; ctx.fillRect(-14.8, -14, 29.6, 2.5); ctx.fillStyle = '#090d16'; ctx.fillRect(-8.5, -10, 17, 5);
-                ctx.fillStyle = '#ffffff'; ctx.fillRect(-13.8, -9, 4, 2.8); ctx.fillRect(9.8, -9, 4, 2.8); ctx.fillStyle = '#fbbf24'; ctx.fillRect(-13.8, -5.5, 3, 2); ctx.fillRect(10.8, -5.5, 3, 2);
-            } else {
-                ctx.fillStyle = '#05070b'; ctx.fillRect(-16, -7.5, 4.5, 7.5); ctx.fillRect(11.5, -7.5, 4.5, 7.5);
-                ctx.fillStyle = pal.cargo; ctx.strokeStyle = pal.trim; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.roundRect(-16.5, -34, 33, 19, 2); ctx.fill(); ctx.stroke();
-                ctx.fillStyle = '#fde047'; [-10, -5, 0, 5, 10].forEach(lx => ctx.fillRect(lx - 1.1, -33, 2.2, 1.8));
-                ctx.fillStyle = pal.cab; ctx.strokeStyle = pal.trim; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.roundRect(-14, -26, 28, 24, 3); ctx.fill(); ctx.stroke();
-                ctx.fillStyle = '#7dd3fc'; ctx.fillRect(-12, -23.5, 11, 7); ctx.fillRect(1, -23.5, 11, 7);
-                ctx.fillStyle = '#0f172a'; ctx.strokeStyle = '#f8fafc'; ctx.lineWidth = 1.3; ctx.beginPath(); ctx.roundRect(-8, -14.5, 16, 9.5, 1.5); ctx.fill(); ctx.stroke();
-                for (let g = -5; g <= 5; g += 2.5) { ctx.beginPath(); ctx.moveTo(g, -14); ctx.lineTo(g, -5.5); ctx.stroke(); }
-                ctx.fillStyle = '#fef08a'; ctx.fillRect(-13, -11.5, 3.8, 3.2); ctx.fillRect(9.2, -11.5, 3.8, 3.2);
-            }
-        } else if (cid === 2) {
-            ctx.fillStyle = '#05070b'; ctx.beginPath(); ctx.roundRect(-14, -6.5, 4, 6.5, 1.5); ctx.roundRect(10, -6.5, 4, 6.5, 1.5); ctx.fill();
-            ctx.fillStyle = pal.top; ctx.strokeStyle = pal.trim; ctx.lineWidth = 1.7; ctx.beginPath(); ctx.moveTo(-13, -2); ctx.quadraticCurveTo(-14.5, -8.5, -12, -13.5); ctx.lineTo(-8, -21.5); ctx.quadraticCurveTo(0, -23.5, 8, -21.5); ctx.lineTo(12, -13.5); ctx.quadraticCurveTo(14.5, -8.5, 13, -2); ctx.closePath(); ctx.fill(); ctx.stroke();
-            ctx.fillStyle = pal.bot; ctx.fillRect(-12.2, -11, 24.4, 8); ctx.fillStyle = pal.canopy; ctx.beginPath(); ctx.moveTo(-6.8, -20); ctx.quadraticCurveTo(0, -21.4, 6.8, -20); ctx.lineTo(9.4, -13.2); ctx.quadraticCurveTo(0, -12, -9.4, -13.2); ctx.closePath(); ctx.fill();
-            ctx.fillStyle = '#05070c'; ctx.beginPath(); ctx.roundRect(-11, -7.2, 22, 4.8, 2); ctx.fill(); ctx.fillStyle = '#ff1e42'; ctx.fillRect(-10.2, -6.5, 6.2, 2.5); ctx.fillRect(4, -6.5, 6.2, 2.5); ctx.fillStyle = pal.trim; ctx.fillRect(-2.4, -6, 4.8, 1.6);
-        } else if (cid === 3) {
-            ctx.fillStyle = '#05070b'; ctx.strokeStyle = '#475569'; ctx.lineWidth = 1; ctx.beginPath(); ctx.roundRect(-2.8, -10, 5.6, 10, 2); ctx.fill(); ctx.stroke();
-            ctx.fillStyle = '#0f172a'; ctx.fillRect(-6.8, -15, 3, 7); ctx.fillRect(3.8, -15, 3, 7); ctx.fillStyle = pal.main; ctx.strokeStyle = pal.trim; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(0, -4.5); ctx.lineTo(-6.2, -13.5); ctx.lineTo(-4.4, -20.5); ctx.lineTo(4.4, -20.5); ctx.lineTo(6.2, -13.5); ctx.closePath(); ctx.fill(); ctx.stroke();
-            ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(-8.5, -18.5); ctx.lineTo(8.5, -18.5); ctx.stroke(); ctx.fillStyle = '#0f172a'; ctx.strokeStyle = pal.trim; ctx.lineWidth = 1.3; ctx.beginPath(); ctx.arc(0, -22.5, 4.2, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-            ctx.fillStyle = pal.visor; ctx.fillRect(-2.8, -23.4, 5.6, 2.2); ctx.fillStyle = '#fef08a'; ctx.fillRect(-4.2, -13.5, 2.6, 2.2); ctx.fillRect(1.6, -13.5, 2.6, 2.2);
-        } else if (cid === 4) {
-            const runCycle = now * 0.015 + (hz.phase || 0), swing = Math.sin(runCycle), bob = Math.abs(Math.cos(runCycle)) * 1.6; ctx.translate(0, -bob);
-            const ll = swing > 0 ? swing * 4.0 : swing * 1.2, rl = swing < 0 ? -swing * 4.0 : -swing * 1.2;
-            ctx.lineCap = 'round'; ctx.lineWidth = 2.8; ctx.strokeStyle = '#e2e8f0'; ctx.beginPath(); ctx.moveTo(-2.5, -10); ctx.lineTo(-3.0, -2.2 - ll); ctx.moveTo(2.5, -10); ctx.lineTo(3.0, -2.2 - rl); ctx.stroke();
-            ctx.fillStyle = pal.trim; ctx.beginPath(); ctx.arc(-3.0, -1.6 - ll, 1.7, 0, Math.PI * 2); ctx.arc(3.0, -1.6 - rl, 1.7, 0, Math.PI * 2); ctx.fill();
-            const laY = -13 + swing * 3.0, raY = -13 - swing * 3.0; ctx.strokeStyle = pal.top; ctx.lineWidth = 2.4; ctx.beginPath(); ctx.moveTo(-4.4, -18.5); ctx.lineTo(-7.0, laY); ctx.moveTo(4.4, -18.5); ctx.lineTo(7.0, raY); ctx.stroke();
-            ctx.fillStyle = pal.skin; ctx.beginPath(); ctx.arc(-7.0, laY, 1.3, 0, Math.PI * 2); ctx.arc(7.0, raY, 1.3, 0, Math.PI * 2); ctx.fill();
-            ctx.fillStyle = pal.top; ctx.strokeStyle = pal.trim; ctx.lineWidth = 1.3;
-            if (hz.subType === 'girl') { ctx.beginPath(); ctx.moveTo(-4.2, -19.5); ctx.lineTo(4.2, -19.5); ctx.lineTo(3.5, -13); ctx.lineTo(-3.5, -13); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.fillStyle = pal.trim; ctx.beginPath(); ctx.moveTo(-3.8, -13.2); ctx.lineTo(3.8, -13.2); ctx.lineTo(5.8, -8.8); ctx.lineTo(-5.8, -8.8); ctx.closePath(); ctx.fill(); }
-            else { ctx.beginPath(); ctx.roundRect(-4.8, -19.5, 9.6, 9.8, 2); ctx.fill(); ctx.stroke(); ctx.fillStyle = pal.trim; ctx.fillRect(-4.2, -16.2, 8.4, 1.8); }
-            ctx.fillStyle = pal.skin; ctx.beginPath(); ctx.arc(0, -23.5, 3.8, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = pal.hair;
-            if (hz.subType === 'girl') { ctx.beginPath(); ctx.ellipse(3.5 + swing * 0.9, -23.8, 3.0, 1.6, 0.35, 0, Math.PI * 2); ctx.fill(); ctx.beginPath(); ctx.arc(0, -24.6, 3.9, Math.PI * 0.95, Math.PI * 0.05, false); ctx.fill(); }
-            else { ctx.beginPath(); ctx.arc(0, -24.8, 4.0, Math.PI, 0, false); ctx.lineTo(3.2, -27.6); ctx.lineTo(0, -26.5); ctx.lineTo(-3.2, -27.6); ctx.closePath(); ctx.fill(); }
-            ctx.fillStyle = '#0f172a'; ctx.fillRect(-1.8, -23.8, 1.1, 1.3); ctx.fillRect(0.7, -23.8, 1.1, 1.3);
-        } else if (cid === 5) {
-            const runCycle = now * 0.020 + (hz.phase || 0), stride = Math.sin(runCycle), bounce = Math.abs(Math.cos(runCycle)) * 1.4; ctx.translate(0, -bounce);
-            const tailSway = Math.sin(runCycle * 1.6) * 4.2; ctx.strokeStyle = pal.coat; ctx.lineCap = 'round'; ctx.lineWidth = hz.subType === 'cat' ? 2.2 : 2.8; ctx.beginPath(); ctx.moveTo(0, -15.5); ctx.quadraticCurveTo(tailSway * 0.6, -20, tailSway, -23.2); ctx.stroke();
-            ctx.fillStyle = pal.dark; ctx.strokeStyle = pal.outline; ctx.lineWidth = 1.0; ctx.beginPath(); ctx.ellipse(0, -13.2, 6.8, 4.2, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-            const hl = stride < 0 ? -stride * 3.6 : 0, hr = stride > 0 ? stride * 3.6 : 0; ctx.strokeStyle = pal.dark; ctx.lineWidth = 2.6; ctx.beginPath(); ctx.moveTo(-6.2, -11.5); ctx.lineTo(-6.6, -3.2 - hl); ctx.moveTo(6.2, -11.5); ctx.lineTo(6.6, -3.2 - hr); ctx.stroke();
-            ctx.fillStyle = pal.coat; ctx.strokeStyle = pal.outline; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.ellipse(0, -9.8, 5.8, 4.6, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-            ctx.fillStyle = pal.belly; ctx.beginPath(); ctx.ellipse(0, -9.2, 3.4, 3.0, 0, 0, Math.PI * 2); ctx.fill();
-            const fl = stride > 0 ? stride * 3.8 : 0, fr = stride < 0 ? -stride * 3.8 : 0; ctx.strokeStyle = pal.coat; ctx.lineWidth = 2.7; ctx.beginPath(); ctx.moveTo(-3.1, -8.0); ctx.lineTo(-3.2, -1.0 - fl); ctx.moveTo(3.1, -8.0); ctx.lineTo(3.2, -1.0 - fr); ctx.stroke();
-            if (hz.subType === 'dog') {
-                ctx.strokeStyle = pal.collar; ctx.lineWidth = 2.1; ctx.beginPath(); ctx.moveTo(-4.4, -12.6); ctx.quadraticCurveTo(0, -11.0, 4.4, -12.6); ctx.stroke();
-                ctx.fillStyle = pal.dark; ctx.beginPath(); ctx.ellipse(-4.8, -16.8 + stride * 0.6, 2.0, 3.6, 0.32, 0, Math.PI * 2); ctx.ellipse(4.8, -16.8 - stride * 0.6, 2.0, 3.6, -0.32, 0, Math.PI * 2); ctx.fill();
-                ctx.fillStyle = pal.coat; ctx.strokeStyle = pal.outline; ctx.lineWidth = 1.1; ctx.beginPath(); ctx.arc(0, -16.5, 4.6, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-                ctx.fillStyle = pal.belly; ctx.beginPath(); ctx.ellipse(0, -14.8, 2.6, 2.0, 0, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#090d16'; ctx.beginPath(); ctx.arc(0, -15.4, 1.2, 0, Math.PI * 2); ctx.fill();
-                ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(-1.8, -17.5, 1.05, 0, Math.PI * 2); ctx.arc(1.8, -17.5, 1.05, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#090d16'; ctx.beginPath(); ctx.arc(-1.8, -17.5, 0.5, 0, Math.PI * 2); ctx.arc(1.8, -17.5, 0.5, 0, Math.PI * 2); ctx.fill();
-            } else {
-                ctx.fillStyle = pal.coat; ctx.strokeStyle = pal.outline; ctx.lineWidth = 1.1; ctx.beginPath(); ctx.moveTo(-4.4, -17.8); ctx.lineTo(-5.4, -22.6); ctx.lineTo(-1.4, -19.8); ctx.moveTo(4.4, -17.8); ctx.lineTo(5.4, -22.6); ctx.lineTo(1.4, -19.8); ctx.closePath(); ctx.fill(); ctx.stroke();
-                ctx.fillStyle = '#f472b6'; ctx.beginPath(); ctx.moveTo(-3.9, -18.2); ctx.lineTo(-4.6, -21.4); ctx.lineTo(-2.0, -19.5); ctx.moveTo(3.9, -18.2); ctx.lineTo(4.6, -21.4); ctx.lineTo(2.0, -19.5); ctx.closePath(); ctx.fill();
-                ctx.fillStyle = pal.coat; ctx.beginPath(); ctx.arc(0, -16.4, 4.3, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.fillStyle = pal.eye; ctx.beginPath(); ctx.ellipse(-1.8, -17.0, 1.15, 0.85, -0.18, 0, Math.PI * 2); ctx.ellipse(1.8, -17.0, 1.15, 0.85, 0.18, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#fb7185'; ctx.beginPath(); ctx.arc(0, -15.2, 0.85, 0, Math.PI * 2); ctx.fill();
-            }
-        } else if (cid === 6) {
-            ctx.fillStyle = '#334155'; ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(-12.5, -5); ctx.lineTo(-9, -9.8); ctx.lineTo(-2, -11); ctx.lineTo(6.5, -10.2); ctx.lineTo(12.5, -6); ctx.lineTo(10, -1.2); ctx.lineTo(1.5, -0.4); ctx.lineTo(-8.5, -1); ctx.closePath(); ctx.fill(); ctx.stroke();
-            ctx.fillStyle = '#020617'; ctx.beginPath(); ctx.ellipse(0, -5.2, 9.2, 3.4, 0, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#38bdf8'; ctx.beginPath(); ctx.ellipse(-1, -4.8, 5.5, 1.5, 0, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#f97316'; ctx.fillRect(-11.5, -11.5, 3.2, 2.2); ctx.fillRect(8.3, -11.5, 3.2, 2.2);
-        } else {
-            const isY = hz.variantIdx === 0; ctx.fillStyle = isY ? '#090d16' : '#334155'; ctx.strokeStyle = isY ? '#fde047' : '#cbd5e1'; ctx.lineWidth = 1.5;
-            ctx.beginPath(); ctx.moveTo(-15.5, -1.2); ctx.quadraticCurveTo(-14, -9.8, -11, -9.8); ctx.lineTo(11, -9.8); ctx.quadraticCurveTo(14, -9.8, 15.5, -1.2); ctx.closePath(); ctx.fill(); ctx.stroke();
-            ctx.fillStyle = isY ? '#facc15' : '#ffffff'; for (let c = -2; c <= 2; c++) { const sx = c * 5.2; ctx.beginPath(); ctx.moveTo(sx - 1.8, -1.8); ctx.lineTo(sx - 0.2, -9.0); ctx.lineTo(sx + 2.2, -9.0); ctx.lineTo(sx + 0.6, -1.8); ctx.closePath(); ctx.fill(); }
-            ctx.fillStyle = '#ef4444'; ctx.fillRect(-13.5, -4.5, 2.5, 1.8); ctx.fillRect(11, -4.5, 2.5, 1.8);
+        #atmosphereOverlay.atmo-filter-vintage {
+            background: radial-gradient(circle at center, rgba(217, 119, 6, 0.10) 40%, rgba(28, 16, 6, 0.80) 100%) !important;
+            box-shadow: inset 0 0 55px rgba(0, 0, 0, 0.75) !important;
         }
-        ctx.restore();
-    }
+        #atmosphereOverlay.atmo-filter-cinematic {
+            background: linear-gradient(180deg, rgba(2, 4, 10, 0.75) 0%, rgba(14, 165, 233, 0.10) 14%, rgba(0, 0, 0, 0) 50%, rgba(249, 115, 22, 0.14) 86%, rgba(2, 4, 10, 0.78) 100%), radial-gradient(circle at center, transparent 45%, rgba(2, 6, 18, 0.80) 100%) !important;
+            box-shadow: inset 0 0 45px rgba(0, 0, 0, 0.8) !important;
+        }
 
-    if (globalSettings.graphics.hudBoxes) {
-        ctx.strokeStyle = tierCol; ctx.lineWidth = hz.rFinal >= 0.65 ? 1.8 : 1.2; ctx.strokeRect(x1 - 2, y1 - 2, boxW + 4, boxH + 4);
-        if (hz.z < 34) { const label = `${hz.cls.name} ${hz.z.toFixed(1)}m | DGI ${hz.dgi}`, ew = label.length * 6.0 + 8; ctx.fillStyle = 'rgba(9,11,16,0.88)'; ctx.fillRect(bx - ew * 0.5, y1 - 17, ew, 13); ctx.fillStyle = tierCol; ctx.fillText(label, bx - ew * 0.5 + 4, y1 - 7); }
+        @keyframes godModePermPulse {
+            0%, 100% {
+                box-shadow: 0 0 16px rgba(0, 245, 212, 0.85), inset 0 0 12px rgba(0, 245, 212, 0.45);
+                border-color: #00f5d4;
+            }
+            50% {
+                box-shadow: 0 0 26px rgba(251, 191, 36, 0.95), inset 0 0 16px rgba(255, 0, 127, 0.45);
+                border-color: #fbbf24;
+            }
+        }
+        .god-mode-btn-active {
+            background: linear-gradient(135deg, rgba(6, 78, 59, 0.92) 0%, rgba(15, 23, 42, 0.95) 50%, rgba(88, 28, 135, 0.92) 100%) !important;
+            color: #ffffff !important;
+            border: 1.5px solid #00f5d4 !important;
+            text-shadow: 0 0 8px rgba(0, 245, 212, 0.9);
+            animation: godModePermPulse 1.4s ease-in-out infinite !important;
+        }
+
+        /* Stop Chrome compositor from fighting rotated scrollbars & remove nested scroll trap */
+        body.is-mobile #pauseSettingsModal,
+        body.is-mobile #leaderboardModal,
+        body.is-mobile #startModal,
+        body.is-mobile #gameOverModal,
+        body.is-mobile .overflow-y-auto,
+        body.is-mobile input[type="range"] {
+            touch-action: none !important;
+            overscroll-behavior: contain !important;
+        }
+        #biomeGridSelector {
+            max-height: none !important;
+            overflow: visible !important;
+        }
+        body.is-mobile #setTab_sounds .recessed-well > .grid.ost-grid-2col {
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+        }
+        body.is-mobile #setTab_sounds .recessed-well > .grid.ost-grid-3col {
+            grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+        }
+    `;
+}
+injectCustomFilterAndGodStyles();
+
+// Fix Weather & Stars slider so 0% (and 1% steps: 10, 9, 8... 0) never jumps back to 100%
+function updateGfxParticles(val,shouldSave=true){
+    const parsed=parseInt(val,10);
+    const num=Math.max(0,Math.min(150,Number.isNaN(parsed)?100:parsed));
+    gfxSettings.particles=num/100;
+    const lbl=document.getElementById('gfxParticleLabel');
+    if(lbl)lbl.innerText=`${num}%`;
+    const sld=document.getElementById('gfxParticleSlider');
+    if(sld){
+        if(sld.step!=='1')sld.step='1';
+        if(String(sld.value)!==String(num))sld.value=num;
     }
+    if(shouldSave)saveSettingsForActiveAccount();
 }
 
-function drawRoadsterVehicle(tCtx, carCenterX, rearY, halfW, carH, hoodLeadX, cust, isBoosting, isBraking, now, allowBloom, rollRad = 0) {
-    const skin = cust.nitroSkin || 'standard';
-    const chroma = getSkinChromaPalette(skin, cust, now);
-    const borderGlowCol = chroma.primaryGlow, secGlowCol = chroma.secondaryGlow, primary = cust.bodyPrimary || '#1e293b';
-    const boostCol = cust.boostColor || '#fbbf24';
-    const voidHue = (now * 0.16) % 360;
+// Unified Mobile Scrollbar & Range Slider Engine (Fixes 90deg Non-Fullscreen & Fullscreen Scrolling + Blocks Accidental Button Clicks on Swipe)
+(function bindMobileNonFullscreenSlidersAndScroll(){
+    if(window._mobRotSliderBound)return;
+    window._mobRotSliderBound=true;
 
-    const ringPulse = 1.0 + Math.sin(now * (isBoosting ? 0.018 : 0.007)) * (isBoosting ? 0.15 : 0.075);
-    const ringR = halfW * (isBoosting ? 1.64 : 1.38) * ringPulse;
-    const ringRY = Math.max(7.5, halfW * (isBoosting ? 0.28 : 0.235)) * ringPulse;
-    const ringPrimaryCol = chroma.isAllInOne ? chroma.empPrimary : boostCol;
-    const ringSecCol = chroma.isAllInOne ? secGlowCol : borderGlowCol;
+    let activeSlider=null;
+    let activeScroller=null;
+    let startX=0,startY=0,lastX=0,lastY=0;
+    let totalDragDist=0;
+    let isScrollDragging=false;
+    let suppressNextClickUntil=0;
+    let momentumRafId=0;
+    let scrollVelocity=0;
+    let lastMoveTs=0;
 
-    const ugR = Math.max(10, halfW * (isBoosting ? 1.68 : 1.40));
-    const ug = tCtx.createRadialGradient(carCenterX, rearY + 3, 3, carCenterX, rearY + 3, ugR);
-    ug.addColorStop(0, chroma.underglow);
-    ug.addColorStop(0.65, colorWithAlpha(isBoosting ? ringPrimaryCol : ringSecCol, isBoosting ? 0.28 : 0.15));
-    ug.addColorStop(1, 'transparent');
-    tCtx.fillStyle = ug;
-    tCtx.beginPath();
-    tCtx.ellipse(carCenterX, rearY + 3, ugR, Math.max(9, halfW * (isBoosting ? 0.29 : 0.24)), 0, 0, Math.PI * 2);
-    tCtx.fill();
+    const stopMomentum=()=>{
+        if(momentumRafId){
+            cancelAnimationFrame(momentumRafId);
+            momentumRafId=0;
+        }
+        scrollVelocity=0;
+    };
 
-    tCtx.save();
-    if (allowBloom) {
-        tCtx.shadowBlur = isBoosting ? (isMobileHardware ? 14 : 22) : (isMobileHardware ? 8 : 13);
-        tCtx.shadowColor = ringPrimaryCol;
-    }
-
-    tCtx.strokeStyle = ringPrimaryCol;
-    tCtx.globalAlpha = isBoosting ? 0.94 : 0.72;
-    tCtx.lineWidth = isBoosting ? 2.8 : 2.0;
-    tCtx.beginPath();
-    tCtx.ellipse(carCenterX, rearY + 3, ringR, ringRY, 0, 0, Math.PI * 2);
-    tCtx.stroke();
-
-    if (isBoosting) {
-        tCtx.strokeStyle = chroma.isAllInOne ? secGlowCol : '#ffffff';
-        tCtx.globalAlpha = 0.58;
-        tCtx.lineWidth = 1.6;
-        tCtx.beginPath();
-        tCtx.ellipse(carCenterX, rearY + 3, ringR * 1.15, ringRY * 1.15, 0, 0, Math.PI * 2);
-        tCtx.stroke();
-    }
-
-    const arcSpeed = isBoosting ? 0.015 : 0.0065;
-    const arcStart1 = now * arcSpeed;
-    const arcStart2 = -now * (arcSpeed * 0.85) + Math.PI;
-    tCtx.shadowBlur = 0;
-
-    tCtx.strokeStyle = chroma.isAllInOne ? secGlowCol : '#ffffff';
-    tCtx.globalAlpha = isBoosting ? 0.88 : 0.64;
-    tCtx.lineWidth = isBoosting ? 2.1 : 1.5;
-    tCtx.beginPath();
-    tCtx.ellipse(carCenterX, rearY + 3, ringR * 0.85, ringRY * 0.85, 0, arcStart1, arcStart1 + 2.05);
-    tCtx.stroke();
-
-    tCtx.strokeStyle = ringSecCol;
-    tCtx.globalAlpha = isBoosting ? 0.82 : 0.55;
-    tCtx.lineWidth = isBoosting ? 1.8 : 1.3;
-    tCtx.beginPath();
-    tCtx.ellipse(carCenterX, rearY + 3, ringR * 0.68, ringRY * 0.68, 0, arcStart2, arcStart2 + 2.25);
-    tCtx.stroke();
-
-    const nodeCount = isBoosting ? 4 : 2;
-    for (let n = 0; n < nodeCount; n++) {
-        const na = arcStart1 * 1.15 + (n / nodeCount) * Math.PI * 2;
-        const nx = carCenterX + Math.cos(na) * ringR;
-        const ny = (rearY + 3) + Math.sin(na) * ringRY;
-        tCtx.fillStyle = n % 2 === 0 ? '#ffffff' : ringPrimaryCol;
-        tCtx.globalAlpha = isBoosting ? 0.95 : 0.78;
-        tCtx.beginPath();
-        tCtx.arc(nx, ny, isBoosting ? 2.6 : 1.9, 0, Math.PI * 2);
-        tCtx.fill();
-    }
-    tCtx.restore();
-
-    tCtx.fillStyle = 'rgba(0,0,0,0.80)';
-    tCtx.beginPath();
-    tCtx.ellipse(carCenterX, rearY + 3, halfW * 0.98, 6, 0, 0, Math.PI * 2);
-    tCtx.fill();
-
-    const vibX = isBoosting ? (Math.sin(now * 0.135) * 2.45 + Math.cos(now * 0.188) * 1.55) : 0;
-    const vibY = isBoosting ? (Math.sin(now * 0.028) * 2.35 + Math.cos(now * 0.148) * 1.75) : 0;
-    const vibRoll = isBoosting ? (Math.sin(now * 0.095) * 0.022) : 0;
-
-    tCtx.save();
-    tCtx.translate(carCenterX + vibX, rearY + vibY);
-    tCtx.rotate((rollRad * 0.45) + vibRoll);
-    tCtx.translate(-carCenterX, -rearY);
-
-    const diffuserBotY = rearY, fasciaTopY = rearY - Math.round(carH * 0.34), shoulderY = rearY - Math.round(carH * 0.56), roofTopY = rearY - carH;
-    const shoulderHalfW = Math.round(halfW * 0.96), roofHalfW = Math.round(halfW * 0.56), hoodHalfW = Math.round(halfW * 0.44);
-
-    const tireW = Math.max(9, Math.round(halfW * 0.26)), tireH = Math.max(13, Math.round(carH * 0.36));
-    tCtx.fillStyle = '#04060a'; tCtx.strokeStyle = chroma.isAllInOne ? borderGlowCol : colorWithAlpha(borderGlowCol, 0.53); tCtx.lineWidth = 1.3;
-    tCtx.beginPath(); tCtx.roundRect(carCenterX - halfW - 2, diffuserBotY - tireH + 3, tireW, tireH, 3); tCtx.roundRect(carCenterX + halfW - tireW + 2, diffuserBotY - tireH + 3, tireW, tireH, 3); tCtx.fill(); tCtx.stroke();
-
-    if (allowBloom) { tCtx.shadowBlur = isMobileHardware ? 13 : (skin === 'void_chroma' ? 22 : 18); tCtx.shadowColor = borderGlowCol; }
-
-    const bodyGrad = tCtx.createLinearGradient(carCenterX - halfW * 0.5, roofTopY, carCenterX + halfW * 0.5, diffuserBotY);
-    if (chroma.isAllInOne) { bodyGrad.addColorStop(0, '#0a0f1c'); bodyGrad.addColorStop(0.32, chroma.bodyTint); bodyGrad.addColorStop(0.66, chroma.bodyMidTint); bodyGrad.addColorStop(1, '#070a12'); }
-    else { bodyGrad.addColorStop(0, primary); bodyGrad.addColorStop(0.45, chroma.bodyTint); bodyGrad.addColorStop(1, '#080c15'); }
-    tCtx.fillStyle = bodyGrad; tCtx.strokeStyle = borderGlowCol; tCtx.lineWidth = chroma.isAllInOne ? 2.4 : 2.25;
-    tCtx.beginPath();
-    tCtx.moveTo(carCenterX - halfW + 2, diffuserBotY - 3);
-    tCtx.quadraticCurveTo(carCenterX - halfW - 4, fasciaTopY + 4, carCenterX - shoulderHalfW, shoulderY);
-    tCtx.quadraticCurveTo(carCenterX + hoodLeadX * 0.5 - roofHalfW * 1.12, roofTopY + Math.round(carH * 0.18), carCenterX + hoodLeadX - hoodHalfW, roofTopY + 3);
-    tCtx.quadraticCurveTo(carCenterX + hoodLeadX, roofTopY - 3, carCenterX + hoodLeadX + hoodHalfW, roofTopY + 3);
-    tCtx.quadraticCurveTo(carCenterX + hoodLeadX * 0.5 + roofHalfW * 1.12, roofTopY + Math.round(carH * 0.18), carCenterX + shoulderHalfW, shoulderY);
-    tCtx.quadraticCurveTo(carCenterX + halfW + 4, fasciaTopY + 4, carCenterX + halfW - 2, diffuserBotY - 3);
-    tCtx.closePath(); tCtx.fill(); tCtx.stroke(); tCtx.shadowBlur = 0;
-
-    if (skin === 'void_chroma') {
-        tCtx.save(); tCtx.strokeStyle = `hsla(${(voidHue + 180) % 360},100%,70%,0.55)`; tCtx.lineWidth = 1.4;
-        tCtx.beginPath(); tCtx.ellipse(carCenterX, shoulderY + 4, halfW * 1.06, carH * 0.40, Math.sin(now * 0.0025) * 0.08, 0, Math.PI * 2); tCtx.stroke(); tCtx.restore();
-    } else if (skin === 'aether_helix') {
-        tCtx.strokeStyle = secGlowCol; tCtx.lineWidth = 1.35;
-        tCtx.beginPath(); tCtx.moveTo(carCenterX - shoulderHalfW * 0.88, shoulderY + 1); tCtx.lineTo(carCenterX + hoodLeadX * 0.5 - roofHalfW * 0.72, roofTopY + 10); tCtx.moveTo(carCenterX + shoulderHalfW * 0.88, shoulderY + 1); tCtx.lineTo(carCenterX + hoodLeadX * 0.5 + roofHalfW * 0.72, roofTopY + 10); tCtx.stroke();
-    } else if (skin === 'solar_crown') {
-        tCtx.strokeStyle = '#fef08a'; tCtx.lineWidth = 1.35;
-        tCtx.beginPath(); tCtx.moveTo(carCenterX - halfW * 0.74, fasciaTopY - 2); tCtx.lineTo(carCenterX, shoulderY - 3); tCtx.lineTo(carCenterX + halfW * 0.74, fasciaTopY - 2); tCtx.stroke();
-    } else if (skin === 'chrono_arc') {
-        tCtx.strokeStyle = secGlowCol; tCtx.lineWidth = 1.3; const px = Math.sin(now * 0.007) * 3;
-        tCtx.beginPath(); tCtx.moveTo(carCenterX - shoulderHalfW * 0.72, shoulderY + 2); tCtx.lineTo(carCenterX - halfW * 0.35 + px, fasciaTopY - 1); tCtx.moveTo(carCenterX + shoulderHalfW * 0.72, shoulderY + 2); tCtx.lineTo(carCenterX + halfW * 0.35 - px, fasciaTopY - 1); tCtx.stroke();
-    } else {
-        const sheenA = 0.24 + Math.abs(Math.sin(now * 0.003)) * 0.32;
-        tCtx.save(); tCtx.globalAlpha = sheenA; tCtx.strokeStyle = secGlowCol; tCtx.lineWidth = 1.2;
-        tCtx.beginPath(); tCtx.moveTo(carCenterX - shoulderHalfW * 0.78, shoulderY + 2); tCtx.lineTo(carCenterX + hoodLeadX * 0.35, roofTopY + carH * 0.26); tCtx.lineTo(carCenterX + shoulderHalfW * 0.78, shoulderY + 2); tCtx.stroke(); tCtx.restore();
-    }
-
-    tCtx.fillStyle = primary; tCtx.strokeStyle = borderGlowCol; tCtx.lineWidth = 1.25;
-    const mirrorY = shoulderY - Math.round(carH * 0.16), mCX = carCenterX + Math.round(hoodLeadX * 0.45);
-    tCtx.beginPath();
-    tCtx.moveTo(mCX - roofHalfW * 1.10, mirrorY); tCtx.lineTo(mCX - roofHalfW * 1.28, mirrorY - 2); tCtx.lineTo(mCX - roofHalfW * 1.18, mirrorY + 3); tCtx.closePath();
-    tCtx.moveTo(mCX + roofHalfW * 1.10, mirrorY); tCtx.lineTo(mCX + roofHalfW * 1.28, mirrorY - 2); tCtx.lineTo(mCX + roofHalfW * 1.18, mirrorY + 3); tCtx.closePath();
-    tCtx.fill(); tCtx.stroke();
-
-    const glassGrad = tCtx.createLinearGradient(carCenterX, roofTopY + 2, carCenterX, shoulderY + 4);
-    glassGrad.addColorStop(0, chroma.canopyTop); glassGrad.addColorStop(0.55, chroma.canopyMid); glassGrad.addColorStop(1, '#060911');
-    tCtx.fillStyle = glassGrad; tCtx.strokeStyle = chroma.isAllInOne ? secGlowCol : colorWithAlpha(borderGlowCol, 0.67); tCtx.lineWidth = 1.35;
-    tCtx.beginPath();
-    tCtx.moveTo(carCenterX + hoodLeadX - hoodHalfW * 0.82, roofTopY + 4); tCtx.quadraticCurveTo(carCenterX + hoodLeadX, roofTopY + 1, carCenterX + hoodLeadX + hoodHalfW * 0.82, roofTopY + 4);
-    tCtx.lineTo(carCenterX + roofHalfW * 0.76, shoulderY + 2); tCtx.quadraticCurveTo(carCenterX, shoulderY + 5, carCenterX - roofHalfW * 0.76, shoulderY + 2); tCtx.closePath(); tCtx.fill(); tCtx.stroke();
-
-    tCtx.strokeStyle = 'rgba(255,255,255,0.36)'; tCtx.lineWidth = 1.1;
-    tCtx.beginPath(); tCtx.moveTo(carCenterX + hoodLeadX * 0.55 - roofHalfW * 0.68, roofTopY + Math.round(carH * 0.18)); tCtx.quadraticCurveTo(carCenterX + hoodLeadX * 0.55, roofTopY + Math.round(carH * 0.15), carCenterX + hoodLeadX * 0.55 + roofHalfW * 0.68, roofTopY + Math.round(carH * 0.18)); tCtx.stroke();
-
-    tCtx.strokeStyle = chroma.isAllInOne ? borderGlowCol : colorWithAlpha(borderGlowCol, 0.73); tCtx.lineWidth = 1.3;
-    tCtx.beginPath(); tCtx.moveTo(carCenterX - shoulderHalfW + 2, shoulderY); tCtx.quadraticCurveTo(carCenterX - halfW * 0.68, fasciaTopY - 4, carCenterX - halfW * 0.42, fasciaTopY); tCtx.moveTo(carCenterX + shoulderHalfW - 2, shoulderY); tCtx.quadraticCurveTo(carCenterX + halfW * 0.68, fasciaTopY - 4, carCenterX + halfW * 0.42, fasciaTopY); tCtx.stroke();
-
-    const wingLift = isBraking ? 6 : (isBoosting ? 4.5 : 0.8), wingY = fasciaTopY - 2 - wingLift, wingW = Math.round(shoulderHalfW * 0.94);
-    tCtx.fillStyle = '#070b14'; tCtx.strokeStyle = borderGlowCol; tCtx.lineWidth = 1.6;
-    tCtx.beginPath(); tCtx.moveTo(carCenterX - wingW, wingY + 2); tCtx.quadraticCurveTo(carCenterX, wingY - 2, carCenterX + wingW, wingY + 2); tCtx.lineTo(carCenterX + wingW - 3, wingY + 5); tCtx.quadraticCurveTo(carCenterX, wingY + 2, carCenterX - wingW + 3, wingY + 5); tCtx.closePath(); tCtx.fill(); tCtx.stroke();
-
-    const fasciaW = Math.round(halfW * 0.90), fasciaH = Math.max(10, diffuserBotY - fasciaTopY - 3);
-    tCtx.fillStyle = '#05070e'; tCtx.strokeStyle = chroma.isAllInOne ? secGlowCol : '#1e293b'; tCtx.lineWidth = 1.25;
-    tCtx.beginPath(); tCtx.roundRect(carCenterX - fasciaW, fasciaTopY, fasciaW * 2, fasciaH, 4); tCtx.fill(); tCtx.stroke();
-
-    const tailCol = isBraking ? '#ff1e42' : chroma.tailColor;
-    if (allowBloom) { tCtx.shadowBlur = isBraking ? 20 : 12; tCtx.shadowColor = tailCol; }
-    tCtx.fillStyle = tailCol;
-    const bladeW = Math.round(fasciaW * 0.42), bladeY = fasciaTopY + 2;
-    tCtx.beginPath(); tCtx.roundRect(carCenterX - fasciaW + 3, bladeY, bladeW, 3.5, 2); tCtx.roundRect(carCenterX + fasciaW - bladeW - 3, bladeY, bladeW, 3.5, 2); tCtx.roundRect(carCenterX - 4, bladeY + 0.5, 8, 2.5, 1); tCtx.fill(); tCtx.shadowBlur = 0;
-
-    const diffY = diffuserBotY - 8;
-    tCtx.strokeStyle = chroma.isAllInOne ? borderGlowCol : colorWithAlpha(borderGlowCol, 0.53); tCtx.lineWidth = 1.25;
-    tCtx.beginPath(); [-0.55, -0.25, 0.25, 0.55].forEach(r => { const sx = carCenterX + Math.round(fasciaW * r); tCtx.moveTo(sx, diffY); tCtx.lineTo(sx, diffuserBotY - 2); }); tCtx.stroke();
-
-    const leftNozX = Math.round(carCenterX - fasciaW * 0.36), rightNozX = Math.round(carCenterX + fasciaW * 0.36);
-    tCtx.fillStyle = '#090d16'; tCtx.strokeStyle = isBoosting ? (chroma.isAllInOne ? borderGlowCol : boostCol) : borderGlowCol; tCtx.lineWidth = 1.45;
-    tCtx.beginPath(); tCtx.roundRect(leftNozX - 6, diffY + 1, 12, 4.5, 2); tCtx.roundRect(rightNozX - 6, diffY + 1, 12, 4.5, 2); tCtx.roundRect(carCenterX - 8, diffY + 1, 16, 5, 2); tCtx.fill(); tCtx.stroke();
-
-    if (!isBoosting) {
-        const idlePulse = 0.65 + Math.sin(now * 0.03) * 0.25;
-        tCtx.save();
-        tCtx.globalAlpha = idlePulse;
-        tCtx.fillStyle = ringPrimaryCol;
-        tCtx.beginPath();
-        tCtx.ellipse(leftNozX, diffY + 3.5, 3.5, 1.4, 0, 0, Math.PI * 2);
-        tCtx.ellipse(rightNozX, diffY + 3.5, 3.5, 1.4, 0, 0, Math.PI * 2);
-        tCtx.ellipse(carCenterX, diffY + 3.6, 5.0, 1.6, 0, 0, Math.PI * 2);
-        tCtx.fill();
-        tCtx.restore();
-    } else {
-        const pulse = Math.sin(now * 0.042);
-        const flameLen = 19 + pulse * 4.2 + Math.random() * 6.5;
-
-        if (skin === 'void_chroma') {
-            const c1 = `hsl(${voidHue},100%,60%)`, c2 = `hsl(${(voidHue + 95) % 360},100%,64%)`, c3 = `hsl(${(voidHue + 205) % 360},100%,66%)`, c4 = `hsl(${(voidHue + 300) % 360},100%,72%)`;
-            for (let r = 0; r < 3; r++) {
-                const prog = (now * 0.0048 + r * 0.333) % 1;
-                const ry = diffuserBotY + 3 + prog * flameLen * 1.65, rx = (9 + prog * 16) * (1 - prog * 0.25);
-                tCtx.save(); tCtx.globalAlpha = (1 - prog) * 0.85; tCtx.strokeStyle = `hsl(${(voidHue + r * 110) % 360},100%,66%)`; tCtx.lineWidth = 2.2 - prog * 1.1;
-                tCtx.beginPath(); tCtx.ellipse(carCenterX, ry, rx, rx * 0.26, 0, 0, Math.PI * 2); tCtx.stroke(); tCtx.restore();
+    const findScrollableTarget=(el)=>{
+        let cur=el;
+        let fallback=null;
+        while(cur&&cur!==document.body&&cur!==document.documentElement){
+            if(cur.classList&&cur.classList.contains('overflow-y-auto')){
+                if(!fallback)fallback=cur;
+                if(cur.scrollHeight>cur.clientHeight+1)return cur;
             }
-            if (allowBloom) { tCtx.shadowBlur = 24; tCtx.shadowColor = c1; }
-            for (let side = -1; side <= 1; side += 2) {
-                const nx = side < 0 ? leftNozX : rightNozX, gOut = tCtx.createLinearGradient(nx, diffuserBotY - 2, nx, diffuserBotY + flameLen * 1.38);
-                gOut.addColorStop(0, '#ffffff'); gOut.addColorStop(0.28, side < 0 ? c1 : c3); gOut.addColorStop(0.70, c2); gOut.addColorStop(1, 'transparent');
-                tCtx.fillStyle = gOut; const sway = Math.sin(now * 0.032 + side) * 3.0;
-                tCtx.beginPath(); tCtx.moveTo(nx - 6, diffuserBotY - 2); tCtx.quadraticCurveTo(nx - 2 + sway, diffuserBotY + flameLen * 0.65, nx + sway * 1.4, diffuserBotY + flameLen * 1.35); tCtx.quadraticCurveTo(nx + 4 + sway, diffuserBotY + flameLen * 0.65, nx + 6, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
+            cur=cur.parentElement;
+        }
+        return fallback;
+    };
+
+    const applyScrollDelta=(scroller,delta)=>{
+        if(!scroller||!delta)return;
+        const prev=scroller.scrollTop;
+        const maxScroll=Math.max(0,scroller.scrollHeight-scroller.clientHeight);
+        if(maxScroll>0){
+            scroller.scrollTop=Math.max(0,Math.min(maxScroll,prev+delta));
+        }
+        const consumed=scroller.scrollTop-prev;
+        const remainder=delta-consumed;
+        if(Math.abs(remainder)>0.5&&scroller.parentElement){
+            const parentScroller=findScrollableTarget(scroller.parentElement);
+            if(parentScroller&&parentScroller!==scroller){
+                parentScroller.scrollTop+=remainder;
             }
-            const gMid = tCtx.createLinearGradient(carCenterX, diffuserBotY - 2, carCenterX, diffuserBotY + flameLen * 1.85);
-            gMid.addColorStop(0, '#ffffff'); gMid.addColorStop(0.20, c4); gMid.addColorStop(0.55, c1); gMid.addColorStop(0.85, c3); gMid.addColorStop(1, 'transparent');
-            tCtx.fillStyle = gMid;
-            tCtx.beginPath(); tCtx.moveTo(carCenterX - 11, diffuserBotY - 2); tCtx.quadraticCurveTo(carCenterX - 12.5, diffuserBotY + flameLen * 0.55, carCenterX, diffuserBotY + flameLen * 1.85); tCtx.quadraticCurveTo(carCenterX + 12.5, diffuserBotY + flameLen * 0.55, carCenterX + 11, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            tCtx.fillStyle = '#ffffff'; tCtx.beginPath(); tCtx.moveTo(carCenterX - 5, diffuserBotY - 2); tCtx.lineTo(carCenterX, diffuserBotY + flameLen * 1.22); tCtx.lineTo(carCenterX + 5, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            for (let d = 0; d < 4; d++) {
-                const dy = diffuserBotY + 4 + d * (flameLen * 0.34), dw = 7.2 - d * 1.35;
-                tCtx.fillStyle = d === 0 ? '#ffffff' : `hsl(${(voidHue + d * 80) % 360},100%,74%)`;
-                tCtx.beginPath(); tCtx.moveTo(carCenterX, dy - 3.2); tCtx.lineTo(carCenterX + dw, dy); tCtx.lineTo(carCenterX, dy + 4.5); tCtx.lineTo(carCenterX - dw, dy); tCtx.closePath(); tCtx.fill();
+        }
+    };
+
+    const setSliderFromPoint=(clientX,clientY,sld)=>{
+        const rect=sld.getBoundingClientRect();
+        if(!rect.width&&!rect.height)return;
+        const isRotated=isMobileHardware&&(window.innerHeight>window.innerWidth);
+        const ratio=isRotated
+            ?((clientY-rect.top)/Math.max(1,rect.height))
+            :((clientX-rect.left)/Math.max(1,rect.width));
+        const clamped=Math.max(0,Math.min(1,ratio));
+        const min=parseFloat(sld.min)||0;
+        const max=parseFloat(sld.max)||100;
+        const step=parseFloat(sld.step)||1;
+        let val=min+clamped*(max-min);
+        val=Math.round((val-min)/step)*step+min;
+        val=Math.max(min,Math.min(max,val));
+        if(String(sld.value)!==String(val)){
+            sld.value=val;
+            sld.dispatchEvent(new Event('input',{bubbles:true}));
+            sld.dispatchEvent(new Event('change',{bubbles:true}));
+        }
+    };
+
+    // Suppress accidental button clicks when lifting finger after scrolling
+    ['click','pointerup','mouseup'].forEach(evt=>{
+        document.addEventListener(evt,(e)=>{
+            if(performance.now()<suppressNextClickUntil){
+                e.preventDefault();
+                e.stopPropagation();
+                if(typeof e.stopImmediatePropagation==='function')e.stopImmediatePropagation();
             }
-            tCtx.save(); tCtx.translate(carCenterX, diffuserBotY + 3);
-            tCtx.fillStyle = '#03000a'; tCtx.beginPath(); tCtx.ellipse(0, 0, 6.8, 3.0, 0, 0, Math.PI * 2); tCtx.fill();
-            for (let arc = 0; arc < 2; arc++) { const a0 = now * 0.014 + arc * Math.PI; tCtx.strokeStyle = arc === 0 ? c1 : c2; tCtx.lineWidth = 2.0; tCtx.beginPath(); tCtx.ellipse(0, 0, 10, 4.1, 0, a0, a0 + 2.1); tCtx.stroke(); }
-            tCtx.restore();
-            tCtx.strokeStyle = '#ffffff'; tCtx.lineWidth = 1.35;
-            for (let w = -1; w <= 1; w += 2) {
-                tCtx.beginPath(); tCtx.moveTo(carCenterX + w * 9, diffuserBotY);
-                tCtx.lineTo(carCenterX + w * 13 + Math.sin(now * 0.055 + w * 3) * 6, diffuserBotY + flameLen * 0.48);
-                tCtx.lineTo(carCenterX + w * 5 + Math.cos(now * 0.048 + w * 5) * 7, diffuserBotY + flameLen * 1.08); tCtx.stroke();
+        },true);
+    });
+
+    document.addEventListener('touchstart',(e)=>{
+        if(!isMobileHardware||!e.touches||!e.touches[0])return;
+        stopMomentum();
+        const t=e.touches[0];
+        startX=lastX=t.clientX;
+        startY=lastY=t.clientY;
+        totalDragDist=0;
+        isScrollDragging=false;
+        lastMoveTs=performance.now();
+
+        const sld=e.target&&e.target.closest?e.target.closest('input[type="range"]'):null;
+        if(sld){
+            activeSlider=sld;
+            activeScroller=null;
+            if(e.cancelable)e.preventDefault();
+            setSliderFromPoint(t.clientX,t.clientY,sld);
+            return;
+        }
+        activeSlider=null;
+        activeScroller=e.target&&e.target.closest?findScrollableTarget(e.target):null;
+    },{capture:true,passive:false});
+
+    document.addEventListener('touchmove',(e)=>{
+        if(!isMobileHardware||!e.touches||!e.touches[0])return;
+        const t=e.touches[0];
+        const now=performance.now();
+        const dt=Math.max(4,now-lastMoveTs);
+        lastMoveTs=now;
+
+        if(activeSlider){
+            if(e.cancelable)e.preventDefault();
+            e.stopPropagation();
+            setSliderFromPoint(t.clientX,t.clientY,activeSlider);
+            return;
+        }
+
+        if(activeScroller){
+            const isRotated=(window.innerHeight>window.innerWidth);
+            const rawDx=t.clientX-lastX;
+            const rawDy=t.clientY-lastY;
+            lastX=t.clientX;
+            lastY=t.clientY;
+
+            // In rotate(90deg) portrait mode, visual vertical scroll axis is physical clientX; in normal landscape it is -clientY
+            const scrollDelta=isRotated?rawDx:(-rawDy);
+            totalDragDist+=Math.hypot(rawDx,rawDy);
+
+            if(totalDragDist>6){
+                isScrollDragging=true;
             }
-            for (let sp = 0; sp < 6; sp++) {
-                const p = (now * 0.0052 + sp * 0.166) % 1, sx = carCenterX + Math.sin(sp * 2.4 + now * 0.01) * (5 + p * 15), sy = diffuserBotY + 3 + p * flameLen * 1.7;
-                tCtx.fillStyle = `hsl(${(voidHue + sp * 60) % 360},100%,76%)`; tCtx.fillRect(sx - 1.5, sy - 1.5, 3 * (1 - p * 0.5), 5 * (1 - p * 0.4));
+            if(isScrollDragging){
+                if(e.cancelable)e.preventDefault();
+                e.stopPropagation();
+                applyScrollDelta(activeScroller,scrollDelta);
+                const instVel=scrollDelta/dt;
+                scrollVelocity=scrollVelocity*0.45+instVel*0.55;
             }
-            tCtx.shadowBlur = 0;
-        } else if (skin === 'aether_helix') {
-            if (allowBloom) { tCtx.shadowBlur = 20; tCtx.shadowColor = borderGlowCol; }
-            for (const nx of [leftNozX, rightNozX]) {
-                for (let strand = 0; strand < 2; strand++) {
-                    tCtx.strokeStyle = strand === 0 ? borderGlowCol : secGlowCol; tCtx.lineWidth = 2.3; tCtx.beginPath();
-                    for (let t = 0; t <= 1; t += 0.14) { const y = diffuserBotY - 1 + t * flameLen * 1.42, x = nx + Math.sin(now * 0.030 + t * 9.5 + strand * Math.PI) * (5.0 * (1 - t * 0.42)); if (t === 0) tCtx.moveTo(x, y); else tCtx.lineTo(x, y); }
-                    tCtx.stroke();
+        }
+    },{capture:true,passive:false});
+
+    const endTouchInteraction=()=>{
+        if(activeSlider){
+            activeSlider=null;
+            return;
+        }
+        if(isScrollDragging&&activeScroller){
+            suppressNextClickUntil=performance.now()+340;
+            const targetScroller=activeScroller;
+            let vel=scrollVelocity*16;
+            const stepMomentum=()=>{
+                if(Math.abs(vel)<0.6){
+                    momentumRafId=0;
+                    return;
                 }
+                applyScrollDelta(targetScroller,vel);
+                vel*=0.91;
+                momentumRafId=requestAnimationFrame(stepMomentum);
+            };
+            if(Math.abs(vel)>1.2){
+                momentumRafId=requestAnimationFrame(stepMomentum);
             }
-            const gA = tCtx.createLinearGradient(carCenterX, diffuserBotY - 2, carCenterX, diffuserBotY + flameLen * 1.55);
-            gA.addColorStop(0, '#ffffff'); gA.addColorStop(0.35, borderGlowCol); gA.addColorStop(0.75, secGlowCol); gA.addColorStop(1, 'transparent');
-            tCtx.fillStyle = gA; tCtx.beginPath(); tCtx.moveTo(carCenterX - 7.5, diffuserBotY - 2); tCtx.lineTo(carCenterX, diffuserBotY + flameLen * 1.58); tCtx.lineTo(carCenterX + 7.5, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            tCtx.fillStyle = '#ffffff'; tCtx.beginPath(); tCtx.moveTo(carCenterX - 3.4, diffuserBotY - 2); tCtx.lineTo(carCenterX, diffuserBotY + flameLen * 1.05); tCtx.lineTo(carCenterX + 3.4, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            for (let c = 0; c < 5; c++) { const p = (now * 0.0046 + c * 0.2) % 1, cxp = carCenterX + Math.cos(c * 2.1 + now * 0.012) * (9 + p * 8), cyp = diffuserBotY + 3 + p * flameLen * 1.45, sz = 3.0 * (1 - p * 0.5); tCtx.fillStyle = c % 2 === 0 ? '#e0f2fe' : secGlowCol; tCtx.beginPath(); tCtx.moveTo(cxp, cyp - sz); tCtx.lineTo(cxp + sz, cyp); tCtx.lineTo(cxp, cyp + sz); tCtx.lineTo(cxp - sz, cyp); tCtx.closePath(); tCtx.fill(); }
-            tCtx.shadowBlur = 0;
-        } else if (skin === 'solar_crown') {
-            if (allowBloom) { tCtx.shadowBlur = 20; tCtx.shadowColor = borderGlowCol; }
-            for (let side = -1; side <= 1; side += 2) {
-                tCtx.strokeStyle = borderGlowCol; tCtx.lineWidth = 2.3; tCtx.beginPath(); tCtx.moveTo(carCenterX + side * 6, diffuserBotY); tCtx.quadraticCurveTo(carCenterX + side * (fasciaW * 0.72), diffuserBotY + flameLen * 0.45, carCenterX + side * (fasciaW * 0.46), diffuserBotY + flameLen * 1.18); tCtx.stroke();
-                const nx = side < 0 ? leftNozX : rightNozX, gS = tCtx.createLinearGradient(nx, diffuserBotY - 2, nx, diffuserBotY + flameLen * 1.25);
-                gS.addColorStop(0, '#fef9c3'); gS.addColorStop(0.4, borderGlowCol); gS.addColorStop(1, 'transparent');
-                tCtx.fillStyle = gS; tCtx.beginPath(); tCtx.moveTo(nx - 5.5, diffuserBotY - 2); tCtx.lineTo(nx, diffuserBotY + flameLen * 1.25); tCtx.lineTo(nx + 5.5, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            }
-            const gC = tCtx.createLinearGradient(carCenterX, diffuserBotY - 2, carCenterX, diffuserBotY + flameLen * 1.62);
-            gC.addColorStop(0, '#ffffff'); gC.addColorStop(0.35, borderGlowCol); gC.addColorStop(0.75, secGlowCol); gC.addColorStop(1, 'transparent');
-            tCtx.fillStyle = gC; tCtx.beginPath(); tCtx.moveTo(carCenterX - 8.5, diffuserBotY - 2); tCtx.lineTo(carCenterX, diffuserBotY + flameLen * 1.62); tCtx.lineTo(carCenterX + 8.5, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            for (let d = 0; d < 4; d++) { const dy = diffuserBotY + 3 + d * (flameLen * 0.34), dw = 7.2 - d * 1.45; tCtx.fillStyle = d === 0 ? '#ffffff' : (d === 1 ? '#fef08a' : (d === 2 ? borderGlowCol : secGlowCol)); tCtx.beginPath(); tCtx.moveTo(carCenterX, dy - 3.3); tCtx.lineTo(carCenterX + dw, dy); tCtx.lineTo(carCenterX, dy + 4.3); tCtx.lineTo(carCenterX - dw, dy); tCtx.closePath(); tCtx.fill(); }
-            for (let e = 0; e < 5; e++) { const p = (now * 0.005 + e * 0.2) % 1; tCtx.fillStyle = e % 2 === 0 ? '#fef08a' : '#f97316'; tCtx.beginPath(); tCtx.arc(carCenterX + Math.sin(e * 3.1 + now * 0.015) * (13 * p + 4), diffuserBotY + 3 + p * flameLen * 1.5, 2.0 * (1 - p * 0.5), 0, Math.PI * 2); tCtx.fill(); }
-            tCtx.shadowBlur = 0;
-        } else if (skin === 'chrono_arc') {
-            if (allowBloom) { tCtx.shadowBlur = 20; tCtx.shadowColor = borderGlowCol; }
-            const gCh = tCtx.createLinearGradient(carCenterX, diffuserBotY - 2, carCenterX, diffuserBotY + flameLen * 1.55);
-            gCh.addColorStop(0, '#ecfdf5'); gCh.addColorStop(0.32, borderGlowCol); gCh.addColorStop(0.72, secGlowCol); gCh.addColorStop(1, 'transparent');
-            tCtx.fillStyle = gCh; tCtx.beginPath(); tCtx.moveTo(carCenterX - 7.5, diffuserBotY - 2); tCtx.lineTo(carCenterX, diffuserBotY + flameLen * 1.55); tCtx.lineTo(carCenterX + 7.5, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            for (const nx of [leftNozX, rightNozX]) { tCtx.fillStyle = secGlowCol; tCtx.beginPath(); tCtx.moveTo(nx - 4.2, diffuserBotY - 2); tCtx.lineTo(nx, diffuserBotY + flameLen * 1.05); tCtx.lineTo(nx + 4.2, diffuserBotY - 2); tCtx.closePath(); tCtx.fill(); }
-            for (let r = 0; r < 4; r++) {
-                const prog = (now * 0.0052 + r * 0.25) % 1, ry = diffuserBotY + 3 + prog * flameLen * 1.48, rx = 11 * (1 - prog * 0.38);
-                tCtx.save(); tCtx.globalAlpha = 1 - prog * 0.78; tCtx.strokeStyle = r % 2 === 0 ? '#a7f3d0' : borderGlowCol; tCtx.lineWidth = 1.8;
-                tCtx.beginPath(); tCtx.ellipse(carCenterX, ry, rx, 2.7, 0, 0, Math.PI * 2); tCtx.stroke();
-                const tickA = now * 0.012 + r * 1.4; tCtx.fillStyle = '#ffffff'; tCtx.beginPath(); tCtx.arc(carCenterX + Math.cos(tickA) * rx, ry + Math.sin(tickA) * 2.7, 1.7, 0, Math.PI * 2); tCtx.fill(); tCtx.restore();
-            }
-            tCtx.strokeStyle = '#d1fae5'; tCtx.lineWidth = 1.4;
-            tCtx.beginPath(); tCtx.moveTo(leftNozX, diffuserBotY + 4); tCtx.lineTo((leftNozX + carCenterX) * 0.5, diffuserBotY + 8 + Math.sin(now * 0.06) * 4); tCtx.lineTo(carCenterX, diffuserBotY + 6); tCtx.lineTo((rightNozX + carCenterX) * 0.5, diffuserBotY + 8 + Math.cos(now * 0.06) * 4); tCtx.lineTo(rightNozX, diffuserBotY + 4); tCtx.stroke();
-            tCtx.shadowBlur = 0;
-        } else {
-            if (allowBloom) { tCtx.shadowBlur = 20; tCtx.shadowColor = boostCol; }
-            for (const nx of [leftNozX, rightNozX]) {
-                const gSide = tCtx.createLinearGradient(nx, diffuserBotY - 2, nx, diffuserBotY + flameLen * 1.18);
-                gSide.addColorStop(0, '#ffffff'); gSide.addColorStop(0.30, boostCol); gSide.addColorStop(0.78, borderGlowCol); gSide.addColorStop(1, 'transparent');
-                tCtx.fillStyle = gSide;
-                tCtx.beginPath(); tCtx.moveTo(nx - 5.5, diffuserBotY - 2); tCtx.quadraticCurveTo(nx - 4, diffuserBotY + flameLen * 0.5, nx, diffuserBotY + flameLen * 1.18); tCtx.quadraticCurveTo(nx + 4, diffuserBotY + flameLen * 0.5, nx + 5.5, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            }
-            const gBase = tCtx.createLinearGradient(carCenterX, diffuserBotY - 2, carCenterX, diffuserBotY + flameLen * 1.52);
-            gBase.addColorStop(0, '#ffffff'); gBase.addColorStop(0.28, boostCol); gBase.addColorStop(0.72, borderGlowCol); gBase.addColorStop(1, 'transparent');
-            tCtx.fillStyle = gBase;
-            tCtx.beginPath(); tCtx.moveTo(carCenterX - 8.5, diffuserBotY - 2); tCtx.quadraticCurveTo(carCenterX - 9, diffuserBotY + flameLen * 0.5, carCenterX, diffuserBotY + flameLen * 1.52); tCtx.quadraticCurveTo(carCenterX + 9, diffuserBotY + flameLen * 0.5, carCenterX + 8.5, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            tCtx.fillStyle = '#f0f9ff';
-            tCtx.beginPath(); tCtx.moveTo(carCenterX - 4.2, diffuserBotY - 2); tCtx.lineTo(carCenterX, diffuserBotY + flameLen * 1.02); tCtx.lineTo(carCenterX + 4.2, diffuserBotY - 2); tCtx.closePath(); tCtx.fill();
-            for (let r = 0; r < 3; r++) {
-                const prog = (now * 0.005 + r * 0.333) % 1, ry = diffuserBotY + 3 + prog * flameLen * 1.38, rx = 9.5 * (1 - prog * 0.38);
-                tCtx.save(); tCtx.globalAlpha = (1 - prog) * 0.78; tCtx.strokeStyle = r === 0 ? '#ffffff' : boostCol; tCtx.lineWidth = 1.6;
-                tCtx.beginPath(); tCtx.ellipse(carCenterX, ry, rx, 2.3, 0, 0, Math.PI * 2); tCtx.stroke(); tCtx.restore();
-            }
-            for (let sp = 0; sp < 5; sp++) {
-                const p = (now * 0.0052 + sp * 0.2) % 1, sx = carCenterX + Math.sin(sp * 2.9 + now * 0.012) * (6 + p * 12), sy = diffuserBotY + 3 + p * flameLen * 1.48;
-                tCtx.fillStyle = sp % 2 === 0 ? '#ffffff' : boostCol; tCtx.fillRect(sx - 1.2, sy - 1.2, 2.4 * (1 - p * 0.4), 4.2 * (1 - p * 0.4));
-            }
-            tCtx.shadowBlur = 0;
         }
-    }
+        activeScroller=null;
+        isScrollDragging=false;
+    };
 
-    tCtx.restore();
-}
+    document.addEventListener('touchend',endTouchInteraction,{capture:true,passive:true});
+    document.addEventListener('touchcancel',()=>{
+        stopMomentum();
+        activeSlider=null;
+        activeScroller=null;
+        isScrollDragging=false;
+    },{capture:true,passive:true});
+})();
 
-let lastRenderNow = performance.now();
-function renderSceneFrame(now) {
-    const dtRender = Math.min(0.05, Math.max(0.001, (now - lastRenderNow) / 1000));
-    lastRenderNow = now;
+// Anti-Misclick Shield between Start Splash and Main Menu (Mobile & PC)
+let mainMenuSplashGuardUntil=0;
+let splashGuardBound=false;
 
-    const W = gameState.viewW, H = gameState.viewH, theme = BIOME_THEMES[biomeIdx] || BIOME_THEMES[0];
-    const isCosmic250 = Boolean(theme.isEpoch250Special || gameState.epoch === 250), horizonY = H * 0.42;
-    const cust = activeAccount ? activeAccount.custom : DEFAULT_VEHICLE_CUST;
-    const chroma = getSkinChromaPalette(cust.nitroSkin, cust, now);
-    const activeDist = gameState.running ? gameState.distanceM : menuCruiseDist;
-
-    ensureCachedBiomeGradients(W, H, horizonY, theme);
-    ctx.save();
-    if (gameState.screenShake > 0 && globalSettings.graphics.shake) ctx.translate((Math.random() - 0.5) * gameState.screenShake, (Math.random() - 0.5) * gameState.screenShake);
-
-    ctx.fillStyle = cachedGradients.sky; ctx.fillRect(0, 0, W, H);
-    const cosmicHue = (now * 0.08) % 360, dynamicWorldColor = isCosmic250 ? `hsl(${cosmicHue},95%,62%)` : theme.curb;
-
-    const starCount = Math.min(gameState.stars.length, Math.floor((isMobileHardware ? 42 : 65) * globalSettings.graphics.particles));
-    const streakLen = (globalSettings.graphics.speedLines || isCosmic250 || gameState.boosting) ? 5.8 : 1.5;
-    for (let i = 0; i < starCount; i++) {
-        const st = gameState.stars[i], sx = ((st.x * W - activeDist * st.sp) % W + W) % W;
-        ctx.fillStyle = isCosmic250 ? st.col : (i % 3 === 0 ? theme.curb : '#e2e8f0');
-        ctx.fillRect(sx, st.y * H, st.s * streakLen, st.s * 0.95);
-    }
-
-    renderUniqueDimensionHorizon(W, H, horizonY, theme, now, dynamicWorldColor, cosmicHue);
-    ctx.fillStyle = theme.roadDark; ctx.fillRect(0, horizonY, W, H - horizonY);
-
-    const roadCurve = Math.sin(activeDist * 0.012) * 0.65;
-    const totalSlices = globalSettings.graphics.roadSlices || (isMobileHardware ? 26 : 36), sliceStep = 55.0 / totalSlices;
-
-    for (let i = totalSlices; i >= 1; i--) {
-        const zN = 0.55 + (i - 1) * sliceStep, zF = 0.55 + i * sliceStep;
-        const yN = projectY(zN, 0, H), yF = i === totalSlices ? horizonY : projectY(zF, 0, H);
-        const xNL = projectX(-2.6, zN, W, H, roadCurve), xNR = projectX(2.6, zN, W, H, roadCurve);
-        const xFL = projectX(-2.6, zF, W, H, roadCurve), xFR = projectX(2.6, zF, W, H, roadCurve);
-        const isAlt = (Math.floor((activeDist + zN) / 3.2) & 1) === 0;
-        ctx.fillStyle = isAlt ? theme.roadLight : theme.roadDark;
-        ctx.beginPath(); ctx.moveTo(xFL, yF); ctx.lineTo(xFR, yF); ctx.lineTo(xNR, yN); ctx.lineTo(xNL, yN); ctx.closePath(); ctx.fill();
-        if (isAlt) { ctx.strokeStyle = dynamicWorldColor; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(xFL, yF); ctx.lineTo(xNL, yN); ctx.moveTo(xFR, yF); ctx.lineTo(xNR, yN); ctx.stroke(); }
-    }
-
-    ctx.strokeStyle = colorWithAlpha(dynamicWorldColor, 0.53); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(0, horizonY); ctx.lineTo(W, horizonY); ctx.stroke();
-    if (globalSettings.graphics.reflections) { ctx.fillStyle = colorWithAlpha(dynamicWorldColor, 0.07); ctx.beginPath(); ctx.moveTo(W * 0.46, horizonY); ctx.lineTo(W * 0.54, horizonY); ctx.lineTo(W * 0.64, H); ctx.lineTo(W * 0.36, H); ctx.closePath(); ctx.fill(); }
-
-    ctx.strokeStyle = colorWithAlpha(dynamicWorldColor, 0.34); ctx.lineWidth = 1.2; ctx.beginPath();
-    const divSteps = isMobileHardware ? 14 : 18, divStepM = 48.0 / divSteps;
-    for (let l = 0; l < 4; l++) {
-        const dl = -1.5 + l;
-        for (let s = 0; s < divSteps; s += 2) { const z1 = 0.65 + s * divStepM, z2 = z1 + divStepM * 0.75; ctx.moveTo(projectX(dl, z1, W, H, roadCurve), projectY(z1, 0, H)); ctx.lineTo(projectX(dl, z2, W, H, roadCurve), projectY(z2, 0, H)); }
-    }
-    ctx.stroke();
-
-    const cSteps = isMobileHardware ? 14 : 20, cStepM = 42.0 / cSteps;
-    ctx.fillStyle = chroma.railFill; ctx.beginPath();
-    for (let s = 0; s <= cSteps; s++) { const z = 0.58 + s * cStepM, xL = projectX(gameState.egoLaneX - 0.46, z, W, H, roadCurve), y = projectY(z, 0, H); if (s === 0) ctx.moveTo(xL, y); else ctx.lineTo(xL, y); }
-    for (let s = cSteps; s >= 0; s--) { const z = 0.58 + s * cStepM; ctx.lineTo(projectX(gameState.egoLaneX + 0.46, z, W, H, roadCurve), projectY(z, 0, H)); }
-    ctx.closePath(); ctx.fill();
-
-    ctx.strokeStyle = chroma.railColor; ctx.lineWidth = chroma.isAllInOne ? 2.4 : 2.1; ctx.beginPath();
-    for (let s = 0; s <= cSteps; s++) { const z = 0.58 + s * cStepM, xL = projectX(gameState.egoLaneX - 0.46, z, W, H, roadCurve), y = projectY(z, 0, H); if (s === 0) ctx.moveTo(xL, y); else ctx.lineTo(xL, y); }
-    for (let s = 0; s <= cSteps; s++) { const z = 0.58 + s * cStepM, xR = projectX(gameState.egoLaneX + 0.46, z, W, H, roadCurve), y = projectY(z, 0, H); if (s === 0) ctx.moveTo(xR, y); else ctx.lineTo(xR, y); }
-    ctx.stroke();
-
-    if (gameState.running) {
-        for (let i = gameState.pickups.length - 1; i >= 0; i--) renderHighTexturePickup(gameState.pickups[i], W, H, roadCurve, now);
-        gameState.hazards.sort((a, b) => b.z - a.z);
-        ctx.font = "bold 10px 'JetBrains Mono',monospace";
-        for (let i = 0; i < gameState.hazards.length; i++) renderHighTextureDistinctHazard(gameState.hazards[i], Math.max(0.55, gameState.hazards[i].z), W, H, roadCurve, dynamicWorldColor, isCosmic250, cosmicHue, now);
-    }
-
-    for (let i = gameState.empFX.length - 1; i >= 0; i--) {
-        const fx = gameState.empFX[i]; fx.life -= dtRender * 1.65;
-        if (fx.life <= 0) { gameState.empFX.splice(i, 1); continue; }
-        const prog = 1 - fx.life, bx = projectX(fx.lane, fx.z, W, H, roadCurve), by = projectY(fx.z, 0, H) - prog * 18;
-        const s = getRigidPerspectiveScale(fx.z, W, H, fx.cls.id), dims = globalSettings.graphics.legacyModels ? { w: 25, h: 23 } : (REAL_LIFE_HAZARD_DIMS[fx.cls.id] || { w: 24, h: 21 });
-        const boxW = dims.w * s * (1 + prog * 0.35), boxH = dims.h * s * (1 - prog * 0.25);
-
-        ctx.save(); ctx.globalAlpha = Math.max(0, fx.life * 0.32); ctx.fillStyle = fx.empCol;
-        const beamW = Math.max(2.5, boxW * 0.32 * fx.life); ctx.fillRect(bx - beamW * 0.5, by - boxH * 2.2, beamW, boxH * 2.2);
-        ctx.globalAlpha = Math.max(0, fx.life); ctx.strokeStyle = prog < 0.35 ? '#ffffff' : fx.empCol; ctx.lineWidth = 1.8;
-        ctx.beginPath(); ctx.ellipse(bx, by - boxH * 0.35, boxW * (0.55 + prog * 0.95), boxH * (0.32 + prog * 0.55), 0, 0, Math.PI * 2); ctx.stroke();
-        const slCnt = isMobileHardware ? 4 : 6, slH = boxH / slCnt;
-        for (let sl = 0; sl < slCnt; sl++) { const jit = (sl % 2 === 0 ? 1 : -1) * prog * 13 * s; ctx.fillStyle = sl % 2 === 0 ? fx.empCol : (fx.empSec || fx.mainCol || chroma.railColor); ctx.fillRect(bx - boxW * 0.46 + jit, by - boxH + sl * slH, boxW * 0.92, slH * 0.58); }
-        for (let k = 0; k < fx.shards.length; k++) { const sh = fx.shards[k], sz = sh.sz * s * fx.life; ctx.fillStyle = sh.col; ctx.fillRect(bx + sh.vx * prog * s - sz * 0.5, (by - boxH * 0.5) + sh.vy * prog * s - sz * 0.5, sz, sz); }
-        ctx.restore();
-    }
-
-    const zR = 1.34, zF = 1.54, rx = projectX(gameState.egoLaneX, zR, W, H, roadCurve), fx = projectX(gameState.egoLaneX, zF, W, H, roadCurve);
-    const carCenterX = Math.round(rx), rearY = Math.round(projectY(zR, 0, H));
-    const halfW = Math.round(((H * 0.85) / zR) * EGO_HALF_LANE_W * LANE_WIDTH_M * 0.24 * 0.86), carH = Math.round(halfW * 0.92 * 1.05);
-    const invulnFlicker = gameState.invulnTimer > 0 && Math.floor(now / 60) % 2 === 0;
-    const isCarBoosting = gameState.running && gameState.boosting;
-    ctx.save(); if (invulnFlicker) ctx.globalAlpha = 0.55;
-    drawRoadsterVehicle(ctx, carCenterX, rearY, halfW, carH, Math.round((fx - rx) * 0.65), cust, isCarBoosting, gameState.running && gameState.braking, now, globalSettings.graphics.bloom, gameState.egoRoll);
-    ctx.restore();
-
-    if (isCarBoosting && globalSettings.graphics.speedLines) {
-        ctx.save(); ctx.strokeStyle = chroma.primaryGlow; ctx.globalAlpha = 0.28; ctx.lineWidth = 1.6;
-        const lineCnt = isMobileHardware ? 8 : 14;
-        for (let i = 0; i < lineCnt; i++) { const ang = (i / lineCnt) * Math.PI * 2 + (now * 0.0015), rIn = Math.min(W, H) * (0.34 + ((now * 0.003 + i * 0.17) % 0.14)), rOut = Math.max(W, H) * 0.72; ctx.beginPath(); ctx.moveTo(W * 0.5 + Math.cos(ang) * rIn, H * 0.45 + Math.sin(ang) * rIn); ctx.lineTo(W * 0.5 + Math.cos(ang) * rOut, H * 0.45 + Math.sin(ang) * rOut); ctx.stroke(); }
-        ctx.restore();
-    }
-
-    if (gameState.empWaveRadius > 0) {
-        const ox = carCenterX, oy = rearY - carH * 0.45, r1 = gameState.empWaveRadius, fade = Math.max(0.12, 1 - (r1 / 1500));
-        ctx.save(); ctx.globalAlpha = fade;
-        if (gameState.empFlashAlpha > 0) { ctx.fillStyle = chroma.empFlash; if (!chroma.isAllInOne) ctx.globalAlpha = gameState.empFlashAlpha * 0.22; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = fade; }
-        ctx.strokeStyle = chroma.empPrimary; ctx.lineWidth = 6; ctx.beginPath(); ctx.ellipse(ox, oy, r1, r1 * 0.52, 0, 0, Math.PI * 2); ctx.stroke();
-        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.8; ctx.beginPath(); ctx.ellipse(ox, oy, r1 * 0.76, r1 * 0.40, 0, 0, Math.PI * 2); ctx.stroke();
-        ctx.strokeStyle = chroma.empSecondary; ctx.lineWidth = 3.2; ctx.beginPath(); ctx.arc(ox, oy, r1 * 0.88, 0, Math.PI * 2); ctx.stroke();
-        const arcCount = isMobileHardware ? 6 : 10; ctx.strokeStyle = '#e0f2fe'; ctx.lineWidth = 1.8; ctx.beginPath();
-        for (let a = 0; a < arcCount; a++) { const ba = (a / arcCount) * Math.PI * 2 + now * 0.008, j1 = Math.sin(now * 0.03 + a * 4.1) * 0.14, j2 = Math.cos(now * 0.04 + a * 2.7) * 0.14; ctx.moveTo(ox + Math.cos(ba) * r1 * 0.25, oy + Math.sin(ba) * r1 * 0.25 * 0.55); ctx.lineTo(ox + Math.cos(ba + j1) * r1 * 0.62, oy + Math.sin(ba + j1) * r1 * 0.62 * 0.55); ctx.lineTo(ox + Math.cos(ba + j2) * r1 * 0.96, oy + Math.sin(ba + j2) * r1 * 0.96 * 0.55); }
-        ctx.stroke(); ctx.restore();
-    }
-
-    if (theme.weather !== 'none' && globalSettings.graphics.particles > 0.05) {
-        const pCnt = Math.floor((isMobileHardware ? 18 : 30) * globalSettings.graphics.particles);
-        for (let r = 0; r < pCnt; r++) {
-            const rxp = (r * 97 + now * 0.42) % W, ryp = (r * 61 + now * 1.05) % H;
-            if (theme.weather === 'rain') { ctx.strokeStyle = 'rgba(125,211,252,0.34)'; ctx.lineWidth = 1.3; ctx.beginPath(); ctx.moveTo(rxp, ryp); ctx.lineTo(rxp - 6, ryp + 15); ctx.stroke(); }
-            else { ctx.fillStyle = theme.weather === 'snow' ? 'rgba(241,245,249,0.75)' : (theme.weather === 'embers' ? 'rgba(251,146,60,0.75)' : (theme.weather === 'petals' ? 'rgba(244,114,182,0.75)' : dynamicWorldColor)); ctx.fillRect(rxp, theme.weather === 'embers' ? H - ryp : ryp, 2.8, 2.8); }
-        }
-    }
-
-    for (let i = 0; i < gameState.FloatingTexts.length; i++) {
-        const ft = gameState.FloatingTexts[i]; ctx.save(); ctx.globalAlpha = Math.max(0, ft.life);
-        ctx.font = "800 13px 'JetBrains Mono',monospace"; ctx.textAlign = 'center'; ctx.fillStyle = ft.color; ctx.fillText(ft.text, ft.x, ft.y); ctx.restore();
-    }
-    ctx.restore();
-
-    if (gCtx && document.getElementById('pauseSettingsModal').style.display === 'flex' && currentSettingsTab === 'garage') renderGaragePreview(now, dtRender, cust);
-}
-
-function syncGarageCanvasResolution() {
-    if (!garageCanvas || !gCtx) return;
-    const rect = garageCanvas.getBoundingClientRect();
-    const cssW = Math.max(240, Math.round(rect.width || 560)), cssH = Math.max(104, Math.round(rect.height || 172));
-    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-    const targetW = Math.round(cssW * dpr), targetH = Math.round(cssH * dpr);
-    if (garageCanvas.width !== targetW || garageCanvas.height !== targetH) {
-        garageCanvas.width = targetW; garageCanvas.height = targetH;
-    }
-    gCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    garageCanvas._cssW = cssW; garageCanvas._cssH = cssH;
-}
-
-function renderGaragePreview(now, dtRender, cust) {
-    syncGarageCanvasResolution();
-    const W = garageCanvas._cssW || 560, H = garageCanvas._cssH || 172;
-    gCtx.fillStyle = '#050810'; gCtx.fillRect(0, 0, W, H);
-    const chroma = getSkinChromaPalette(cust.nitroSkin, cust, now), scrollOff = (now * 0.08) % 20;
-    gCtx.strokeStyle = chroma.isAllInOne ? chroma.railFill : colorWithAlpha(chroma.railColor, 0.20); gCtx.lineWidth = 1;
-    for (let x = 20; x < W; x += 28) { gCtx.beginPath(); gCtx.moveTo(W * 0.5 + (x - W * 0.5) * 0.30, 22); gCtx.lineTo(x, H); gCtx.stroke(); }
-    for (let y = 28 + scrollOff; y < H; y += 20) { gCtx.beginPath(); gCtx.moveTo(0, y); gCtx.lineTo(W, y); gCtx.stroke(); }
-
-    gCtx.fillStyle = chroma.railFill; gCtx.beginPath(); gCtx.moveTo(W * 0.5 - 38, 22); gCtx.lineTo(W * 0.5 + 38, 22); gCtx.lineTo(W * 0.5 + 112, H); gCtx.lineTo(W * 0.5 - 112, H); gCtx.closePath(); gCtx.fill();
-    gCtx.strokeStyle = chroma.railColor; gCtx.lineWidth = 2; gCtx.beginPath(); gCtx.moveTo(W * 0.5 - 38, 22); gCtx.lineTo(W * 0.5 - 112, H); gCtx.moveTo(W * 0.5 + 38, 22); gCtx.lineTo(W * 0.5 + 112, H); gCtx.stroke();
-
-    const sway = Math.sin(now * 0.0024) * 7, carScale = Math.min(1, H / 160);
-    drawRoadsterVehicle(gCtx, W * 0.5 + sway, H * 0.68, Math.round(54 * carScale), Math.round(52 * carScale), -sway * 0.4, cust, garageNitroPreviewOn, false, now, true, -sway * 0.012);
-
-    if (garageEmpPreviewRadius > 0) {
-        garageEmpPreviewRadius += dtRender * 420; const fade = Math.max(0, 1 - garageEmpPreviewRadius / 280);
-        if (fade <= 0) garageEmpPreviewRadius = 0;
-        else {
-            gCtx.save(); gCtx.globalAlpha = fade;
-            gCtx.strokeStyle = chroma.empPrimary; gCtx.lineWidth = 4; gCtx.beginPath(); gCtx.ellipse(W * 0.5, H * 0.58, garageEmpPreviewRadius, garageEmpPreviewRadius * 0.44, 0, 0, Math.PI * 2); gCtx.stroke();
-            gCtx.strokeStyle = '#ffffff'; gCtx.lineWidth = 2; gCtx.beginPath(); gCtx.ellipse(W * 0.5, H * 0.58, garageEmpPreviewRadius * 0.72, garageEmpPreviewRadius * 0.32, 0, 0, Math.PI * 2); gCtx.stroke();
-            gCtx.strokeStyle = chroma.empSecondary; gCtx.lineWidth = 2.2; gCtx.beginPath(); gCtx.arc(W * 0.5, H * 0.58, garageEmpPreviewRadius * 0.85, 0, Math.PI * 2); gCtx.stroke();
-            gCtx.restore();
-        }
-    }
-}
-
-function updateHudDOM(force = false) {
-    if (isHudHidden && !force) return;
-    setTextCached('hudScore', String(gameState.score).padStart(6, '0'));
-    setTextCached('hudEpoch', `EP ${gameState.epoch}`);
-    setTextCached('hudCombo', `${gameState.combo.toFixed(1)}x`);
-    setTextCached('hudSpeedKmh', `${Math.round(gameState.speedMps * 3.6)} km/h`);
-    setWidthCached('hudArmorBar', `${gameState.armor}%`);
-    setTextCached('hudArmorPct', `${gameState.armor}%`);
-    const armBar = document.getElementById('hudArmorBar');
-    if (armBar) armBar.style.background = gameState.armor <= 25 ? '#ef4444' : (gameState.armor <= 55 ? '#f59e0b' : '#34d399');
-
-    const nP = Math.max(0, Math.min(100, Math.floor(gameState.nitroFuel))), eP = Math.max(0, Math.min(100, Math.floor(gameState.empCharge)));
-    setTextCached('hudNitroPct', `${nP}%`); setWidthCached('hudNitroBar', `${nP}%`);
-    setTextCached('hudEmpPct', eP >= 100 ? 'READY!' : `${eP}%`); setWidthCached('hudEmpBar', `${eP}%`);
-
-    let lead = null, maxRisk = 0;
-    for (let i = 0; i < gameState.hazards.length; i++) {
-        const h = gameState.hazards[i];
-        const dR = Math.max(0, Math.min(1, 1 - (h.z - 2) / 50)), ov = Math.max(0, 1 - Math.abs(h.lane - gameState.egoLaneX) / 1.2);
-        const ttc = h.z / Math.max(1, gameState.speedMps - h.speedMps), tR = ttc <= 1.8 ? 1.0 : Math.max(0, (6.0 - ttc) / 4.2);
-        h.rFinal = Math.min(1, 0.35 * dR + 0.35 * tR + 0.30 * ov); h.ttc = ttc;
-        if (h.rFinal > maxRisk) { maxRisk = h.rFinal; lead = h; }
-    }
-    const rP = Math.round(maxRisk * 100), tier = rP >= 85 ? 'CRITICAL' : (rP >= 65 ? 'WARNING' : (rP >= 35 ? 'CAUTION' : 'CLEAR'));
-    if (domCache.warnTier !== tier) {
-        domCache.warnTier = tier;
-        const wb = document.getElementById('hudWarningBadge');
-        if (wb) { wb.innerText = tier; wb.className = tier === 'CRITICAL' ? 'badge badge-red' : (tier === 'WARNING' || tier === 'CAUTION' ? 'badge badge-amber' : 'badge badge-emerald'); }
-    }
-    if (lead) { setTextCached('hudLeadName', `${lead.cls.name.toUpperCase()} (${lead.z.toFixed(1)}m)`); setTextCached('hudLeadTtc', `${lead.ttc.toFixed(1)}s`); setTextCached('hudLeadDgi', String(lead.dgi)); }
-    else { setTextCached('hudLeadName', 'CLEAR'); setTextCached('hudLeadTtc', 'STABLE'); setTextCached('hudLeadDgi', '0.00'); }
-}
-
-function renderMiniRadar(now = performance.now()) {
-    const w = radarCanvas.width, h = radarCanvas.height, cx = w * 0.5, cy = h - 7;
-    rCtx.clearRect(0, 0, w, h); rCtx.strokeStyle = '#1e2638'; rCtx.lineWidth = 1;
-    rCtx.beginPath(); rCtx.arc(cx, cy, 20, Math.PI, 0, false); rCtx.arc(cx, cy, 40, Math.PI, 0, false); rCtx.arc(cx, cy, 60, Math.PI, 0, false); rCtx.stroke();
-    const cust = activeAccount ? activeAccount.custom : DEFAULT_VEHICLE_CUST, chroma = getSkinChromaPalette(cust.nitroSkin, cust, now);
-    rCtx.fillStyle = chroma.radarDot; rCtx.fillRect(cx - 3, cy - 5, 6, 5);
-    radarAngle += 0.25; if (radarAngle > Math.PI * 2) radarAngle = Math.PI;
-    rCtx.beginPath(); rCtx.moveTo(cx, cy); rCtx.lineTo(cx + Math.cos(radarAngle) * 65, cy + Math.sin(radarAngle) * 65); rCtx.strokeStyle = 'rgba(56,189,248,0.35)'; rCtx.stroke();
-    for (let i = 0; i < gameState.hazards.length; i++) {
-        const hz = gameState.hazards[i]; if (hz.z > 55) continue;
-        const bx = cx + (hz.lane - gameState.egoLaneX) * 9, by = cy - hz.z * 1.18;
-        if (by > 2 && by < h) { rCtx.fillStyle = hz.rFinal >= 0.85 ? '#ef4444' : (hz.rFinal >= 0.65 ? '#f97316' : (hz.rFinal >= 0.35 ? '#f59e0b' : '#38bdf8')); rCtx.fillRect(bx - 2, by - 2, 4, 4); }
-    }
-}
-
-// =========================================================================
-// 12. PRIVACY CLICK-TO-REVEAL, AUTH & ON-DEMAND FIREBASE UID SIGN-IN
-// =========================================================================
-function resetAllRevealStates() { Object.keys(revealState).forEach(k => { revealState[k] = false; }); }
-function toggleRevealField(key) { if (!(key in revealState)) return; revealState[key] = !revealState[key]; refreshMenuAccountUI(); playSfx('uiClick'); }
-function renderRevealButton(btnId, isRevealed, maskedText, plainText) {
-    const el = document.getElementById(btnId); if (!el) return;
-    el.classList.toggle('revealed', isRevealed);
-    el.innerText = isRevealed ? `${plainText} 🙈` : `${maskedText} 👁`;
-}
-function showAuthFeedback(msg, ok = true) { const el = document.getElementById('authFeedback'); if (!el) return; el.className = ok ? 'mono badge-emerald auth-feedback' : 'mono badge-red auth-feedback'; el.style.display = 'block'; el.innerText = msg; }
-function switchAuthSubTab(mode) {
-    document.getElementById('authCreatePane').classList.toggle('hidden', mode !== 'create');
-    document.getElementById('authLoginPane').classList.toggle('hidden', mode !== 'login');
-    document.getElementById('authTabCreate').className = mode === 'create' ? 'btn btn-xs btn-sky active' : 'btn btn-xs';
-    document.getElementById('authTabLogin').className = mode === 'login' ? 'btn btn-xs btn-sky active' : 'btn btn-xs';
-}
-
-function createNewPilotAccount() {
-    const nameEl = document.getElementById('regNameInput'), tagEl = document.getElementById('regTagInput');
-    const name = (nameEl.value || '').trim(), tag = (tagEl.value || '').trim();
-    if (!name || name.length < 2) { showAuthFeedback('Enter a name (min 2 chars).', false); playSfx('hit'); return; }
-    if (!tag) { showAuthFeedback('Enter an ID / Tag.', false); playSfx('hit'); return; }
-
-    const uid = generateUnique17DigitUid();
-    const acc = makeAccountObj({ uid, name, tag, isDev: false });
-    const st = seasonStatusCache;
-    pushMail(acc, {
-        title: `Welcome, ${acc.name}`, sender: 'SYSTEM',
-        body: `Account created: ${acc.name} #${acc.tag}\nYour unique 17-digit UID can be revealed & copied anytime in Profile.\n\nSeason ${st.seasonNum} is ${st.phase === 'ACTIVE' ? `LIVE — Top 5 earn "${st.featuredSkin.name}" for Season ${st.nextSeasonNum}.` : `in 24h Off-Season Gap before Season ${st.nextSeasonNum}.`}\nReach #1 All-Time to wield Void Prismatic FX!`
+function bindMainMenuMisclickShield(){
+    if(splashGuardBound)return;
+    const startModalEl=document.getElementById('startModal');
+    if(!startModalEl)return;
+    splashGuardBound=true;
+    ['pointerdown','pointerup','mousedown','mouseup','touchstart','touchend','click'].forEach(evt=>{
+        startModalEl.addEventListener(evt,(e)=>{
+            if(performance.now()<mainMenuSplashGuardUntil){
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+            }
+        },true);
     });
-    accountsCache[uid] = acc; saveAccountsCache();
-    publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(acc) });
-    nameEl.value = ''; tagEl.value = '';
-    activateAccountSession(uid);
-    showToast(`Pilot created & synced live: ${acc.name}`, 'ok'); playSfx('pickup');
 }
 
-// Direct On-Demand UID Lookup from Firebase if UID isn't cached locally yet!
-async function signInWithUid() {
-    const inp = document.getElementById('loginUidInput'), uid = (inp.value || '').replace(/\D+/g, '');
-    if (!/^\d{17}$/.test(uid)) { showAuthFeedback('Enter a valid 17-digit UID.', false); playSfx('hit'); return; }
-    if (!accountsCache[uid] && FB_BASE_URL) {
-        showAuthFeedback('Looking up 17-digit UID in Firebase Cloud DB...', true);
-        const remAcc = await fbRequest(`/accounts/${uid}`, 'GET', null, 4500);
-        if (remAcc && remAcc.uid === uid) {
-            mergeSingleAccountRecord(remAcc, true);
+function createAndMountBootSplashGate(){
+    bindMainMenuMisclickShield();
+    if(document.getElementById('bootSplashGateModal'))return;
+    const wrapper=document.getElementById('gameViewportWrapper')||document.body;
+    const gate=document.createElement('div');
+    gate.id='bootSplashGateModal';
+    gate.className='absolute inset-0 bg-[#03050a]/95 z-[95] flex items-center justify-center p-4 select-none';
+    gate.innerHTML=`
+        <div class="hardware-panel modal-anim p-6 sm:p-8 rounded-2xl max-w-md w-full text-center space-y-4 border border-sky-500/40 shadow-[0_0_50px_rgba(14,165,233,0.25)]">
+            <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-[10px] mono-num font-extrabold uppercase tracking-widest">
+                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> SYSTEM ONLINE // AUDIO READY
+            </div>
+            <h1 class="title-cinzel text-xl sm:text-2xl font-black text-white tracking-wider">ROADSENSE: OVERDRIVE</h1>
+            <p class="text-xs text-gray-300 mono-num leading-relaxed">Neural Interceptor Telemetry &amp; Synth Audio Engine Ready.</p>
+            <button type="button" id="enterMainMenuGateBtn" class="btn-launch w-full py-3.5 px-6 rounded-xl text-sm sm:text-base font-extrabold uppercase tracking-wider cursor-pointer shadow-lg">
+                ▶ START / ENTER MAIN MENU
+            </button>
+            <div class="text-[10px] mono-num text-sky-300/80 uppercase tracking-wider">Tap button or press [ENTER] / [SPACE]</div>
+        </div>
+    `;
+    wrapper.appendChild(gate);
+    const startModalEl=document.getElementById('startModal');
+    if(startModalEl)startModalEl.style.display='none';
+
+    const triggerEnter=(ev)=>{
+        if(ev){
+            if(ev.type==='keydown'&&ev.key!=='Enter'&&ev.key!==' ')return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            if(typeof ev.stopImmediatePropagation==='function')ev.stopImmediatePropagation();
+        }
+        enterMainMenuFromSplash();
+    };
+    gate.addEventListener('pointerdown',triggerEnter,{passive:false});
+    gate.addEventListener('click',triggerEnter,{passive:false});
+    const btn=gate.querySelector('#enterMainMenuGateBtn');
+    if(btn){
+        btn.addEventListener('pointerdown',triggerEnter,{passive:false});
+        btn.addEventListener('click',triggerEnter,{passive:false});
+    }
+}
+
+function enterMainMenuFromSplash(){
+    if(isBootSplashDismissed)return;
+    isBootSplashDismissed=true;
+    hasTrustedGesture=true;
+    mainMenuSplashGuardUntil=performance.now()+450;
+    bindMainMenuMisclickShield();
+
+    const gate=document.getElementById('bootSplashGateModal');
+    const startModalEl=document.getElementById('startModal');
+    if(startModalEl){
+        startModalEl.style.pointerEvents='none';
+        startModalEl.style.display='flex';
+    }
+    if(gate){
+        gate.style.pointerEvents='all';
+        gate.style.opacity='0';
+        setTimeout(()=>{
+            gate.style.display='none';
+            gate.style.opacity='1';
+        },180);
+    }
+    setTimeout(()=>{
+        if(startModalEl)startModalEl.style.pointerEvents='auto';
+    },450);
+
+    ensureAudioEngine();
+    tryStartMenuUnlockAudio();
+    playGameSfx('pickup');
+    syncCursorVisibility();
+}
+
+// Show "🎧 Mixtape" ONLY for ID 1117; completely hide for all other Core members & Guests
+function syncMixtapeOstVisibilityUI(){
+    const isArch=(currentPilot&&currentPilot.id==='1117');
+    const mitBtn=document.getElementById('ostBtn_mitadru');
+    if(mitBtn){
+        const titleRow=mitBtn.firstElementChild;
+        if(titleRow&&titleRow.firstElementChild){
+            titleRow.firstElementChild.innerText='🎧 Mixtape';
+        }
+        const badge=document.getElementById('mitadruOstBadge');
+        if(badge)badge.innerText='👑 1117';
+
+        const grid=mitBtn.parentElement;
+        if(isArch){
+            mitBtn.classList.remove('hidden');
+            mitBtn.style.display='';
+            if(grid)grid.className='grid grid-cols-1 sm:grid-cols-3 gap-1.5 ost-grid-3col';
+        }else{
+            mitBtn.classList.add('hidden');
+            mitBtn.style.display='none';
+            if(grid)grid.className='grid grid-cols-1 sm:grid-cols-2 gap-1.5 ost-grid-2col';
+            if(audioSettings.ostMode==='mitadru'){
+                audioSettings.ostMode='synth';
+            }
         }
     }
-    if (!accountsCache[uid]) { showAuthFeedback('UID not found. Check your 17-digit UID or create a new pilot.', false); playSfx('hit'); return; }
-    inp.value = '';
-    activateAccountSession(uid);
-    showToast(`Signed in as ${activeAccount.name}`, 'ok'); playSfx('pickup');
 }
 
-function activateAccountSession(uid) {
-    const acc = accountsCache[uid]; if (!acc) return;
-    activeAccount = acc; lsSet(STORAGE_ACTIVE_UID_KEY, uid); resetAllRevealStates();
-    if (!acc.isDev) { devGodModeActive = false; lbDevManageMode = false; }
-    reconcileAllTimeChampion();
-    if (acc.custom.nitroSkin !== 'standard' && !hasNitroSkinUnlocked(acc, acc.custom.nitroSkin)) { acc.custom.nitroSkin = 'standard'; saveAccountsCache(); }
-    if (!isBiomeUnlockedForAccount(biomeIdx)) { biomeIdx = 0; cachedGradients.key = ''; }
-    if (globalSettings.audio.ostMode === 'mitadru' && !acc.isDev) selectOstMode('synth');
-    document.getElementById('authFeedback').style.display = 'none';
-    refreshMenuAccountUI(); refreshSeasonUI(); refreshInboxBadgeUI();
-    loadCustomSongForActiveAccount(); buildBiomeSelectorGrid(); syncOstButtonsUI(); syncDevUiVisibility();
-}
-
-function logoutActiveAccount() {
-    if (!activeAccount) return;
-    lastLoggedOutUid = activeAccount.uid; lsSet(STORAGE_LAST_OUT_KEY, lastLoggedOutUid);
-    activeAccount = null; devGodModeActive = false; lbDevManageMode = false;
-    lsRemove(STORAGE_ACTIVE_UID_KEY); resetAllRevealStates();
-    if (globalSettings.audio.ostMode === 'mitadru') selectOstMode('synth');
-    loadCustomSongForActiveAccount(); syncDevUiVisibility(); switchAuthSubTab('login');
-    refreshMenuAccountUI(); refreshInboxBadgeUI();
-    showToast('Logged out.'); playSfx('uiClick');
-}
-function logoutFromProfile() { document.getElementById('pauseSettingsModal').style.display = 'none'; returnToMainMenu(); logoutActiveAccount(); }
-
-function saveProfileIdentity() {
-    if (!activeAccount) return;
-    const newName = (document.getElementById('profEditNameInput').value || '').trim(), newTag = (document.getElementById('profEditTagInput').value || '').trim();
-    if (!newName || newName.length < 2) { showToast('Name must be at least 2 characters.', 'err'); playSfx('hit'); return; }
-    if (!newTag) { showToast('ID / Tag cannot be empty.', 'err'); playSfx('hit'); return; }
-    activeAccount.name = newName; activeAccount.tag = newTag; activeAccount.updatedAt = Date.now();
-    saveAccountsCache(); syncAccountMetaInLeaderboards(activeAccount);
-    publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) });
-    refreshMenuAccountUI(); updateTopLeaderBanner(); renderDevAccountsList();
-    showToast('Name & ID updated live.', 'ok'); playSfx('pickup');
-}
-
-function syncMenuButtonsLockState(isLoggedIn) {
-    ['engageLaunchBtn', 'menuMailBtn', 'menuRanksBtn', 'menuGarageBtn', 'menuSettingsBtn', 'menuExitBtn'].forEach(id => {
-        const b = document.getElementById(id);
-        if (!b) return;
-        b.disabled = !isLoggedIn;
-        b.title = isLoggedIn ? '' : 'Create a pilot or sign in with a UID first';
-    });
-    const hint = document.getElementById('menuLockedHint');
-    if (hint) hint.classList.toggle('hidden', isLoggedIn);
-}
-
-function refreshQuickLoadoutStrip() {
-    const diffObj = DIFFICULTY_PRESETS[globalSettings.difficulty] || DIFFICULTY_PRESETS.easy;
-    setTextCached('menuQuickDiff', diffObj.label);
-    const bObj = BIOME_THEMES[biomeIdx] || BIOME_THEMES[0];
-    setTextCached('menuQuickBiome', bObj.label.replace(/^[^\w]+/, '').trim());
-    const skinId = (activeAccount && activeAccount.custom && activeAccount.custom.nitroSkin) || 'standard';
-    const skObj = SEASON_FX_SKINS.find(s => s.id === skinId) || SEASON_FX_SKINS[0];
-    setTextCached('menuQuickSkin', skObj.name);
-}
-
-function refreshMenuAccountUI() {
-    const acc = activeAccount, launchBtn = document.getElementById('engageLaunchBtn'), st = seasonStatusCache;
-    const activeCard = document.getElementById('menuAccountActiveCard'), prevCard = document.getElementById('menuPrevAccountCard'), authCard = document.getElementById('menuAuthCard');
-
-    syncMenuButtonsLockState(Boolean(acc));
-    refreshQuickLoadoutStrip();
-
-    if (!acc) {
-        activeCard.classList.add('hidden'); authCard.classList.remove('hidden');
-        const prevAcc = lastLoggedOutUid ? accountsCache[lastLoggedOutUid] : null;
-        if (prevAcc) {
-            prevCard.classList.remove('hidden');
-            document.getElementById('prevPilotColorDot').style.background = prevAcc.custom.bodySecondary;
-            document.getElementById('prevPilotName').innerText = prevAcc.name;
-            renderRevealButton('prevPilotTagRevealBtn', revealState.prevTag, '#••••', `#${prevAcc.tag}`);
-            renderRevealButton('prevPilotUidRevealBtn', revealState.prevUid, 'UID: •••• •••• •••• •••••', `UID: ${formatUidSpaced(prevAcc.uid)}`);
-            document.getElementById('prevCopyUidBtn').classList.toggle('hidden', !revealState.prevUid);
-        } else prevCard.classList.add('hidden');
-
-        if (launchBtn) launchBtn.innerText = '🔒 SIGN IN TO PLAY';
-        setTextCached('menuStatSeasonBest', '0'); setTextCached('menuStatAllBest', '0'); setTextCached('menuStatBestEpoch', 'Ep 1'); setTextCached('menuStatFlashes', '0');
+function selectOstMode(mode){
+    syncMixtapeOstVisibilityUI();
+    if(mode==='mitadru'&&currentPilot.id!=='1117'){
+        mode='synth';
+    }
+    if(mode==='custom'&&!currentCustomObjectUrl){
+        const stTxt=document.getElementById('customSongStatusText');
+        if(stTxt)stTxt.innerText="⚠️ Upload a song file (≤ 20 MB) first!";
         return;
     }
-
-    activeCard.classList.remove('hidden'); prevCard.classList.add('hidden'); authCard.classList.add('hidden');
-    if (launchBtn) launchBtn.innerText = '▶ PLAY';
-    document.getElementById('menuPilotName').innerText = acc.name;
-    document.getElementById('menuPilotColorDot').style.background = acc.custom.bodySecondary;
-    renderRevealButton('menuPilotTagRevealBtn', revealState.menuTag, '#••••', `#${acc.tag}`);
-    renderRevealButton('menuPilotUidRevealBtn', revealState.menuUid, 'UID: •••• •••• •••• •••••', `UID: ${formatUidSpaced(acc.uid)}`);
-    document.getElementById('menuCopyUidBtn').classList.toggle('hidden', !revealState.menuUid);
-
-    const rBadge = document.getElementById('menuPilotRoleBadge');
-    rBadge.className = acc.isDev ? 'badge badge-cyan mono' : 'badge hidden';
-    rBadge.innerText = acc.isDev ? 'DEV' : '';
-
-    const sBest = (acc.stats.seasonScores && acc.stats.seasonScores[st.seasonNum]) || 0;
-    setTextCached('menuStatSeasonBest', sBest.toLocaleString());
-    setTextCached('menuStatAllBest', (acc.stats.allTimeBest || 0).toLocaleString());
-    setTextCached('menuStatBestEpoch', `Ep ${acc.stats.bestEpoch || 1}`);
-    setTextCached('menuStatFlashes', (acc.stats.totalFlashes || 0).toLocaleString());
-
-    setTextCached('hudPilotCallsign', acc.name.toUpperCase());
-    document.getElementById('hudPilotDot').style.background = acc.custom.bodySecondary;
-
-    setTextCached('profNameDisplay', acc.name);
-    renderRevealButton('profTagRevealBtn', revealState.profTag, 'ID: #••••', `ID: #${acc.tag}`);
-    renderRevealButton('profUidRevealBtn', revealState.profUid, '•••• •••• •••• •••••', formatUidSpaced(acc.uid));
-    document.getElementById('copyUidBtn').classList.toggle('hidden', !revealState.profUid);
-
-    const nInp = document.getElementById('profEditNameInput'), tInp = document.getElementById('profEditTagInput');
-    if (nInp && document.activeElement !== nInp) nInp.value = acc.name;
-    if (tInp && document.activeElement !== tInp) tInp.value = acc.tag;
-
-    const pr = document.getElementById('profRoleDisplay');
-    pr.innerText = acc.isDev ? 'DEV' : 'PILOT'; pr.className = acc.isDev ? 'badge badge-cyan mono' : 'badge mono';
-    setTextCached('profCreatedDisplay', new Date(acc.createdAt || Date.now()).toLocaleDateString());
-    setTextCached('profRunsDisplay', String(acc.stats.totalRuns || 0));
-    const owned = SEASON_FX_SKINS.filter(sk => sk.id !== 'standard' && hasNitroSkinUnlocked(acc, sk.id));
-    setTextCached('profRewardsDisplay', acc.isDev ? 'All Unlocked' : (owned.length ? owned.map(s => s.name).join(', ') : 'None'));
-    document.getElementById('profDeleteSection').classList.toggle('hidden', Boolean(acc.isDev));
-}
-
-async function deleteActiveAccountSelf() {
-    if (!activeAccount || activeAccount.isDev) return;
-    const ok = await askConfirm({ title: 'Delete Your Account?', body: `Permanently delete "${activeAccount.name}" and all scores across all browsers?\nYour 17-digit UID will be released immediately.`, okLabel: 'Delete Account' });
-    if (!ok) return;
-    await deleteAccountByUid(activeAccount.uid, false);
-}
-
-async function deleteAccountByUid(uid, askDevConfirm = true) {
-    if (!uid || uid === CANONICAL_DEV_UID) return;
-    const target = accountsCache[uid]; if (!target) return;
-    if (askDevConfirm) {
-        const ok = await askConfirm({ title: 'Delete Account?', body: `Delete pilot "${target.name}" (#${target.tag})\nUID: ${formatUidSpaced(target.uid)}\n\nWipes account & scores live across all connected browsers.`, okLabel: 'Delete' });
-        if (!ok) return;
-    }
-    const now = Date.now();
-    syncMeta.deletedUids[uid] = true; saveSyncMeta();
-    applyAccountDeleteLocally(uid, false);
-    publishRealtimeEvent('acc_delete', { uid, ts: now });
-    renderDevAccountsList();
-    if (document.getElementById('leaderboardModal').style.display === 'flex') renderLeaderboardList();
-    showToast(`Deleted "${target.name}" live.`, 'ok'); playSfx('pickup');
-}
-
-function refreshSeasonUI() {
-    const st = seasonStatusCache, cd = formatCountdown(st.remainingMs);
-    const pill = document.getElementById('menuSeasonPill'), stTxt = document.getElementById('menuSeasonStatusText'), lbSub = document.getElementById('lbSeasonHeaderSub');
-    if (st.phase === 'ACTIVE') {
-        if (pill) { pill.className = 'badge badge-amber mono'; pill.innerText = `S${st.seasonNum} • ${cd}`; }
-        if (stTxt) stTxt.innerText = `SEASON ${st.seasonNum} • ${cd} LEFT`;
-        if (lbSub) lbSub.innerText = currentLbTab === 'season' ? `Season ${st.seasonNum} • ${cd} remaining` : 'All-Time Hall of Fame';
-    } else {
-        if (pill) { pill.className = 'badge badge-sky mono'; pill.innerText = `GAP • S${st.nextSeasonNum} in ${cd}`; }
-        if (stTxt) stTxt.innerText = `OFF-SEASON GAP (S${st.nextSeasonNum} in ${cd})`;
-        if (lbSub) lbSub.innerText = currentLbTab === 'season' ? `Off-Season Gap • Season ${st.nextSeasonNum} in ${cd}` : 'All-Time Hall of Fame';
-    }
-    updateTopLeaderBanner();
-}
-
-function updateTopLeaderBanner() {
-    const top = lbAllCache[0] || getSeasonLbFor(seasonStatusCache.seasonNum)[0] || null;
-    if (top && top.score > 0) {
-        setTextCached('menuTopLeaderName', top.name); setTextCached('menuTopLeaderScore', `(${Number(top.score).toLocaleString()})`);
-        setTextCached('hudLeaderMini', `${top.name.split(' ')[0]} (${Number(top.score).toLocaleString()})`);
-    } else { setTextCached('menuTopLeaderName', 'Unclaimed'); setTextCached('menuTopLeaderScore', ''); setTextCached('hudLeaderMini', 'Unclaimed'); }
-}
-
-// INBOX
-function refreshInboxBadgeUI() {
-    const unread = activeAccount ? (activeAccount.inbox || []).filter(m => !m.read).length : 0;
-    const b = document.getElementById('menuInboxBadge');
-    if (b) { b.innerText = String(unread); b.classList.toggle('hidden', unread === 0); }
-    setTextCached('inboxUnreadCountBadge', `${unread} Unread`);
-}
-function openInboxModal() {
-    if (!activeAccount) { showToast('Sign in or create an account first.', 'err'); return; }
-    syncSeasonLifecycle(); renderInboxList();
-    document.getElementById('inboxModal').style.display = 'flex'; syncCursorVisibility();
-}
-function closeInboxModal() { document.getElementById('inboxModal').style.display = 'none'; refreshInboxBadgeUI(); syncCursorVisibility(); }
-function renderInboxList() {
-    const el = document.getElementById('inboxListContainer'); if (!el || !activeAccount) return;
-    refreshInboxBadgeUI();
-    const mails = activeAccount.inbox || [];
-    if (!mails.length) { el.innerHTML = '<div class="recessed-well" style="padding:24px;text-align:center;color:var(--text-muted);">Inbox is empty.</div>'; return; }
-    const st = seasonStatusCache;
-    el.innerHTML = mails.map(m => {
-        let rw = '';
-        if (m.reward) {
-            const exp = (st.phase === 'ACTIVE' && m.reward.validForSeason < st.seasonNum) || (st.phase === 'GAP' && m.reward.validForSeason <= st.seasonNum);
-            rw = exp
-                ? `<div class="recessed-well row-between" style="padding:7px 9px;margin-top:7px;"><span class="mono" style="font-size:10px;color:var(--text-dim);">🎁 ${escapeHtml(m.reward.skinName)} (S${m.reward.validForSeason})</span><span class="badge mono">EXPIRED</span></div>`
-                : (m.reward.claimed
-                    ? `<div class="recessed-well row-between" style="padding:7px 9px;margin-top:7px;border-color:rgba(16,185,129,0.35);"><span class="mono" style="font-size:10px;color:#34d399;">🎁 ${escapeHtml(m.reward.skinName)} (S${m.reward.validForSeason})</span><span class="badge badge-emerald mono">CLAIMED</span></div>`
-                    : `<div class="recessed-well row-between" style="padding:7px 9px;margin-top:7px;border-color:rgba(245,158,11,0.45);"><span class="mono" style="font-size:10px;color:#fcd34d;">🎁 ${escapeHtml(m.reward.skinName)} (S${m.reward.validForSeason})</span><button type="button" class="btn btn-xs btn-amber" onclick="event.stopPropagation();claimInboxReward('${escapeHtml(m.id)}')">Claim</button></div>`);
+    audioSettings.ostMode=mode;
+    ['synth','mitadru','custom'].forEach(m=>{
+        const btn=document.getElementById(`ostBtn_${m}`);
+        if(!btn)return;
+        if(m==='mitadru'&&currentPilot.id!=='1117'){
+            btn.classList.add('hidden');
+            btn.style.display='none';
+            return;
         }
-        return `<div class="mail-item ${m.read ? '' : 'unread'}" onclick="markMailRead('${escapeHtml(m.id)}')"><div class="row-between"><strong style="font-size:12px;color:#fff;">${escapeHtml(m.title)}</strong><span class="mono" style="font-size:9px;color:var(--text-dim);">${new Date(m.ts).toLocaleString()}</span></div><div class="mono" style="font-size:9px;color:#7dd3fc;margin-top:1px;">${escapeHtml(m.sender)}</div><div style="font-size:11.5px;color:#cbd5e1;margin-top:5px;white-space:pre-line;line-height:1.45;">${escapeHtml(m.body)}</div>${rw}</div>`;
-    }).join('');
-}
-function markMailRead(id) { if (!activeAccount) return; const m = activeAccount.inbox.find(x => x.id === id); if (m && !m.read) { m.read = true; saveAccountsCache(); renderInboxList(); } }
-function markAllInboxRead() { if (!activeAccount) return; activeAccount.inbox.forEach(m => { m.read = true; }); saveAccountsCache(); renderInboxList(); }
-function clearReadInboxMail() { if (!activeAccount) return; activeAccount.inbox = activeAccount.inbox.filter(m => !m.read || (m.reward && !m.reward.claimed)); saveAccountsCache(); renderInboxList(); }
-function claimInboxReward(id) {
-    if (!activeAccount) return;
-    const m = activeAccount.inbox.find(x => x.id === id);
-    if (!m || !m.reward || m.reward.claimed) return;
-    m.reward.claimed = true; m.read = true;
-    const sk = (activeAccount.seasonalSkins || []).find(s => s.skinId === m.reward.skinId && s.validForSeason === m.reward.validForSeason);
-    if (sk) sk.claimed = true; else activeAccount.seasonalSkins.push({ skinId: m.reward.skinId, wonSeason: m.reward.wonSeason, validForSeason: m.reward.validForSeason, claimed: true, expired: false, rank: m.reward.rank });
-    activeAccount.custom.nitroSkin = m.reward.skinId; activeAccount.updatedAt = Date.now();
-    saveAccountsCache(); syncAccountMetaInLeaderboards(activeAccount);
-    publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) });
-    playSfx('pickup'); renderInboxList(); buildGarageUI(); refreshMenuAccountUI();
-    showToast(`Claimed & equipped ${m.reward.skinName}!`, 'ok');
-}
-
-// LEADERBOARD
-function openLeaderboardModal() {
-    if (!activeAccount) { showToast('Sign in or create an account first.', 'err'); return; }
-    syncSeasonLifecycle(); refreshSeasonUI();
-    document.getElementById('lbDevManageBtn').classList.toggle('hidden', !(activeAccount && activeAccount.isDev));
-    renderLeaderboardList();
-    document.getElementById('leaderboardModal').style.display = 'flex'; syncCursorVisibility();
-}
-function closeLeaderboardModal() { document.getElementById('leaderboardModal').style.display = 'none'; syncCursorVisibility(); }
-function switchLeaderboardTab(tab) {
-    currentLbTab = tab;
-    document.getElementById('lbTabSeason').classList.toggle('active', tab === 'season');
-    document.getElementById('lbTabAllTime').classList.toggle('active', tab === 'alltime');
-    refreshSeasonUI(); renderLeaderboardList();
-}
-function toggleLbDevManage() {
-    if (!activeAccount || !activeAccount.isDev) return;
-    lbDevManageMode = !lbDevManageMode;
-    document.getElementById('lbDevManageBtn').innerText = lbDevManageMode ? '✓ Done' : '🛠️ Manage';
-    renderLeaderboardList();
-}
-function renderLeaderboardList() {
-    const el = document.getElementById('leaderboardListContainer'); if (!el) return;
-    const list = currentLbTab === 'season' ? getSeasonLbFor(seasonStatusCache.seasonNum) : lbAllCache;
-    if (!list.length) { el.innerHTML = '<div class="recessed-well" style="padding:24px;text-align:center;color:var(--text-muted);">No runs recorded yet.</div>'; return; }
-    const medals = ['🥇 #1', '🥈 #2', '🥉 #3'];
-    el.innerHTML = list.map((e, i) => {
-        const isSelf = activeAccount && activeAccount.uid === e.uid, isTop = i === 0;
-        const cls = ['lb-card', e.isPrism ? 'lb-card-prism' : (isTop ? 'lb-card-top5' : ''), isSelf ? 'lb-card-self' : ''].join(' ');
-        const devActions = (activeAccount && activeAccount.isDev && lbDevManageMode)
-            ? `<div class="row-wrap" style="gap:4px;"><button type="button" class="btn btn-xs btn-amber" onclick="devResetSpecificScore('${escapeHtml(e.uid)}')">Reset Score</button>${e.uid === CANONICAL_DEV_UID ? '' : `<button type="button" class="btn btn-xs btn-danger" onclick="deleteAccountByUid('${escapeHtml(e.uid)}')">Del Acc</button>`}</div>` : '';
-        const uidSub = (activeAccount && activeAccount.isDev && lbDevManageMode) ? ` &bull; #${escapeHtml(e.tag)} &bull; ${escapeHtml(e.uid)}` : '';
-        return `<div class="${cls}"><div class="row" style="min-width:0;flex:1 1 180px;"><span class="badge mono" style="color:#fff;min-width:44px;justify-content:center;">${medals[i] || '#' + (i + 1)}</span><div style="min-width:0;flex:1;"><div class="row-wrap" style="gap:5px;"><span style="width:8px;height:8px;border-radius:50%;background:${escapeHtml(e.accent || '#38bdf8')};"></span><strong class="truncate" style="font-size:12px;color:#fff;">${escapeHtml(e.name)}</strong>${e.isDev ? '<span class="badge badge-cyan mono">DEV</span>' : ''}${isSelf ? '<span class="badge badge-emerald mono">YOU</span>' : ''}</div><div class="mono truncate" style="font-size:9px;color:var(--text-dim);">Ep ${e.epoch || 1}${uidSub}</div></div></div><div class="row-wrap" style="flex-shrink:0;"><span class="mono" style="font-size:14px;font-weight:800;color:#34d399;">${Number(e.score).toLocaleString()}</span>${devActions}</div></div>`;
-    }).join('');
-}
-
-// GARAGE
-function toggleGarageNitroPreview() {
-    garageNitroPreviewOn = !garageNitroPreviewOn;
-    const b = document.getElementById('garageNitroPreviewBtn');
-    if (b) { b.innerText = garageNitroPreviewOn ? '🔥 Nitro: ON' : '🔥 Nitro: OFF'; b.className = garageNitroPreviewOn ? 'btn btn-xs btn-amber' : 'btn btn-xs'; }
-    playSfx(garageNitroPreviewOn ? 'nitro' : 'uiClick');
-}
-function triggerGarageEmpPreview() { garageEmpPreviewRadius = 10; playSfx('emp'); }
-function buildGarageUI() {
-    const cust = activeAccount ? activeAccount.custom : DEFAULT_VEHICLE_CUST;
-    const nb = document.getElementById('garageNitroPreviewBtn');
-    if (nb) { nb.innerText = garageNitroPreviewOn ? '🔥 Nitro: ON' : '🔥 Nitro: OFF'; nb.className = garageNitroPreviewOn ? 'btn btn-xs btn-amber' : 'btn btn-xs'; }
-
-    ['bodyPrimary', 'bodySecondary', 'canopyColor', 'empColor', 'boostColor'].forEach(ch => {
-        const inp = document.getElementById(`custColor_${ch}`); if (inp) inp.value = cust[ch] || DEFAULT_VEHICLE_CUST[ch];
-        const sw = document.getElementById(`swatch_${ch}`);
-        if (sw) sw.innerHTML = COLOR_SWATCHES[ch].map(hex => `<button type="button" class="swatch-btn ${(cust[ch] || '').toLowerCase() === hex.toLowerCase() ? 'active' : ''}" style="background:${hex};" onclick="setCustomVehicleColor('${ch}','${hex}')"></button>`).join('');
+        btn.className=(m===mode)
+            ?"p-2 rounded-xl text-left border bg-sky-500/20 border-sky-400 text-white cursor-pointer"
+            :"p-2 rounded-xl text-left border bg-[#141824] border-[#262f45] text-gray-300 cursor-pointer";
     });
-    const grid = document.getElementById('nitroSkinSelectorGrid');
-    if (grid) {
-        grid.innerHTML = SEASON_FX_SKINS.map(sk => {
-            const unl = hasNitroSkinUnlocked(activeAccount, sk.id), eq = (cust.nitroSkin || 'standard') === sk.id, statusLbl = getSkinStatusLabel(activeAccount, sk.id);
-            const tierBadge = sk.tier === 'alltime1' ? '<span class="badge badge-violet mono" style="font-size:8px;">ALL-TIME #1</span>' : (sk.tier === 'top5' ? '<span class="badge badge-amber mono" style="font-size:8px;">TOP 5</span>' : '');
-            if (!unl) return `<div class="recessed-well ${sk.cardClass}" style="padding:8px 10px;opacity:0.56;"><div class="row-between"><span class="mono" style="font-size:10.5px;font-weight:700;color:#cbd5e1;">🔒 ${sk.name}</span>${tierBadge}</div><div style="font-size:9.5px;color:var(--text-muted);margin-top:3px;line-height:1.35;">${sk.desc}</div><div class="mono" style="font-size:8.5px;color:#fcd34d;margin-top:4px;">${statusLbl}</div></div>`;
-            return `<button type="button" class="recessed-well ${sk.cardClass}" style="padding:8px 10px;text-align:left;cursor:pointer;border-width:${eq ? '1.8px' : '1px'};box-shadow:${eq ? '0 0 0 1px rgba(56,189,248,0.6)' : 'none'};" onclick="selectNitroSkin('${sk.id}')"><div class="row-between"><strong style="font-size:11px;color:#fff;">${sk.name}</strong><div class="row" style="gap:4px;">${tierBadge}${eq ? '<span class="badge badge-sky mono" style="font-size:8px;">ON</span>' : ''}</div></div><div style="font-size:9.5px;color:#cbd5e1;margin-top:3px;line-height:1.35;">${sk.desc}</div><div class="mono" style="font-size:8.5px;color:#34d399;margin-top:4px;">${statusLbl}</div></button>`;
+    const shortLabel=document.getElementById('hudOstShortLabel');
+    const statusEl=document.getElementById('ostLockStatus');
+    if(shortLabel)shortLabel.innerText=mode==='mitadru'?"MIXTAPE":(mode==='custom'?"CUSTOM":"SYNTH");
+    if(statusEl)statusEl.innerText=mode==='mitadru'?"Mixtape Active":(mode==='custom'?"Custom Song Active":"Cyber-Synth Active");
+    syncExternalTrackPlayback();
+    saveSettingsForActiveAccount();
+}
+
+function playGodModeToggleSfx(enabled){
+    if(audioSettings.master<=0.01||!isAppAudible()||!hasTrustedGesture)return;
+    try{
+        const actx=ensureAudioEngine();
+        if(!actx||actx.state!=='running')return;
+        const now=actx.currentTime,sVol=Math.max(0.2,audioSettings.sfx);
+        const out=sfxBusNode||masterGainNode;
+        const notes=enabled?[440.0,554.37,659.25,880.0,1174.66]:[880.0,659.25,493.88,329.63];
+        notes.forEach((freq,idx)=>{
+            const o=actx.createOscillator(),g=actx.createGain(),st=now+idx*0.045;
+            o.type=enabled?'triangle':'sawtooth';
+            o.frequency.setValueAtTime(freq,st);
+            g.gain.setValueAtTime(0.001,st);
+            g.gain.linearRampToValueAtTime(0.18*sVol,st+0.008);
+            g.gain.exponentialRampToValueAtTime(0.001,st+0.24);
+            o.connect(g);g.connect(out);
+            o.start(st);o.stop(st+0.25);
+        });
+    }catch(e){}
+}
+
+function ensureDevGodModeButtonUI(){
+    const devToggleBtn=document.getElementById('devToggleDimsBtn');
+    if(!devToggleBtn||document.getElementById('devGodModeToggleBtn'))return;
+    const grid=devToggleBtn.parentElement;
+    if(!grid)return;
+    grid.className="grid grid-cols-2 sm:grid-cols-4 gap-1.5";
+    const godBtn=document.createElement('button');
+    godBtn.type='button';
+    godBtn.id='devGodModeToggleBtn';
+    godBtn.onclick=toggleDevGodMode;
+    grid.insertBefore(godBtn,grid.firstChild);
+    syncDevGodModeButtonUI();
+}
+
+function syncDevGodModeButtonUI(){
+    const btn=document.getElementById('devGodModeToggleBtn');
+    if(!btn)return;
+    if(devGodModeActive&&currentPilot.id==='1117'){
+        btn.innerText="⚡ GOD MODE: ACTIVE";
+        btn.className="god-mode-btn-active p-2 rounded-xl text-[10.5px] mono-num font-extrabold cursor-pointer text-center transition";
+    }else{
+        btn.innerText="🛡️ God Mode: OFF";
+        btn.className="p-2 rounded-xl bg-cyan-950/70 hover:bg-cyan-800/80 text-cyan-200 border border-cyan-500/40 text-[10.5px] mono-num font-bold cursor-pointer text-center transition";
+    }
+}
+
+function toggleDevGodMode(){
+    if(currentPilot.id!=='1117')return;
+    devGodModeActive=!devGodModeActive;
+    if(devGodModeActive){
+        gameState.armor=100;
+        gameState.nitroFuel=100;
+        gameState.empCharge=100;
+        updateHudDOM(true);
+    }
+    syncDevGodModeButtonUI();
+    playGodModeToggleSfx(devGodModeActive);
+    showDevConsoleFeedback(devGodModeActive?"⚡ GOD MODE ENGAGED: Infinite Hull, Nitro & EMP Active!":"🛡️ God Mode Deactivated.");
+}
+
+function toggleVoidNitroMode(){
+    gfxSettings.voidChromaNitro=!gfxSettings.voidChromaNitro;
+    buildVehicleLiverySelector();
+    saveSettingsForActiveAccount();
+}
+
+function buildVehicleLiverySelector(){
+    const container=document.getElementById('vehicleLiveryGrid');
+    const hint=document.getElementById('liveryAccessHint');
+    if(!container)return;
+    const isArch=(currentPilot.id==="1117");
+    if(hint){
+        if(activeLiveryProfile.isVoidChroma){
+            const isPrisma=(gfxSettings.voidChromaNitro!==false);
+            hint.innerHTML=`<span class="hidden sm:inline">${isArch?"👑 ID 1117":"Active"} • </span><button type="button" onclick="toggleVoidNitroMode()" class="px-2 py-0.5 rounded bg-purple-500/20 hover:bg-purple-500/35 border border-cyan-400/50 text-[9.5px] mono-num font-extrabold text-cyan-200 cursor-pointer transition">${isPrisma?"🌈 Nitro: Prismatic Chroma":"🟠 Nitro: Default Flame"}</button>`;
+        }else{
+            hint.innerText=isArch?"👑 ID 1117: All Liveries Unlocked":`Assigned: ${activeLiveryProfile.liveryName}`;
+        }
+    }
+    container.innerHTML=["1117","1183","1134","1075","1174","GUEST"].map(k=>{
+        const p=PILOT_PROFILES[k];
+        const unlocked=isArch||(currentPilot.id===k);
+        const sel=(activeLiveryProfile.id===k);
+        if(!unlocked)return `<button type="button" disabled class="px-2 py-1.5 rounded-lg text-[10px] font-semibold text-left truncate border bg-[#0b0d14] border-[#1b202e] text-gray-600 opacity-55 cursor-not-allowed">🔒 ${p.liveryName}</button>`;
+        return `<button type="button" onclick="selectVehicleLivery('${k}')" class="px-2 py-1.5 rounded-lg text-[10px] font-bold text-left truncate cursor-pointer border flex items-center gap-1.5 ${sel?'bg-sky-500/25 border-sky-400 text-white':'bg-[#121621] border-[#22293a] text-gray-300 hover:text-white'}"><span class="w-2 h-2 rounded-full shrink-0" style="background:${p.dotColor}"></span><span class="truncate">${p.liveryName}</span></button>`;
+    }).join('');
+}
+
+function selectVehicleLivery(k){
+    if(currentPilot.id!=="1117"&&currentPilot.id!==k)return;
+    activeLiveryProfile=PILOT_PROFILES[k]||currentPilot;
+    if(activeLiveryProfile.isVoidChroma){
+        gfxSettings.voidChromaNitro=true;
+    }
+    document.getElementById('activeLiveryBadge').innerText=activeLiveryProfile.liveryName;
+    document.getElementById('activePilotColorDot').style.backgroundColor=activeLiveryProfile.dotColor;
+    document.getElementById('hudPilotDot').style.backgroundColor=activeLiveryProfile.dotColor;
+    buildVehicleLiverySelector();
+    saveSettingsForActiveAccount();
+}
+
+function buildGraphicsUI(){
+    injectCustomFilterAndGodStyles();
+    ensureDevGodModeButtonUI();
+    syncMixtapeOstVisibilityUI();
+    const pSld=document.getElementById('gfxParticleSlider');
+    if(pSld)pSld.step='1';
+
+    const pGrid=document.getElementById('gfxPresetButtonsGrid');
+    if(pGrid){
+        pGrid.innerHTML=['low','medium','high','ultra'].map(k=>{
+            const p=GRAPHICS_PRESETS[k];
+            const active=(gfxSettings.preset===k);
+            return `<button type="button" onclick="applyGraphicsPreset('${k}',true)" class="py-1.5 px-2 rounded-lg text-[10.5px] font-bold cursor-pointer border truncate ${active?'bg-sky-500 text-black border-sky-400':'bg-[#151a26] text-gray-300 border-[#262f45] hover:text-white'}">${p.title}</button>`;
         }).join('');
     }
-    setTextCached('nitroSkinAccessHint', activeAccount && activeAccount.isDev ? 'Dev: All Unlocked' : 'All-Time #1 & Season Top 5');
-}
-function setCustomVehicleColor(ch, hex) {
-    if (!activeAccount) return;
-    activeAccount.custom[ch] = hex; activeAccount.updatedAt = Date.now();
-    saveAccountsCache(); syncAccountMetaInLeaderboards(activeAccount);
-    buildGarageUI(); refreshMenuAccountUI();
-    if (colorSyncDebounceTimer) clearTimeout(colorSyncDebounceTimer);
-    colorSyncDebounceTimer = setTimeout(() => { if (activeAccount) publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) }); }, 1200);
-}
-function applyGaragePreset(k) {
-    if (!activeAccount || !GARAGE_PRESETS[k]) return;
-    activeAccount.custom = { ...activeAccount.custom, ...GARAGE_PRESETS[k] }; activeAccount.updatedAt = Date.now();
-    saveAccountsCache(); syncAccountMetaInLeaderboards(activeAccount);
-    publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) });
-    buildGarageUI(); refreshMenuAccountUI(); playSfx('uiClick');
-}
-function selectNitroSkin(id) {
-    if (!activeAccount || !hasNitroSkinUnlocked(activeAccount, id)) return;
-    activeAccount.custom.nitroSkin = id; activeAccount.updatedAt = Date.now();
-    saveAccountsCache(); syncAccountMetaInLeaderboards(activeAccount);
-    publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) });
-    buildGarageUI(); refreshQuickLoadoutStrip();
-    const sk = SEASON_FX_SKINS.find(s => s.id === id);
-    if (sk) showToast(`Equipped ${sk.name}`, 'ok'); playSfx('pickup');
-}
-function resetVehicleCustomization() {
-    if (!activeAccount) return;
-    activeAccount.custom = { ...DEFAULT_VEHICLE_CUST }; activeAccount.updatedAt = Date.now();
-    saveAccountsCache(); syncAccountMetaInLeaderboards(activeAccount);
-    publishRealtimeEvent('acc_upsert', { acc: packAccountForSync(activeAccount) });
-    buildGarageUI(); refreshMenuAccountUI(); showToast('Vehicle colors reset.');
+    const tGrid=document.getElementById('gfxTogglesGrid');
+    if(tGrid){
+        tGrid.className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 pt-1";
+        tGrid.innerHTML=GFX_TOGGLE_META.map(t=>`<button type="button" id="gfxToggle_${t.k}" onclick="toggleGfxOption('${t.k}')" class="p-1.5 rounded-lg text-[10px] font-bold cursor-pointer truncate"></button>`).join('');
+        GFX_TOGGLE_META.forEach(t=>applyGfxOptionState(t.k,gfxSettings[t.k],false));
+    }
+    const fGrid=document.getElementById('gfxFilterButtonsGrid');
+    if(fGrid){
+        const parentWell=fGrid.parentElement;
+        if(parentWell&&!document.getElementById('deactivateOpticFilterBtn')){
+            const hdr=parentWell.firstElementChild;
+            if(hdr){
+                hdr.className="flex items-center justify-between gap-2";
+                hdr.innerHTML=`
+                    <span class="font-bold text-white uppercase text-[11px] mono-num">🎬 Optic Color Grade</span>
+                    <button type="button" id="deactivateOpticFilterBtn" onclick="setVisualFilter('filter-standard')" class="hidden px-2 py-0.5 rounded-md bg-red-500/20 hover:bg-red-500/35 text-red-300 border border-red-500/40 text-[9.5px] mono-num font-extrabold cursor-pointer transition">✕ Deactivate Filter</button>
+                `;
+            }
+        }
+        fGrid.innerHTML=OPTIC_FILTER_META.map(f=>`<button type="button" onclick="setVisualFilter('${f.k}')" id="flt_${f.k}" class="p-2 rounded-lg text-[10.5px] font-semibold cursor-pointer truncate"></button>`).join('');
+        setVisualFilter(VALID_OPTIC_FILTERS.has(gfxSettings.filter)?gfxSettings.filter:'filter-standard',false);
+    }
 }
 
-// SETTINGS HUB
-function openSettingsModal(tab = 'game') {
-    if (!activeAccount) { showToast('Sign in or create an account first.', 'err'); return; }
-    ensureAudioEngine();
-    if (gameState.running && !gameState.paused) { gameState.paused = true; nextGameNoteT = 0; nextMenuNoteT = 0; syncExternalTracks(); updateEnginePitch(); updateEqVisuals(false); }
-    setTextCached('settingsModalTitle', gameState.running ? 'PAUSED' : 'SETTINGS');
-    document.getElementById('resumeOrCloseSettingsBtn').innerText = gameState.running ? '▶ Resume' : '← Back';
-    document.getElementById('inGameRestartBtn').classList.toggle('hidden', !gameState.running);
-    document.getElementById('inGameMenuBtn').classList.toggle('hidden', !gameState.running);
-    syncDevUiVisibility(); switchSettingsTab(tab);
-    buildBiomeSelectorGrid(); buildGarageUI(); buildGraphicsUI(); syncOstButtonsUI(); refreshMenuAccountUI(); renderDevAccountsList(); renderDevCustomSongsList();
-    document.getElementById('pauseSettingsModal').style.display = 'flex';
-    if (tab === 'garage') setTimeout(syncGarageCanvasResolution, 30);
-    syncCursorVisibility();
-}
-function resumeFromSettings() {
-    ensureAudioEngine();
-    document.getElementById('pauseSettingsModal').style.display = 'none';
-    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
-    if (gameState.running) {
-        if (isMobileHardware) requestMobileFullscreenSafe();
-        if (globalSettings.controls.mobileMode === 'tilt') calibrateTiltSensor(true);
-        gameState.paused = false; nextGameNoteT = 0; nextMenuNoteT = 0;
-        syncExternalTracks(); updateEnginePitch(); updateEqVisuals(true);
+function setVisualFilter(fc,shouldSave=true){
+    injectCustomFilterAndGodStyles();
+    const safeFilter=VALID_OPTIC_FILTERS.has(fc)?fc:'filter-standard';
+    gfxSettings.filter=safeFilter;
+    canvas.className=safeFilter;
+
+    const ov=document.getElementById('atmosphereOverlay');
+    if(ov){
+        ov.classList.toggle('atmo-filter-warm',safeFilter==='filter-warm');
+        ov.classList.toggle('atmo-filter-vintage',safeFilter==='filter-vintage');
+        ov.classList.toggle('atmo-filter-cinematic',safeFilter==='filter-cinematic');
     }
-    syncCursorVisibility();
-}
-function switchSettingsTab(tab) {
-    if (tab === 'dev' && !(activeAccount && activeAccount.isDev)) tab = 'game';
-    currentSettingsTab = tab;
-    if (tab !== 'profile') { revealState.profTag = false; revealState.profUid = false; }
-    ['game', 'garage', 'profile', 'sounds', 'controls', 'graphics', 'dev'].forEach(t => {
-        const p = document.getElementById(`setTab_${t}`), b = document.getElementById(`setTabBtn_${t}`);
-        if (p) p.classList.toggle('hidden', t !== tab);
-        if (b) b.classList.toggle('active', t === tab);
+
+    OPTIC_FILTER_META.forEach(f=>{
+        const btn=document.getElementById(`flt_${f.k}`);
+        if(!btn)return;
+        btn.innerText=f.lbl;
+        btn.className=(f.k===safeFilter)
+            ?"p-2 rounded-lg text-[10.5px] font-bold bg-sky-500 text-black cursor-pointer truncate"
+            :"p-2 rounded-lg text-[10.5px] font-semibold bg-[#151a26] text-gray-300 border border-[#262f45] hover:text-white cursor-pointer truncate";
     });
-    if (tab === 'garage') setTimeout(syncGarageCanvasResolution, 20);
-    if (tab === 'profile') refreshMenuAccountUI();
-    if (tab === 'dev') { renderDevAccountsList(); renderDevCustomSongsList(); }
-}
-function syncDevUiVisibility() {
-    const isDev = Boolean(activeAccount && activeAccount.isDev);
-    document.getElementById('setTabBtn_dev').classList.toggle('hidden', !isDev);
-    document.getElementById('hudDevRefillBtn').classList.toggle('hidden', !isDev);
-    const gm = document.getElementById('devGodModeBtn');
-    if (gm) { gm.innerText = (devGodModeActive && isDev) ? '⚡ God Mode: ON' : 'God Mode: OFF'; gm.className = (devGodModeActive && isDev) ? 'btn btn-xs btn-god-active' : 'btn btn-xs btn-sky'; }
+    const deactBtn=document.getElementById('deactivateOpticFilterBtn');
+    if(deactBtn){
+        deactBtn.classList.toggle('hidden',safeFilter==='filter-standard');
+    }
+    if(shouldSave)saveSettingsForActiveAccount();
 }
 
-function setDifficulty(key) {
-    globalSettings.difficulty = DIFFICULTY_PRESETS[key] ? key : 'easy';
-    setTextCached('diffCurrentLabel', DIFFICULTY_PRESETS[globalSettings.difficulty].label);
-    ['easy', 'normal', 'hard', 'void'].forEach(k => { const b = document.getElementById(`diffBtn_${k}`); if (b) b.className = k === globalSettings.difficulty ? 'btn btn-sm btn-emerald active' : 'btn btn-sm'; });
-    refreshQuickLoadoutStrip(); saveGlobalSettings();
-}
-function buildBiomeSelectorGrid() {
-    const el = document.getElementById('biomeGridSelector'), ab = document.getElementById('autoBiomeToggleBtn');
-    if (ab) { ab.innerText = globalSettings.autoCycleBiomes ? 'Auto-Cycle: ON' : 'Auto-Cycle: OFF'; ab.className = globalSettings.autoCycleBiomes ? 'btn btn-xs btn-emerald' : 'btn btn-xs'; }
-    if (!el) return;
-    el.innerHTML = BIOME_THEMES.map((b, i) => {
-        const unl = isBiomeUnlockedForAccount(i);
-        if (!unl) return `<button type="button" disabled class="btn btn-xs" style="justify-content:flex-start;opacity:0.45;">🔒 ${b.isEpoch250Special ? 'Ep 250' : 'Ep ' + b.unlockEpoch} • ${b.label}</button>`;
-        return `<button type="button" class="btn btn-xs ${i === biomeIdx ? 'btn-sky active' : ''}" style="justify-content:flex-start;" onclick="selectManualBiome(${i})">${b.label}</button>`;
-    }).join('');
-}
-function selectManualBiome(i) { if (!isBiomeUnlockedForAccount(i)) return; biomeIdx = i; globalSettings.selectedBiomeIdx = i; globalSettings.autoCycleBiomes = false; cachedGradients.key = ''; setTextCached('hudBiomeName', BIOME_THEMES[biomeIdx].label); buildBiomeSelectorGrid(); refreshQuickLoadoutStrip(); saveGlobalSettings(); }
-function toggleAutoBiomeCycle() { globalSettings.autoCycleBiomes = !globalSettings.autoCycleBiomes; buildBiomeSelectorGrid(); saveGlobalSettings(); }
-function resetGameSettingsOnly() { setDifficulty('easy'); globalSettings.autoCycleBiomes = true; globalSettings.selectedBiomeIdx = 0; biomeIdx = 0; cachedGradients.key = ''; setTextCached('hudBiomeName', BIOME_THEMES[0].label); buildBiomeSelectorGrid(); refreshQuickLoadoutStrip(); saveGlobalSettings(); }
-
-function buildVolumeSlidersUI() {
-    const sl = [{ k: 'master', l: 'Master' }, { k: 'music', l: 'Game OST' }, { k: 'menuMusic', l: 'Menu Music' }, { k: 'engine', l: 'Engine' }, { k: 'sfx', l: 'SFX & EMP' }, { k: 'uiClick', l: 'UI Clicks' }];
-    document.getElementById('volumeSlidersGrid').innerHTML = sl.map(s => { const p = Math.round((globalSettings.audio[s.k] || 0) * 100); return `<div><div class="row-between" style="font-size:10px;"><span style="color:var(--text-muted);">${s.l}</span><span id="volLbl_${s.k}" style="color:#7dd3fc;">${p}%</span></div><input type="range" id="volSld_${s.k}" min="0" max="100" value="${p}" oninput="updateVolumeSetting('${s.k}',this.value)"></div>`; }).join('');
-}
-function updateVolumeSetting(ch, val) {
-    const n = Math.max(0, Math.min(100, parseInt(val, 10) || 0)) / 100;
-    globalSettings.audio[ch] = n; setTextCached(`volLbl_${ch}`, `${Math.round(n * 100)}%`);
-    const s = document.getElementById(`volSld_${ch}`); if (s && String(s.value) !== String(Math.round(n * 100))) s.value = Math.round(n * 100);
-    if (masterGain && audioCtx) masterGain.gain.setTargetAtTime(Math.max(0.0001, globalSettings.audio.master), audioCtx.currentTime, 0.03);
-    syncExternalTracks(); updateEnginePitch(); saveGlobalSettings();
-}
-function syncOstButtonsUI() {
-    const canMix = Boolean(activeAccount && activeAccount.isDev);
-    document.getElementById('ostBtn_mitadru').classList.toggle('hidden', !canMix);
-    document.getElementById('ostButtonsGrid').className = canMix ? 'grid-3' : 'grid-2';
-    const cur = globalSettings.audio.ostMode;
-    ['synth', 'mitadru', 'custom'].forEach(m => { const b = document.getElementById(`ostBtn_${m}`); if (!b) return; b.style.borderColor = m === cur ? '#38bdf8' : '#1b202b'; b.style.background = m === cur ? 'rgba(56,189,248,0.16)' : '#0b0d13'; });
-    setTextCached('hudOstShortLabel', cur === 'mitadru' ? 'MIXTAPE' : (cur === 'custom' ? 'CUSTOM' : 'SYNTH'));
-    setTextCached('ostLockStatus', cur === 'mitadru' ? 'Mixtape' : (cur === 'custom' ? 'Custom' : 'Cyber-Synth'));
-}
-function selectOstMode(mode) { if (mode === 'mitadru' && !(activeAccount && activeAccount.isDev)) mode = 'synth'; if (mode === 'custom' && !customSongObjUrl) { setTextCached('customSongStatusText', 'Upload a song first.'); return; } globalSettings.audio.ostMode = mode; syncOstButtonsUI(); syncExternalTracks(); saveGlobalSettings(); }
-function resetSoundSettingsOnly() { const def = getDefaultGlobalSettings().audio; Object.keys(def).forEach(k => { if (k !== 'ostMode') updateVolumeSetting(k, Math.round(def[k] * 100)); }); selectOstMode('synth'); }
-
-function buildGraphicsUI() {
-    document.getElementById('gfxPresetButtonsGrid').innerHTML = ['low', 'medium', 'high', 'ultra'].map(k => `<button type="button" class="btn btn-sm ${globalSettings.graphics.preset === k ? 'btn-sky active' : ''}" onclick="applyGraphicsPreset('${k}')">${GRAPHICS_PRESETS[k].title}</button>`).join('');
-    document.getElementById('gfxTogglesGrid').innerHTML = GFX_TOGGLE_META.map(t => `<button type="button" class="btn btn-xs ${globalSettings.graphics[t.k] ? 'btn-emerald' : ''}" onclick="toggleGfxOption('${t.k}')">${t.lbl}: ${globalSettings.graphics[t.k] ? 'ON' : 'OFF'}</button>`).join('');
-    document.getElementById('gfxFilterButtonsGrid').innerHTML = OPTIC_FILTER_META.map(f => `<button type="button" id="fltBtn_${f.k}" class="btn btn-xs ${globalSettings.graphics.filter === f.k ? 'btn-sky active' : ''}" onclick="setVisualFilter('${f.k}')">${f.lbl}</button>`).join('');
-    syncGfxSlidersDOM(); setVisualFilter(globalSettings.graphics.filter, false);
-}
-function syncGfxSlidersDOM() {
-    const g = globalSettings.graphics;
-    setTextCached('gfxPresetActiveLabel', (g.preset || 'medium').toUpperCase());
-    setTextCached('gfxResLabel', `${g.resScale.toFixed(2)}x`); setTextCached('gfxSlicesLabel', `${g.roadSlices} Seg`); setTextCached('gfxParticleLabel', `${Math.round(g.particles * 100)}%`);
-    document.getElementById('gfxResSlider').value = Math.round(g.resScale * 100);
-    document.getElementById('gfxSlicesSlider').value = g.roadSlices;
-    document.getElementById('gfxParticleSlider').value = Math.round(g.particles * 100);
-}
-function applyGraphicsPreset(k) { Object.assign(globalSettings.graphics, { preset: k, ...(GRAPHICS_PRESETS[k] || GRAPHICS_PRESETS.medium) }); document.getElementById('atmosphereOverlay').classList.toggle('scanlines-active', globalSettings.graphics.scanlines); buildGraphicsUI(); resizeGameCanvas(); saveGlobalSettings(); }
-function updateGfxResolution(v) { globalSettings.graphics.resScale = Math.max(60, Math.min(150, parseInt(v, 10) || 100)) / 100; syncGfxSlidersDOM(); resizeGameCanvas(); saveGlobalSettings(); }
-function updateGfxDrawSlices(v) { globalSettings.graphics.roadSlices = Math.max(16, Math.min(48, parseInt(v, 10) || 26)); syncGfxSlidersDOM(); saveGlobalSettings(); }
-function updateGfxParticles(v) { const p = parseInt(v, 10); globalSettings.graphics.particles = Math.max(0, Math.min(150, Number.isNaN(p) ? 65 : p)) / 100; syncGfxSlidersDOM(); saveGlobalSettings(); }
-function toggleGfxOption(opt) { globalSettings.graphics[opt] = !globalSettings.graphics[opt]; if (opt === 'scanlines') document.getElementById('atmosphereOverlay').classList.toggle('scanlines-active', globalSettings.graphics.scanlines); buildGraphicsUI(); saveGlobalSettings(); }
-function setVisualFilter(fc, save = true) {
-    const safe = VALID_FILTERS.has(fc) ? fc : 'filter-standard';
-    globalSettings.graphics.filter = safe; canvas.className = safe;
-    const ov = document.getElementById('atmosphereOverlay');
-    OPTIC_FILTER_META.forEach(f => { if (f.atmo) ov.classList.remove(f.atmo); });
-    const meta = OPTIC_FILTER_META.find(f => f.k === safe);
-    if (meta && meta.atmo) ov.classList.add(meta.atmo);
-    OPTIC_FILTER_META.forEach(f => { const b = document.getElementById(`fltBtn_${f.k}`); if (b) b.className = f.k === safe ? 'btn btn-xs btn-sky active' : 'btn btn-xs'; });
-    document.getElementById('deactivateOpticFilterBtn').classList.toggle('hidden', safe === 'filter-standard');
-    if (save) saveGlobalSettings();
-}
-function resetGraphicsSettingsOnly() { globalSettings.graphics = getDefaultGlobalSettings().graphics; applyGraphicsPreset('medium'); setVisualFilter('filter-standard'); }
-
-// CONTROLS
-function buildKeybindGridUI() {
-    const it = [{ k: 'left', l: 'LEFT' }, { k: 'right', l: 'RIGHT' }, { k: 'nitro', l: 'NITRO' }, { k: 'brake', l: 'BRAKE' }, { k: 'emp', l: 'EMP' }, { k: 'hideui', l: 'HUD' }];
-    document.getElementById('pcKeybindGrid').innerHTML = it.map(x => `<button type="button" class="recessed-well" style="padding:7px 9px;text-align:left;cursor:pointer;" onclick="startKeyRebind('${x.k}')"><div style="font-size:8.5px;color:var(--text-dim);">${x.l}</div><div id="bindVal_${x.k}" style="font-size:11px;font-weight:700;color:#7dd3fc;margin-top:2px;"></div></button>`).join('');
-    refreshKeybindLabels();
-}
-function startKeyRebind(act) { awaitingRebindAction = act; setTextCached(`bindVal_${act}`, 'PRESS KEY...'); }
-function refreshKeybindLabels() {
-    Object.entries(globalSettings.controls.binds).forEach(([a, ks]) => setTextCached(`bindVal_${a}`, ks.map(k => k === ' ' ? 'SPACE' : k.toUpperCase()).join(' / ')));
-    const k0 = globalSettings.controls.binds.hideui[0];
-    setTextCached('pcHideUiHintBadge', `[${k0 === ' ' ? 'SPACE' : k0.toUpperCase()}] UI • [ESC] Pause`);
+function loadOrResetSettingsForActiveAccount(){
+    isApplyingAccountSettings=true;
+    try{
+        if(currentPilot.id!=='1117'){
+            devGodModeActive=false;
+            lbAdminManageMode=false;
+        }
+        syncDevGodModeButtonUI();
+        syncMixtapeOstVisibilityUI();
+        const allSet=JSON.parse(localStorage.getItem(SETTINGS_PER_ACC_KEY)||'{}');
+        const saved=allSet[getActiveAccountStorageKey()];
+        if(saved){
+            setDifficulty(saved.diff||'easy');
+            if(saved.liveryId&&(currentPilot.id==='1117'||saved.liveryId===currentPilot.id)){
+                activeLiveryProfile=PILOT_PROFILES[saved.liveryId]||currentPilot;
+            }else{
+                activeLiveryProfile=currentPilot;
+            }
+            biomeIdx=isBiomeUnlockedForPilot(saved.biomeIdx||0)?(saved.biomeIdx||0):0;
+            autoCycleBiomes=saved.autoCycleBiomes!==undefined?Boolean(saved.autoCycleBiomes):true;
+            syncAutoBiomeButtonUI();
+            setTextCached('hudBiomeName',BIOME_THEMES[biomeIdx].label);
+            if(saved.audio){
+                ['master','music','menuMusic','engine','sfx','uiClick'].forEach(ch=>{
+                    if(saved.audio[ch]!==undefined)updateVolumeSetting(ch,Math.round(saved.audio[ch]*100));
+                });
+                selectOstMode(saved.audio.ostMode==='mitadru'&&currentPilot.id!=='1117'?'synth':(saved.audio.ostMode||'synth'));
+            }
+            if(saved.ctrl){
+                setMobileControlMode(saved.ctrl.mobileMode||'buttons');
+                applyDoubleTapNitroState(saved.ctrl.doubleTapNitro!==false);
+                controlConfig.invertGyro=Boolean(saved.ctrl.invertGyro);
+                const invBtn=document.getElementById('invertGyroBtn');
+                if(invBtn){
+                    invBtn.innerText=`⇄ Flip Axis: ${controlConfig.invertGyro?'ON':'OFF'}`;
+                    invBtn.className=controlConfig.invertGyro?"px-2 py-1 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] mono-num font-bold cursor-pointer":"px-2 py-1 rounded bg-[#182032] hover:bg-[#232f47] text-gray-200 border border-gray-600/40 text-[10px] mono-num font-bold cursor-pointer";
+                }
+                updateGyroSpeedSetting(Math.round((saved.ctrl.gyroSensitivity||0.65)*100));
+                if(saved.ctrl.binds)controlConfig.binds=saved.ctrl.binds;
+                refreshKeybindLabels();
+            }
+            if(saved.gfx){
+                applyGraphicsPreset(saved.gfx.preset||'medium',false);
+                if(saved.gfx.resScale)updateGfxResolution(Math.round(saved.gfx.resScale*100),false);
+                if(saved.gfx.roadSlices)updateGfxDrawSlices(saved.gfx.roadSlices,false);
+                if(saved.gfx.particles!==undefined)updateGfxParticles(Math.round(saved.gfx.particles*100),false);
+                ['bloom','shake','transitions','scanlines','pillars','reflections','speedLines','hudBoxes','legacyModels'].forEach(k=>{
+                    if(saved.gfx[k]!==undefined)applyGfxOptionState(k,saved.gfx[k],false);
+                });
+                gfxSettings.voidChromaNitro=(saved.gfx.voidChromaNitro!==undefined)?Boolean(saved.gfx.voidChromaNitro):true;
+                setVisualFilter(VALID_OPTIC_FILTERS.has(saved.gfx.filter)?saved.gfx.filter:'filter-standard',false);
+            }
+        }else{
+            resetGameSettingsOnly();
+            resetSoundSettingsOnly();
+            resetControlSettingsOnly();
+            resetGraphicsSettingsOnly();
+        }
+    }catch(e){}
+    isApplyingAccountSettings=false;
+    syncMixtapeOstVisibilityUI();
+    buildVehicleLiverySelector();
+    saveSettingsForActiveAccount();
 }
 
-let tiltCenterOffset = 0, lastRawTilt = 0, smoothedGyro = 0, needsGyroZero = true, hasGyroVal = false, lastTapTs = 0, dtBoostTimer = null;
-
-function setMobileControlMode(mode) {
-    globalSettings.controls.mobileMode = mode;
-    ['buttons', 'drag', 'tilt'].forEach(m => { const b = document.getElementById(`mobCtrl_${m}`); if (b) b.className = m === mode ? 'btn btn-sm btn-sky active' : 'btn btn-sm'; });
-    const leftGrp = document.getElementById('mobileLeftTouchGroup');
-    if (leftGrp) leftGrp.style.display = mode === 'buttons' ? 'flex' : 'none';
-    const gb = document.getElementById('gyroCalibrationBox');
-    gb.style.opacity = mode === 'tilt' ? '1' : '0.4'; gb.style.pointerEvents = mode === 'tilt' ? 'auto' : 'none';
-    if (mode === 'tilt') { calibrateTiltSensor(true); if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') DeviceOrientationEvent.requestPermission().catch(() => {}); }
-    saveGlobalSettings();
-}
-function toggleInvertGyro() { globalSettings.controls.invertGyro = !globalSettings.controls.invertGyro; needsGyroZero = true; document.getElementById('invertGyroBtn').innerText = `Flip: ${globalSettings.controls.invertGyro ? 'ON' : 'OFF'}`; saveGlobalSettings(); }
-function calibrateTiltSensor(silent = true) { if (hasGyroVal) { tiltCenterOffset = lastRawTilt; smoothedGyro = 0; needsGyroZero = false; } else needsGyroZero = true; setTextCached('gyroLiveAngleLabel', '0.0°'); if (!silent) playSfx('pickup'); }
-function updateGyroSpeedSetting(val) { const p = Math.max(20, Math.min(100, parseInt(val, 10) || 65)); globalSettings.controls.gyroSensitivity = p / 100; setTextCached('gyroSpeedLabel', `${p}%`); document.getElementById('gyroSpeedSlider').value = p; saveGlobalSettings(); }
-function toggleDoubleTapNitro() { globalSettings.controls.doubleTapNitro = !globalSettings.controls.doubleTapNitro; const b = document.getElementById('doubleTapNitroBtn'); b.innerText = globalSettings.controls.doubleTapNitro ? 'ON' : 'OFF'; b.className = globalSettings.controls.doubleTapNitro ? 'btn btn-xs btn-emerald' : 'btn btn-xs'; saveGlobalSettings(); }
-function resetControlSettingsOnly() { globalSettings.controls = getDefaultGlobalSettings().controls; setMobileControlMode('buttons'); updateGyroSpeedSetting(65); document.getElementById('doubleTapNitroBtn').innerText = 'ON'; refreshKeybindLabels(); saveGlobalSettings(); }
-
-// =========================================================================
-// 13. DEV CONSOLE
-// =========================================================================
-function showDevFeedback(msg) { const el = document.getElementById('devConsoleFeedback'); if (el) { el.innerText = msg; el.classList.remove('hidden'); } }
-function toggleDevGodMode() { if (!activeAccount || !activeAccount.isDev) return; devGodModeActive = !devGodModeActive; if (devGodModeActive) { gameState.armor = 100; gameState.nitroFuel = 100; gameState.empCharge = 100; updateHudDOM(true); } syncDevUiVisibility(); playSfx('pickup'); showDevFeedback(devGodModeActive ? '⚡ God Mode ON' : 'God Mode OFF'); }
-function devRefillAllSystems() { if (!activeAccount || !activeAccount.isDev) return; gameState.armor = 100; gameState.nitroFuel = 100; gameState.empCharge = 100; updateHudDOM(true); spawnFloat('⚡ MAX ALL SYSTEMS', '#00f5d4', -45); playSfx('pickup'); }
-function devStartAtCustomEpoch() { if (!activeAccount || !activeAccount.isDev) return; startGameSession(Math.max(1, Math.min(99999, parseInt(document.getElementById('devEpochInput').value, 10) || 250))); }
-function devFastForwardSeasonPhase() {
-    if (!activeAccount || !activeAccount.isDev) return;
-    seasonStateCache.devOffsetMs = (Number(seasonStateCache.devOffsetMs) || 0) + seasonStatusCache.remainingMs + 2500;
-    saveSeasonState(); syncSeasonLifecycle(); refreshSeasonUI(); refreshMenuAccountUI(); buildGarageUI();
-    publishRealtimeEvent('season_sync', { seasonState: seasonStateCache });
-    showDevFeedback(`⏩ Season ${seasonStatusCache.seasonNum} (${seasonStatusCache.phase}) synced live.`); showToast(`Advanced to S${seasonStatusCache.seasonNum} (${seasonStatusCache.phase})`, 'ok'); playSfx('pickup');
-}
-function devBroadcastSystemMail() {
-    if (!activeAccount || !activeAccount.isDev) return;
-    const t = (document.getElementById('devMailTitleInput').value || '').trim(), b = (document.getElementById('devMailBodyInput').value || '').trim();
-    if (!t || !b) { showToast('Enter subject & message.', 'err'); return; }
-    const mailObj = pushMailAll({ title: t, sender: 'DEV BROADCAST', body: b });
-    publishRealtimeEvent('mail_broadcast', { mail: mailObj });
-    document.getElementById('devMailTitleInput').value = ''; document.getElementById('devMailBodyInput').value = '';
-    refreshInboxBadgeUI(); showDevFeedback(`✓ Sent "${t}" live to all browsers.`); showToast('Broadcast mail sent live.', 'ok'); playSfx('pickup');
-}
-async function devResetSpecificScore(uid) {
-    if (!activeAccount || !activeAccount.isDev || !uid) return;
-    const target = accountsCache[uid];
-    const ok = await askConfirm({ title: 'Reset Specific Score?', body: `Reset Season & All-Time scores for "${target ? target.name : uid}" across all browsers?`, okLabel: 'Reset Score' });
-    if (!ok) return;
-    const now = Date.now(); syncMeta.resetScoreTs[uid] = now; saveSyncMeta();
-    applyScoreResetLocally(uid); publishRealtimeEvent('score_reset', { uid, ts: now });
-    reconcileAllTimeChampion(); refreshMenuAccountUI(); buildGarageUI(); renderDevAccountsList();
-    if (document.getElementById('leaderboardModal').style.display === 'flex') renderLeaderboardList();
-    showDevFeedback(`✓ Score reset live for ${target ? target.name : uid}.`); showToast('Specific score reset live.', 'ok'); playSfx('pickup');
-}
-async function devResetAllScores() {
-    if (!activeAccount || !activeAccount.isDev) return;
-    const ok = await askConfirm({ title: 'Reset ALL Scores?', body: 'Wipe ALL Season & All-Time leaderboard scores across every browser?', okLabel: 'Reset All Scores' });
-    if (!ok) return;
-    const now = Date.now(); syncMeta.wipeAllScoresTs = now; saveSyncMeta();
-    applyResetAllScoresLocally(); publishRealtimeEvent('score_reset_all', { ts: now });
-    refreshMenuAccountUI(); buildGarageUI(); updateTopLeaderBanner(); renderDevAccountsList();
-    if (document.getElementById('leaderboardModal').style.display === 'flex') renderLeaderboardList();
-    showDevFeedback('✓ All scores reset live.'); showToast('All scores wiped live.', 'ok'); playSfx('pickup');
-}
-async function devDeleteAllNonDevAccounts() {
-    if (!activeAccount || !activeAccount.isDev) return;
-    const victims = Object.values(accountsCache).filter(a => !a.isDev);
-    if (!victims.length) { showDevFeedback('No player accounts to delete.'); showToast('No player accounts exist.'); return; }
-    const ok = await askConfirm({ title: 'Delete ALL Player Accounts?', body: `Permanently delete ALL ${victims.length} non-Dev player account(s), scores, and songs across ALL browsers?\nYour unique Dev account is preserved.`, okLabel: `Delete ${victims.length} Accounts` });
-    if (!ok) return;
-    const now = Date.now(); syncMeta.wipeAllAccountsTs = now; saveSyncMeta();
-    applyDeleteAllNonDevLocally(now, false); publishRealtimeEvent('acc_delete_all', { ts: now });
-    reconcileAllTimeChampion(); refreshMenuAccountUI(); buildGarageUI(); renderDevAccountsList(); renderDevCustomSongsList();
-    if (document.getElementById('leaderboardModal').style.display === 'flex') renderLeaderboardList();
-    showDevFeedback(`✓ Deleted ${victims.length} player accounts live.`); showToast(`Deleted ${victims.length} player accounts live.`, 'ok'); playSfx('pickup');
-}
-function toggleDevRevealAllIds() {
-    devRevealAllIds = !devRevealAllIds; if (!devRevealAllIds) devRowRevealSet.clear();
-    const b = document.getElementById('devRevealAllIdsBtn'); if (b) b.innerText = devRevealAllIds ? '🙈 Hide All IDs' : '👁 Show All IDs';
-    renderDevAccountsList();
-}
-function toggleDevRowReveal(uid) { if (devRowRevealSet.has(uid)) devRowRevealSet.delete(uid); else devRowRevealSet.add(uid); renderDevAccountsList(); }
-function renderDevAccountsList() {
-    const el = document.getElementById('devAccountsList'); if (!el || !activeAccount || !activeAccount.isDev) return;
-    const q = ((document.getElementById('devAccSearchInput') || {}).value || '').trim().toLowerCase();
-    const all = Object.values(accountsCache); setTextCached('devAccCountBadge', String(all.length));
-    const st = seasonStatusCache, filtered = q ? all.filter(a => a.name.toLowerCase().includes(q) || a.tag.toLowerCase().includes(q) || a.uid.includes(q)) : all;
-    if (!filtered.length) { el.innerHTML = '<div style="padding:8px;text-align:center;color:var(--text-dim);font-size:10px;">No matching accounts.</div>'; return; }
-    el.innerHTML = filtered.map(a => {
-        const shown = devRevealAllIds || devRowRevealSet.has(a.uid);
-        const sScore = (a.stats.seasonScores && a.stats.seasonScores[st.seasonNum]) || 0, aScore = a.stats.allTimeBest || 0;
-        const idText = shown ? `#${escapeHtml(a.tag)} • ${escapeHtml(a.uid)}` : `#•••• • ••••••••••••••••`;
-        const copyBtn = shown ? `<button type="button" class="btn btn-xs btn-emerald" style="padding:1px 5px;font-size:9px;" onclick="copyUidDirect('${escapeHtml(a.uid)}')">📋</button>` : '';
-        return `<div class="recessed-well" style="padding:6px 8px;display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;"><div style="min-width:0;flex:1;"><div class="row-wrap" style="gap:5px;"><span style="width:7px;height:7px;border-radius:50%;background:${escapeHtml(a.custom.bodySecondary)};"></span><strong style="font-size:11px;color:#fff;">${escapeHtml(a.name)}</strong>${a.isDev ? '<span class="badge badge-cyan mono" style="font-size:8px;">DEV</span>' : ''}<button type="button" class="reveal-pill ${shown ? 'revealed' : ''}" style="font-size:9px;padding:1px 5px;" onclick="toggleDevRowReveal('${escapeHtml(a.uid)}')">${idText} ${shown ? '🙈' : '👁'}</button>${copyBtn}</div><div class="mono" style="font-size:9px;color:var(--text-dim);margin-top:2px;">All: <span style="color:#34d399;">${aScore.toLocaleString()}</span> &bull; S${st.seasonNum}: <span style="color:#fcd34d;">${sScore.toLocaleString()}</span> &bull; Runs: ${a.stats.totalRuns || 0}</div></div><div class="row" style="gap:4px;flex-shrink:0;"><button type="button" class="btn btn-xs btn-amber" onclick="devResetSpecificScore('${escapeHtml(a.uid)}')">Reset Score</button>${a.isDev ? '' : `<button type="button" class="btn btn-xs btn-danger" onclick="deleteAccountByUid('${escapeHtml(a.uid)}')">Del</button>`}</div></div>`;
-    }).join('');
+function resetGraphicsSettingsOnly(){
+    gfxSettings.legacyModels=false;
+    gfxSettings.voidChromaNitro=true;
+    setVisualFilter('filter-standard',false);
+    applyGraphicsPreset('medium',true);
 }
 
-// =========================================================================
-// 14. SESSION, VIEWPORT, MOBILE FULLSCREEN & INPUTS
-// =========================================================================
-function syncCursorVisibility() {
-    const open = ['bootSplashModal', 'startModal', 'gameOverModal', 'inboxModal', 'leaderboardModal', 'pauseSettingsModal', 'confirmModal'].some(id => document.getElementById(id).style.display === 'flex');
-    document.body.classList.toggle('gameplay-active', gameState.running && !gameState.paused && !open);
+// Wrap updateGamePhysics so God Mode (ID 1117) locks Hull, Nitro & EMP at 100% and prevents collision damage
+const _baseUpdateGamePhysics=updateGamePhysics;
+updateGamePhysics=function(dt,now){
+    const godActive=(devGodModeActive&&currentPilot.id==='1117');
+    if(godActive){
+        gameState.armor=100;
+        gameState.nitroFuel=100;
+        gameState.empCharge=100;
+    }
+    _baseUpdateGamePhysics(dt,now);
+    if(godActive){
+        gameState.armor=100;
+        gameState.nitroFuel=100;
+        gameState.empCharge=100;
+    }
+};
+
+// ==================== UNIFIED CUSTOM SONGS MANAGER (DEV 1117 + INDIVIDUAL & ALL DELETE) ====================
+function resetSavedAccountOstIfCustom(accKey){
+    try{
+        const allSet=JSON.parse(localStorage.getItem(SETTINGS_PER_ACC_KEY)||'{}');
+        if(allSet[accKey]&&allSet[accKey].audio&&allSet[accKey].audio.ostMode==='custom'){
+            allSet[accKey].audio.ostMode='synth';
+            localStorage.setItem(SETTINGS_PER_ACC_KEY,JSON.stringify(allSet));
+        }
+    }catch(e){}
 }
-function toggleGameHudVisibility() { isHudHidden = !isHudHidden; document.getElementById('gameViewportWrapper').classList.toggle('hud-hidden', isHudHidden); }
 
-function startGameSession(startEp = 1) {
-    if (isPortalExiting) return;
-    if (!activeAccount) { showToast('Sign in or create an account first.', 'err'); playSfx('hit'); return; }
-    hasTrustedGesture = true; isBootSplashDismissed = true;
-    document.getElementById('bootSplashModal').style.display = 'none';
-    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
-    ensureAudioEngine(); syncSeasonLifecycle();
-    if (isMobileHardware) requestMobileFullscreenSafe();
-    resizeGameCanvas();
-    if (globalSettings.controls.mobileMode === 'tilt') calibrateTiltSensor(true);
+async function deleteCustomSongByKey(accKey){
+    try{
+        const db=await openCustomSongsIDB();
+        await new Promise((res)=>{
+            const tx=db.transaction('songs','readwrite');
+            tx.objectStore('songs').delete(accKey);
+            tx.oncomplete=()=>res();
+            tx.onerror=()=>res();
+        });
+        resetSavedAccountOstIfCustom(accKey);
+        if(accKey===getActiveAccountStorageKey()){
+            await loadCustomSongForActivePilot();
+        }else{
+            await renderDevCustomSongsList();
+        }
+        if(currentPilot.id==='1117'){
+            showDevConsoleFeedback(`✓ Custom Song Removed for ${CORE_IDS.has(accKey)?PILOT_PROFILES[accKey].name:accKey.replace('GUEST_ID_','Guest #')}!`);
+        }
+        playGameSfx('uiClick');
+    }catch(e){}
+}
 
-    ['startModal', 'pauseSettingsModal', 'leaderboardModal', 'inboxModal', 'gameOverModal', 'confirmModal'].forEach(id => { document.getElementById(id).style.display = 'none'; });
-    document.getElementById('atmosphereOverlay').classList.remove('hit-flash');
+async function devRemoveAllCustomSongs(){
+    if(currentPilot.id!=='1117')return;
+    try{
+        const db=await openCustomSongsIDB();
+        await new Promise((res)=>{
+            const tx=db.transaction('songs','readwrite');
+            tx.objectStore('songs').clear();
+            tx.oncomplete=()=>res();
+            tx.onerror=()=>res();
+        });
+        const allSet=JSON.parse(localStorage.getItem(SETTINGS_PER_ACC_KEY)||'{}');
+        Object.keys(allSet).forEach(k=>{
+            if(allSet[k]&&allSet[k].audio&&allSet[k].audio.ostMode==='custom'){
+                allSet[k].audio.ostMode='synth';
+            }
+        });
+        localStorage.setItem(SETTINGS_PER_ACC_KEY,JSON.stringify(allSet));
+        await loadCustomSongForActivePilot();
+        showDevConsoleFeedback("✓ All Custom Uploaded Songs (Core, 1117 & Guests) Removed!");
+        playGameSfx('pickup');
+    }catch(e){}
+}
 
-    const ep = Math.max(1, Math.floor(startEp || 1));
-    Object.assign(gameState, {
-        running: true, paused: false, score: 0, epoch: ep, combo: 1.0, nearMisses: 0,
-        armor: 100, nitroFuel: 100, empCharge: 100, distanceM: getDistanceForEpoch(ep),
-        speedMps: 25, targetLane: 0, egoLaneX: 0, egoRoll: 0, boosting: false, braking: false,
-        slowMoTimer: 0, invulnTimer: 0, hitFlashTimer: 0, empWaveRadius: 0, empFlashAlpha: 0, screenShake: 0,
-        ep250WarnTriggered: ep > 250, ep250WarnTimer: 0, hazards: [], pickups: [], FloatingTexts: [], empFX: []
+async function renderDevCustomSongsList(){
+    const container=document.getElementById('devCustomSongsList');
+    if(!container||currentPilot.id!=='1117')return;
+    try{
+        const parentBox=container.parentElement;
+        if(parentBox&&parentBox.firstElementChild){
+            parentBox.firstElementChild.className="hidden";
+        }
+        const db=await openCustomSongsIDB();
+        const allRecords=await new Promise((res)=>{
+            const tx=db.transaction('songs','readonly');
+            const req=tx.objectStore('songs').getAll();
+            req.onsuccess=()=>res(req.result||[]);
+            req.onerror=()=>res([]);
+        });
+
+        const count=allRecords.length;
+        const headerHtml=`
+            <div class="flex flex-wrap items-center justify-between gap-1.5 pb-1.5 mb-1.5 border-b border-[#1d2638]">
+                <div class="flex items-center gap-1.5">
+                    <span class="text-[10.5px] font-extrabold text-cyan-300 mono-num uppercase">🎵 Custom Songs Vault</span>
+                    <span class="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[9px] mono-num font-bold">${count} Active</span>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <button type="button" onclick="document.getElementById('customSongFileInput').click()" class="px-2 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/35 text-emerald-300 border border-emerald-500/40 text-[9px] mono-num font-bold cursor-pointer transition">📤 Upload (1117)</button>
+                    <button type="button" onclick="devRemoveAllCustomSongs()" ${count===0?'disabled':''} class="px-2 py-0.5 rounded text-[9px] mono-num font-bold transition ${count>0?'bg-red-600/85 hover:bg-red-500 text-white cursor-pointer':'bg-[#141926] text-gray-600 border border-[#22293a] cursor-not-allowed'}">🗑️ Clear All (${count})</button>
+                </div>
+            </div>
+        `;
+
+        if(count===0){
+            container.className="space-y-1 text-[10px] mono-num text-gray-400";
+            container.innerHTML=headerHtml+`<div class="text-gray-500 py-1 text-center">No custom songs uploaded by Core or Guest pilots yet.</div>`;
+            return;
+        }
+
+        container.className="space-y-1.5 text-[10px] mono-num text-gray-300";
+        const rowsHtml=allRecords.map(r=>{
+            const mb=(r.sizeBytes/(1024*1024)).toFixed(1);
+            const accK=String(r.accountKey||'');
+            const isSelf=(accK==='1117');
+            const isCore=CORE_IDS.has(accK);
+            const roleBadge=isSelf
+                ?`<span class="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-400/40 text-[8.5px] font-extrabold shrink-0">👑 1117</span>`
+                :(isCore
+                    ?`<span class="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-400/40 text-[8.5px] font-bold shrink-0">⚡ CORE #${escapeHtml(accK)}</span>`
+                    :`<span class="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30 text-[8.5px] shrink-0">👤 GUEST</span>`);
+            return `
+                <div class="flex items-center justify-between gap-2 bg-[#121724] px-2.5 py-1.5 rounded-lg border border-[#232c42]">
+                    <div class="flex items-center gap-1.5 min-w-0">
+                        ${roleBadge}
+                        <span class="truncate text-gray-200">${escapeHtml(r.pilotName||accK)}: <strong class="text-white">${escapeHtml(r.fileName)}</strong> <span class="text-gray-400">(${mb}MB)</span></span>
+                    </div>
+                    <button type="button" onclick="deleteCustomSongByKey('${escapeHtml(accK)}')" class="px-2 py-0.5 rounded bg-red-500/20 hover:bg-red-500/40 text-red-300 border border-red-500/40 text-[9px] font-extrabold shrink-0 cursor-pointer transition">✕ Delete</button>
+                </div>
+            `;
+        }).join('');
+        container.innerHTML=headerHtml+`<div class="space-y-1 max-h-28 overflow-y-auto pr-0.5">${rowsHtml}</div>`;
+    }catch(e){}
+}
+
+// ==================== PER-PILOT RESET & CLEAN LEADERBOARD MANAGE MODE (ID 1117) ====================
+function reconcileAllPilotScores(){
+    const delSet=new Set(sanitizeDeletedAccountKeys());
+    const perAccReset=getPerAccountResetMap();
+    const db=getAccountsDatabase();
+    let rawLb=[];
+    try{rawLb=JSON.parse(localStorage.getItem(LB_STORAGE_KEY)||'[]');}catch(e){rawLb=[];}
+    if(!Array.isArray(rawLb))rawLb=[];
+
+    const lbMap=new Map();
+
+    rawLb.forEach(item=>{
+        if(!item)return;
+        const sc=Number(item.score)||0;
+        const itemTs=Number(item.ts)||0;
+        if(sc<=0)return;
+        if(lastCloudResetTs&&itemTs>0&&itemTs<lastCloudResetTs)return;
+        const k=normalizeEntryAccountKey(item);
+        if(!k||delSet.has(k))return;
+        if(perAccReset[k]&&(!itemTs||itemTs<=Number(perAccReset[k])))return;
+
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const gid=isCore?"":(item.guestId||extractGuestIdTag(item));
+        const canonicalName=isCore?prof.name:(item.name||'Guest Pilot');
+        const ep=Math.max(1,Number(item.epoch)||1);
+        const prev=lbMap.get(k);
+        if(!prev||sc>prev.score||(sc===prev.score&&ep>prev.epoch)){
+            lbMap.set(k,{
+                id:isCore?k:'GUEST',
+                guestId:isCore?'':(gid==='GUEST'?'':gid),
+                accountKey:k,
+                name:canonicalName,
+                score:Math.max(sc,prev?prev.score:0),
+                epoch:Math.max(ep,prev?prev.epoch:1),
+                ts:Math.max(itemTs,prev?prev.ts:0)||Date.now()
+            });
+        }
     });
-    nextMenuNoteT = 0; nextGameNoteT = 0;
-    syncBiomeForEpoch(true);
-    if (ep === 249 || ep === 250) triggerEpoch250Warning(); else syncEpoch250Banners();
-    syncExternalTracks(); updateEnginePitch(); updateEqVisuals(true); updateHudDOM(true); renderMiniRadar(); syncCursorVisibility();
+
+    let dbChanged=false;
+    Object.keys(db).forEach(rawKey=>{
+        const rec=db[rawKey];
+        if(!rec)return;
+        if(lastCloudResetTs&&rec.updatedAt&&Number(rec.updatedAt)<lastCloudResetTs){
+            delete db[rawKey];
+            dbChanged=true;
+            return;
+        }
+        const k=CORE_IDS.has(rawKey)?rawKey:(resolveCorePilotFromInputs(rawKey,rec.name)||rawKey);
+        if(delSet.has(k)){
+            delete db[rawKey];
+            dbChanged=true;
+            return;
+        }
+        if(perAccReset[k]&&rec.updatedAt&&Number(rec.updatedAt)<=Number(perAccReset[k])){
+            if(CORE_IDS.has(k)){
+                db[k]={id:k,guestId:"",name:PILOT_PROFILES[k].name,isCore:true,bestScore:0,bestEpoch:1,totalFlashes:0,completedEpoch250:false,updatedAt:Number(perAccReset[k])+1};
+            }else{
+                delete db[rawKey];
+            }
+            dbChanged=true;
+            return;
+        }
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const dbScore=Math.max(0,Number(rec.bestScore)||0);
+        const dbEpoch=Math.max(1,Number(rec.bestEpoch)||1);
+        const lbEntry=lbMap.get(k);
+        const maxScore=Math.max(dbScore,lbEntry?lbEntry.score:0);
+        const maxEpoch=maxScore>0?Math.max(dbEpoch,lbEntry?lbEntry.epoch:1):dbEpoch;
+
+        if(maxScore!==dbScore||maxEpoch!==dbEpoch||k!==rawKey){
+            db[k]={
+                ...rec,
+                id:k,
+                guestId:isCore?"":(rec.guestId||k.replace('GUEST_ID_','')),
+                name:isCore?prof.name:(rec.name||`Pilot #${k.replace('GUEST_ID_','')}`),
+                isCore,
+                bestScore:maxScore,
+                bestEpoch:maxEpoch,
+                totalFlashes:Math.max(0,Number(rec.totalFlashes)||0),
+                completedEpoch250:Boolean(rec.completedEpoch250||maxEpoch>250),
+                updatedAt:rec.updatedAt||Date.now()
+            };
+            if(k!==rawKey)delete db[rawKey];
+            dbChanged=true;
+        }
+        if(maxScore>0){
+            lbMap.set(k,{
+                id:isCore?k:'GUEST',
+                guestId:isCore?'':(db[k].guestId||k.replace('GUEST_ID_','')),
+                accountKey:k,
+                name:isCore?prof.name:(db[k].name||'Guest Pilot'),
+                score:maxScore,
+                epoch:maxEpoch,
+                ts:lbEntry?lbEntry.ts:(db[k].updatedAt||Date.now())
+            });
+        }
+    });
+
+    lbMap.forEach((entry,k)=>{
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const prev=db[k]||{bestScore:0,bestEpoch:1,totalFlashes:0,completedEpoch250:false};
+        if((Number(prev.bestScore)||0)<entry.score||(Number(prev.bestEpoch)||1)<entry.epoch){
+            db[k]={
+                id:k,
+                guestId:isCore?"":(entry.guestId||k.replace('GUEST_ID_','')),
+                name:isCore?prof.name:(entry.name||prev.name||'Guest Pilot'),
+                isCore,
+                bestScore:Math.max(Number(prev.bestScore)||0,entry.score),
+                bestEpoch:Math.max(Number(prev.bestEpoch)||1,entry.epoch),
+                totalFlashes:Math.max(0,Number(prev.totalFlashes)||0),
+                completedEpoch250:Boolean(prev.completedEpoch250||entry.epoch>250),
+                updatedAt:entry.ts||Date.now()
+            };
+            dbChanged=true;
+        }
+    });
+
+    if(dbChanged)saveAccountsDatabase(db);
+    const sorted=Array.from(lbMap.values()).sort((a,b)=>b.score-a.score).slice(0,100);
+    localStorage.setItem(LB_STORAGE_KEY,JSON.stringify(sorted));
+    updateTopLeaderBanner(sorted);
+    return sorted;
 }
 
-function returnToMainMenu() {
-    gameState.running = false; gameState.paused = false; gameState.ep250WarnTimer = 0; gameState.hitFlashTimer = 0; gameState.boosting = false; gameState.braking = false;
-    nextGameNoteT = 0; nextMenuNoteT = 0;
-    document.getElementById('atmosphereOverlay').classList.remove('hit-flash');
-    syncEpoch250Banners(); syncExternalTracks(); updateEnginePitch(); updateEqVisuals(false);
-    ['pauseSettingsModal', 'gameOverModal', 'leaderboardModal', 'inboxModal', 'confirmModal'].forEach(id => { document.getElementById(id).style.display = 'none'; });
-    document.getElementById('startModal').style.display = 'flex';
-    syncSeasonLifecycle(); refreshMenuAccountUI(); refreshSeasonUI(); refreshInboxBadgeUI(); syncCursorVisibility();
-}
+function mergeRemoteLeaderboardPacket(packet){
+    if(!packet||typeof packet!=='object')return;
 
-function exitGamePortal() {
-    if (!activeAccount) { showToast('Sign in or create an account first.', 'err'); return; }
-    isPortalExiting = true; gameState.running = false; gameState.paused = true;
-    if (musicSchedId) clearInterval(musicSchedId);
-    if (rtEventSource) { try { rtEventSource.close(); } catch (e) {} }
-    silenceAllAudio();
-    if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
-    try { window.open('', '_self', ''); window.close(); } catch (e) {}
-    setTimeout(() => { document.body.innerHTML = '<div style="position:fixed;inset:0;background:#05070b;color:#94a3b8;display:flex;align-items:center;justify-content:center;font-family:monospace;">SESSION CLOSED</div>'; }, 80);
-}
-
-function resizeGameCanvas() {
-    detectDeviceHardware();
-    const wrap = document.getElementById('gameViewportWrapper'), vv = window.visualViewport;
-    const winW = Math.round(vv ? vv.width : window.innerWidth), winH = Math.round(vv ? vv.height : window.innerHeight);
-    let w = winW, h = winH;
-    const isRotatedPortrait = Boolean(isMobileHardware && winH > winW);
-    wrap.classList.toggle('is-rotated-portrait', isRotatedPortrait);
-    if (isRotatedPortrait) {
-        w = winH; h = winW;
-        wrap.style.left = `${winW}px`; wrap.style.width = `${winH}px`; wrap.style.height = `${winW}px`;
-        wrap.style.transformOrigin = 'top left'; wrap.style.transform = 'rotate(90deg)';
-    } else {
-        wrap.style.left = '0px'; wrap.style.width = `${winW}px`; wrap.style.height = `${winH}px`;
-        wrap.style.transformOrigin = ''; wrap.style.transform = 'none';
+    if(packet.resetTs&&Number(packet.resetTs)>lastCloudResetTs){
+        lastCloudResetTs=Number(packet.resetTs);
+        localStorage.setItem('roadSense_overdrive_resetTs_v8',String(lastCloudResetTs));
+        localStorage.setItem(ACCOUNTS_DB_KEY,JSON.stringify({}));
+        localStorage.setItem(LB_STORAGE_KEY,JSON.stringify([]));
+        refreshAccountStatsUI();
+        updateTopLeaderBanner([]);
+        if(document.getElementById('leaderboardModal').style.display!=='none')renderLeaderboardList();
     }
-    const baseDpr = Math.min(window.devicePixelRatio || 1, isMobileHardware ? 1.15 : 1.45);
-    const effDpr = Math.max(0.6, Math.min(2.0, baseDpr * (globalSettings.graphics.resScale || 1.0)));
-    canvas.width = Math.max(1, Math.floor(w * effDpr)); canvas.height = Math.max(1, Math.floor(h * effDpr));
-    ctx.setTransform(effDpr, 0, 0, effDpr, 0, 0);
-    gameState.viewW = w; gameState.viewH = h; cachedGradients.key = '';
-    if (document.getElementById('pauseSettingsModal').style.display === 'flex' && currentSettingsTab === 'garage') syncGarageCanvasResolution();
+
+    if(packet.perAccResetTs&&typeof packet.perAccResetTs==='object'){
+        const localMap=getPerAccountResetMap();
+        let mapChanged=false;
+        Object.entries(packet.perAccResetTs).forEach(([k,tsVal])=>{
+            const numTs=Number(tsVal)||0;
+            if(numTs>(Number(localMap[k])||0)){
+                localMap[k]=numTs;
+                mapChanged=true;
+            }
+        });
+        if(mapChanged)savePerAccountResetMap(localMap);
+    }
+
+    if(Array.isArray(packet.deletedAccounts)&&packet.deletedAccounts.length>0){
+        const safeIncoming=packet.deletedAccounts.filter(k=>k&&!CORE_IDS.has(String(k)));
+        saveDeletedAccountKeys(Array.from(new Set([...sanitizeDeletedAccountKeys(),...safeIncoming])));
+    }
+
+    const delSet=new Set(sanitizeDeletedAccountKeys());
+    const perAccReset=getPerAccountResetMap();
+    const mapByKey=new Map();
+    getLocalLeaderboard().forEach(item=>{
+        const k=normalizeEntryAccountKey(item);
+        if(k&&!delSet.has(k)&&item.score>0)mapByKey.set(k,item);
+    });
+
+    (Array.isArray(packet.entries)?packet.entries:[]).forEach(rem=>{
+        const remScore=Number(rem&&rem.score)||0;
+        const remTs=Number(rem&&rem.ts)||0;
+        if(remScore<=0)return;
+        if(lastCloudResetTs&&(!remTs||remTs<=lastCloudResetTs))return;
+        const k=normalizeEntryAccountKey(rem);
+        if(!k||delSet.has(k))return;
+        if(perAccReset[k]&&(!remTs||remTs<=Number(perAccReset[k])))return;
+
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const ex=mapByKey.get(k);
+        const remEpoch=Math.max(1,Number(rem.epoch)||1);
+        if(!ex||remScore>ex.score){
+            mapByKey.set(k,{
+                id:isCore?k:'GUEST',
+                guestId:isCore?'':(rem.guestId||extractGuestIdTag(rem)),
+                accountKey:k,
+                name:isCore?prof.name:(rem.name||'Guest Pilot'),
+                score:Math.max(remScore,ex?ex.score:0),
+                epoch:Math.max(remEpoch,ex?ex.epoch:1),
+                ts:remTs||Date.now()
+            });
+        }
+    });
+
+    saveLocalLeaderboard(Array.from(mapByKey.values()));
+    refreshAccountStatsUI();
+    if(document.getElementById('leaderboardModal').style.display!=='none')renderLeaderboardList();
 }
 
-function requestMobileFullscreenSafe() {
-    if (!isMobileHardware || isPortalExiting) return;
-    const el = document.documentElement;
-    if (!document.fullscreenElement && el.requestFullscreen) {
-        el.requestFullscreen({ navigationUI: 'hide' }).then(() => {
-            if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {});
-            setTimeout(resizeGameCanvas, 120);
-        }).catch(() => resizeGameCanvas());
-    }
-}
-
-function enterFromBootSplash() {
-    if (isBootSplashDismissed) return;
-    isBootSplashDismissed = true; hasTrustedGesture = true;
-    mainMenuSplashGuardUntil = performance.now() + 340;
-    document.getElementById('bootSplashModal').style.display = 'none';
-    document.getElementById('startModal').style.display = 'flex';
-    if (isMobileHardware) requestMobileFullscreenSafe();
-    const actx = ensureAudioEngine();
-    nextMenuNoteT = 0;
-    if (actx && actx.state === 'running') tickMusicScheduler();
-    playSfx('pickup');
-    syncCursorVisibility();
-}
-
-['pointerdown', 'click'].forEach(evt => document.getElementById('startModal').addEventListener(evt, e => { if (performance.now() < mainMenuSplashGuardUntil) { e.preventDefault(); e.stopPropagation(); } }, true));
-document.getElementById('bootSplashModal').addEventListener('click', () => enterFromBootSplash());
-document.getElementById('bootEnterBtn').addEventListener('click', e => { e.stopPropagation(); enterFromBootSplash(); });
-
-canvas.addEventListener('pointerdown', e => {
-    if (e.isTrusted) hasTrustedGesture = true;
-    if (!gameState.running || gameState.paused) return;
-    if (!isMobileHardware) return;
-    const now = performance.now(), dtTap = now - lastTapTs;
-    if (globalSettings.controls.doubleTapNitro && dtTap > 40 && dtTap < 260) {
-        setBoosting(true); if (dtBoostTimer) clearTimeout(dtBoostTimer); dtBoostTimer = setTimeout(() => setBoosting(false), 1100);
-    }
-    lastTapTs = now;
-    if (globalSettings.controls.mobileMode === 'drag') {
-        const rot = isMobileHardware && window.innerHeight > window.innerWidth;
-        const x = rot ? e.clientY : e.clientX, y = rot ? (window.innerWidth - e.clientX) : e.clientY;
-        const W = gameState.viewW, H = gameState.viewH, hY = H * 0.42, rc = Math.sin(gameState.distanceM * 0.012) * 0.65;
-        let zTap = EGO_Z_CENTER;
-        if (y > hY + 12) zTap = Math.max(1.1, Math.min(18, (H * 0.85) / Math.max(1, (y - hY) / (1.72 * 0.36))));
-        let best = Math.round(gameState.targetLane), minD = Infinity;
-        for (const l of LANES) { const d = Math.abs(x - projectX(l, zTap, W, H, rc)); if (d < minD) { minD = d; best = l; } }
-        setDiscreteTargetLane(best);
-    }
-});
-
-(function bindMobileTouchSlidersAndScroll() {
-    let activeSld = null, activeScr = null, lastX = 0, lastY = 0, dragDist = 0, isDrag = false, suppressUntil = 0, vel = 0, lastTs = 0, rafId = 0;
-    const stopMom = () => { if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } vel = 0; };
-    const findScr = el => { let c = el; while (c && c !== document.body) { if (c.classList && c.classList.contains('modal-scroll') && c.scrollHeight > c.clientHeight + 1) return c; c = c.parentElement; } return null; };
-    const setSld = (cx, cy, sld) => {
-        const r = sld.getBoundingClientRect(), rot = isMobileHardware && window.innerHeight > window.innerWidth;
-        const ratio = Math.max(0, Math.min(1, rot ? (cy - r.top) / Math.max(1, r.height) : (cx - r.left) / Math.max(1, r.width)));
-        const mn = parseFloat(sld.min) || 0, mx = parseFloat(sld.max) || 100, st = parseFloat(sld.step) || 1;
-        const v = Math.max(mn, Math.min(mx, Math.round((mn + ratio * (mx - mn) - mn) / st) * st + mn));
-        if (String(sld.value) !== String(v)) { sld.value = v; sld.dispatchEvent(new Event('input', { bubbles: true })); }
+function pushCloudLeaderboardPacket(extra={}){
+    const payload={
+        type:'lb_sync_v10',
+        resetTs:lastCloudResetTs,
+        perAccResetTs:getPerAccountResetMap(),
+        entries:getLocalLeaderboard().slice(0,35),
+        deletedAccounts:sanitizeDeletedAccountKeys(),
+        ...extra
     };
-    ['click', 'pointerup'].forEach(ev => document.addEventListener(ev, e => { if (performance.now() < suppressUntil) { e.preventDefault(); e.stopPropagation(); } }, true));
-    document.addEventListener('touchstart', e => {
-        if (!isMobileHardware || !e.touches[0]) return;
-        stopMom(); const t = e.touches[0]; lastX = t.clientX; lastY = t.clientY; dragDist = 0; isDrag = false; lastTs = performance.now();
-        const sld = e.target.closest ? e.target.closest('input[type="range"]') : null;
-        if (sld) { activeSld = sld; activeScr = null; if (e.cancelable) e.preventDefault(); setSld(t.clientX, t.clientY, sld); return; }
-        activeSld = null;
-        const rot = window.innerHeight > window.innerWidth;
-        activeScr = rot ? findScr(e.target) : null;
-    }, { capture: true, passive: false });
-    document.addEventListener('touchmove', e => {
-        if (!isMobileHardware || !e.touches[0]) return;
-        const t = e.touches[0], now = performance.now(), dt = Math.max(4, now - lastTs); lastTs = now;
-        if (activeSld) { if (e.cancelable) e.preventDefault(); setSld(t.clientX, t.clientY, activeSld); return; }
-        if (activeScr) {
-            const dx = t.clientX - lastX, dy = t.clientY - lastY;
-            lastX = t.clientX; lastY = t.clientY; dragDist += Math.hypot(dx, dy);
-            if (dragDist > 6) isDrag = true;
-            if (isDrag) { if (e.cancelable) e.preventDefault(); activeScr.scrollTop += dx; vel = vel * 0.45 + (dx / dt) * 0.55; }
-        }
-    }, { capture: true, passive: false });
-    document.addEventListener('touchend', () => {
-        if (isDrag && activeScr) {
-            suppressUntil = performance.now() + 300;
-            const scr = activeScr; let v = vel * 16;
-            const step = () => { if (Math.abs(v) < 0.6) { rafId = 0; return; } scr.scrollTop += v; v *= 0.91; rafId = requestAnimationFrame(step); };
-            if (Math.abs(v) > 1.2) rafId = requestAnimationFrame(step);
-        }
-        activeSld = null; activeScr = null; isDrag = false;
-    }, { capture: true, passive: true });
-})();
+    if(lbChannel){try{lbChannel.postMessage(payload);}catch(e){}}
+    fetch(CLOUD_SYNC_URL_V10,{method:'POST',body:JSON.stringify(payload)}).catch(()=>{});
+}
 
-window.addEventListener('deviceorientation', e => {
-    if (e.beta === null && e.gamma === null) return;
-    const ang = (screen.orientation && typeof screen.orientation.angle === 'number') ? screen.orientation.angle : 0;
-    let raw = ang === 90 ? (e.beta || 0) : (ang === 270 || ang === -90 ? -(e.beta || 0) : (window.innerHeight > window.innerWidth ? (e.beta || 0) : (e.gamma || 0)));
-    if (globalSettings.controls.invertGyro) raw = -raw;
-    lastRawTilt = raw; hasGyroVal = true;
-    if (needsGyroZero) { tiltCenterOffset = raw; smoothedGyro = 0; needsGyroZero = false; }
-    const rd = raw - tiltCenterOffset, dz = Math.abs(rd) < 1.1 ? 0 : (rd > 0 ? rd - 1.1 : rd + 1.1);
-    smoothedGyro += (dz - smoothedGyro) * 0.42;
-    if (globalSettings.controls.mobileMode === 'tilt') setTextCached('gyroLiveAngleLabel', `${smoothedGyro > 0.2 ? '+' : ''}${smoothedGyro.toFixed(1)}°`);
-    if (!gameState.running || gameState.paused || globalSettings.controls.mobileMode !== 'tilt') return;
-    const maxDeg = 18.0 - globalSettings.controls.gyroSensitivity * 11.0;
-    const targetF = Math.max(-2, Math.min(2, (smoothedGyro / Math.max(4.5, maxDeg)) * 2.25));
-    if (Math.abs(targetF - Math.round(gameState.targetLane)) >= 0.42) setDiscreteTargetLane(Math.round(targetF));
-});
+function toggleLeaderboardAdminManageMode(){
+    if(currentPilot.id!=='1117')return;
+    lbAdminManageMode=!lbAdminManageMode;
+    renderLeaderboardList();
+}
 
-window.addEventListener('keydown', e => {
-    if (e.isTrusted) hasTrustedGesture = true;
-    if (!isBootSplashDismissed && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); enterFromBootSplash(); return; }
-    if (document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA')) {
-        if (e.key === 'Escape') document.activeElement.blur();
+function ensureLeaderboardManageHeaderBtn(){
+    const lbModal=document.getElementById('leaderboardModal');
+    if(!lbModal)return;
+    const hdr=lbModal.querySelector('.border-b');
+    if(!hdr)return;
+    let btnWrap=document.getElementById('lbHeaderActionGroup');
+    if(!btnWrap){
+        const backBtn=hdr.querySelector('button');
+        if(!backBtn)return;
+        btnWrap=document.createElement('div');
+        btnWrap.id='lbHeaderActionGroup';
+        btnWrap.className='flex items-center gap-1.5 shrink-0';
+        const manageBtn=document.createElement('button');
+        manageBtn.type='button';
+        manageBtn.id='lbAdminManageToggleBtn';
+        manageBtn.onclick=toggleLeaderboardAdminManageMode;
+        hdr.replaceChild(btnWrap,backBtn);
+        btnWrap.appendChild(manageBtn);
+        btnWrap.appendChild(backBtn);
+    }
+    const manageBtn=document.getElementById('lbAdminManageToggleBtn');
+    if(!manageBtn)return;
+    if(currentPilot.id==='1117'){
+        manageBtn.classList.remove('hidden');
+        manageBtn.innerText=lbAdminManageMode?'✓ Done':'🛠️ Manage';
+        manageBtn.className=lbAdminManageMode
+            ?'px-2.5 py-1.5 rounded-lg bg-cyan-500 text-black font-extrabold text-xs cursor-pointer transition shadow-[0_0_12px_rgba(0,245,212,0.5)]'
+            :'px-2.5 py-1.5 rounded-lg bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border border-cyan-500/40 text-xs font-bold cursor-pointer transition';
+    }else{
+        lbAdminManageMode=false;
+        manageBtn.classList.add('hidden');
+    }
+}
+
+// Clean Leaderboard Renderer: Zero buttons on cards unless 1117 toggles "🛠️ Manage"
+function renderLeaderboardList(){
+    ensureLeaderboardManageHeaderBtn();
+    const container=document.getElementById('leaderboardListContainer');
+    if(!container)return;
+    const list=getLocalLeaderboard();
+    const isAdmin=(currentPilot.id==='1117');
+    if(list.length===0){
+        container.innerHTML=`<div class="recessed-well p-6 rounded-xl text-center space-y-1"><div class="text-sm font-bold text-white">No Runs Recorded Yet</div><p class="text-xs text-gray-400">Complete a run to claim #1 on the Global Leaderboard!</p></div>`;
         return;
     }
-    if (!activeAccount) return;
-    ensureAudioEngine();
-    const k = e.key.toLowerCase();
-    if (awaitingRebindAction) { e.preventDefault(); if (k !== 'escape') globalSettings.controls.binds[awaitingRebindAction] = [k]; awaitingRebindAction = null; refreshKeybindLabels(); saveGlobalSettings(); return; }
-    if (e.key === 'Escape') {
+    const medals=["🥇 #1","🥈 #2","🥉 #3"];
+    container.innerHTML=list.map((entry,idx)=>{
+        const k=normalizeEntryAccountKey(entry);
+        const isCore=CORE_IDS.has(k);
+        const prof=isCore?PILOT_PROFILES[k]:PILOT_PROFILES["GUEST"];
+        const accKey=k||entry.accountKey||entry.id;
+        const gTag=isCore?'':extractGuestIdTag(entry);
+        const dispName=isCore?prof.name:((gTag!=='GUEST'&&!String(entry.name).includes(`#${gTag}`))?`${entry.name} (#${gTag})`:entry.name);
+
+        // Only show sleek compact reset/remove pill when 1117 enables Manage Mode (never clutters cards normally)
+        const actionBtn=(isAdmin&&lbAdminManageMode)
+            ?`<button type="button" onclick="adminDeleteIndividualScore('${escapeHtml(accKey)}')" title="Reset Score, Epoch & Phantom Flashes" class="ml-2 px-2 py-1 rounded-lg bg-black/65 hover:bg-red-600/90 text-red-200 hover:text-white border border-white/20 text-[9.5px] mono-num font-extrabold cursor-pointer transition shrink-0">${isCore?'↺ Reset':'✕ Remove'}</button>`
+            :'';
+
+        const badge=prof.isVoidChroma
+            ?`<span class="px-1.5 py-0.5 text-[9px] mono-num font-extrabold rounded bg-cyan-500/20 text-cyan-300 border border-cyan-400/50">👑 ARCHITECT VOID</span>`
+            :(isCore
+                ?`<span class="px-1.5 py-0.5 text-[9px] mono-num font-bold rounded bg-white/10 text-gray-200">⚡ CORE #${k}</span>`
+                :`<span class="px-1.5 py-0.5 text-[9px] mono-num rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">👤 GUEST #${escapeHtml(gTag)}</span>`);
+        return `<div class="p-3 rounded-xl flex items-center justify-between gap-2 transition ${prof.lbClass}"><div class="flex items-center gap-2.5 min-w-0"><span class="mono-num text-xs font-black text-white px-2 py-1 rounded bg-black/40 border border-white/10 shrink-0">${medals[idx]||`#${idx+1}`}</span><div class="min-w-0"><div class="flex items-center gap-1.5 flex-wrap"><span class="text-xs sm:text-sm truncate ${prof.nameClass}">${escapeHtml(dispName)}</span>${badge}</div><div class="text-[10px] mono-num text-gray-400">Epoch ${entry.epoch||1} &bull; ${prof.liveryName}</div></div></div><div class="flex items-center shrink-0"><span class="mono-num text-sm sm:text-base font-black text-emerald-400">${entry.score.toLocaleString()}</span>${actionBtn}</div></div>`;
+    }).join('');
+}
+
+// Deletes individual Leaderboard vote/score AND resets Main Menu Best Score, Max Epoch & Phantom Flashes (Core, 1117 Himself, or Guest)
+function adminDeleteIndividualScore(targetKey){
+    if(currentPilot.id!=='1117')return;
+    const cleanKey=String(targetKey||'').trim();
+    if(!cleanKey)return;
+    const nowTs=Date.now();
+    const isCore=CORE_IDS.has(cleanKey);
+
+    // 1. Record per-account reset timestamp so old cloud scores never bounce back
+    const resetMap=getPerAccountResetMap();
+    resetMap[cleanKey]=nowTs;
+    savePerAccountResetMap(resetMap);
+
+    // 2. Reset Main Menu stats (Best Score: 0, Max Epoch: 1, Phantom Flashes: 0) in Accounts DB
+    const db=getAccountsDatabase();
+    if(isCore){
+        db[cleanKey]={
+            id:cleanKey,
+            guestId:"",
+            name:PILOT_PROFILES[cleanKey].name,
+            isCore:true,
+            bestScore:0,
+            bestEpoch:1,
+            totalFlashes:0,
+            completedEpoch250:false,
+            updatedAt:nowTs+1
+        };
+    }else{
+        delete db[cleanKey];
+        const delList=sanitizeDeletedAccountKeys();
+        if(!delList.includes(cleanKey)){
+            delList.push(cleanKey);
+            saveDeletedAccountKeys(delList);
+        }
+    }
+    saveAccountsDatabase(db);
+
+    // 3. Remove from Leaderboard DB
+    let rawLb=[];
+    try{rawLb=JSON.parse(localStorage.getItem(LB_STORAGE_KEY)||'[]');}catch(e){rawLb=[];}
+    const filteredLb=(Array.isArray(rawLb)?rawLb:[]).filter(e=>normalizeEntryAccountKey(e)!==cleanKey);
+    localStorage.setItem(LB_STORAGE_KEY,JSON.stringify(filteredLb));
+
+    // 4. Reconcile, sync to cloud, and refresh Main Menu & Leaderboard UI
+    reconcileAllPilotScores();
+    pushCloudLeaderboardPacket();
+    refreshAccountStatsUI();
+    buildBiomeSelectorGrid();
+    renderLeaderboardList();
+    showDevConsoleFeedback(`✓ Reset Score, Epoch & Flashes for ${isCore?PILOT_PROFILES[cleanKey].name:cleanKey.replace('GUEST_ID_','Guest #')}!`);
+    playGameSfx('pickup');
+}
+
+function adminDeleteAllGuestAccounts(){
+    if(currentPilot.id!=='1117')return;
+    const db=getAccountsDatabase();
+    const delSet=new Set(sanitizeDeletedAccountKeys());
+    const resetMap=getPerAccountResetMap();
+    const nowTs=Date.now();
+    Object.keys(db).forEach(k=>{
+        if(!CORE_IDS.has(k)){
+            delSet.add(k);
+            resetMap[k]=nowTs;
+            delete db[k];
+        }
+    });
+    getLocalLeaderboard().forEach(e=>{
+        const k=normalizeEntryAccountKey(e);
+        if(!CORE_IDS.has(k)){
+            delSet.add(k);
+            resetMap[k]=nowTs;
+        }
+    });
+    savePerAccountResetMap(resetMap);
+    saveDeletedAccountKeys(Array.from(delSet));
+    saveAccountsDatabase(db);
+    const coreOnly=getLocalLeaderboard().filter(e=>CORE_IDS.has(normalizeEntryAccountKey(e)));
+    localStorage.setItem(LB_STORAGE_KEY,JSON.stringify(coreOnly));
+    reconcileAllPilotScores();
+    pushCloudLeaderboardPacket();
+    renderLeaderboardList();
+    refreshAccountStatsUI();
+    showDevConsoleFeedback("✓ All Guest Accounts & Guest Scores Deleted!");
+    playGameSfx('pickup');
+}
+
+function upgradeEpoch250HologramWarningUI(){
+    if(!document.getElementById('holoKlaxonStyleTag')){
+        const st=document.createElement('style');
+        st.id='holoKlaxonStyleTag';
+        st.textContent=`
+            @keyframes holoHudPulse {
+                0%, 100% {
+                    border-color: rgba(244, 63, 94, 0.72);
+                    box-shadow: 0 0 18px rgba(244, 63, 94, 0.25), inset 0 0 14px rgba(0, 245, 212, 0.14);
+                    transform: translateY(0px) scale(1);
+                }
+                50% {
+                    border-color: rgba(0, 245, 212, 0.85);
+                    box-shadow: 0 0 26px rgba(0, 245, 212, 0.35), inset 0 0 18px rgba(244, 63, 94, 0.22);
+                    transform: translateY(1px) scale(1.015);
+                }
+            }
+            .holo-top-klaxon {
+                background: linear-gradient(180deg, rgba(24, 6, 14, 0.24) 0%, rgba(8, 20, 34, 0.16) 100%) !important;
+                backdrop-filter: blur(2px);
+                -webkit-backdrop-filter: blur(2px);
+                border: 1px solid rgba(244, 63, 94, 0.7);
+                animation: holoHudPulse 0.55s ease-in-out infinite !important;
+                text-shadow: 0 0 8px rgba(0, 0, 0, 0.95), 0 0 12px rgba(244, 63, 94, 0.75);
+            }
+        `;
+        document.head.appendChild(st);
+    }
+
+    const modal=document.getElementById('epoch250RedAlertModal');
+    if(modal){
+        modal.className='absolute inset-x-0 top-10 sm:top-13 z-[45] flex items-start justify-center pointer-events-none px-3';
+        modal.innerHTML=`
+            <div class="holo-top-klaxon rounded-xl px-3.5 py-1.5 sm:px-5 sm:py-2 max-w-xs sm:max-w-md w-full text-center space-y-0.5 relative overflow-hidden">
+                <div class="text-[8.5px] sm:text-[10px] mono-num font-extrabold text-cyan-300 tracking-widest uppercase flex items-center justify-center gap-1.5">
+                    <span class="w-1.5 h-1.5 rounded-full bg-red-400 animate-ping"></span>
+                    <span>HOLO-ALERT // SINGULARITY BREACH</span>
+                    <span class="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping"></span>
+                </div>
+                <div class="title-cinzel text-xs sm:text-base font-black text-white tracking-wider leading-tight">WARNING: EPOCH 250 INBOUND</div>
+                <div class="text-[8px] sm:text-[9.5px] mono-num font-bold text-amber-300/95 uppercase tracking-wider">VOID MAX OVERDRIVE &bull; 800M HORIZON</div>
+            </div>
+        `;
+    }
+
+    const banner=document.getElementById('singularityAlertBanner');
+    if(banner){
+        banner.className='hud-collapsible absolute top-10 sm:top-13 inset-x-0 z-25 flex justify-center pointer-events-none px-3';
+        banner.innerHTML=`
+            <div class="px-3 py-0.5 sm:px-4 sm:py-1 rounded-lg bg-purple-950/25 border border-cyan-400/65 text-cyan-200 mono-num text-[8.5px] sm:text-[10.5px] font-extrabold tracking-wider uppercase shadow-[0_0_14px_rgba(0,245,212,0.25)] backdrop-blur-[1.5px] text-center">
+                🌌 EPOCH 250 SINGULARITY ACTIVE — VOID MAX (800M) 🌌
+            </div>
+        `;
+    }
+}
+
+function triggerEpoch250BigRedWarning(){
+    upgradeEpoch250HologramWarningUI();
+    gameState.ep250WarnTriggered=true;
+    gameState.ep250WarnTimer=2.6;
+    const modal=document.getElementById('epoch250RedAlertModal');
+    if(modal)modal.style.display='flex';
+    playGameSfx('siren250');
+}
+
+function projectX(laneOffset,zSafe,W,H,roadCurve=0){
+    const scale=(H*0.85)/zSafe;
+    const zNorm=zSafe*0.0181818;
+    const curveShift=roadCurve*(zNorm*zNorm)*(W*0.22);
+    const worldX=(laneOffset-gameState.egoLaneX*0.82)*LANE_WIDTH_M;
+    return W*0.5+worldX*scale*0.24+curveShift;
+}
+
+const REAL_LIFE_HAZARD_DIMS={
+    0:{w:20,h:22}, // auto_rickshaw
+    1:{w:28,h:29}, // bus_truck
+    2:{w:24,h:21}, // car
+    3:{w:13,h:21}, // two_wheeler
+    4:{w:13,h:22}, // pedestrian
+    5:{w:18,h:17}, // stray_animal
+    6:{w:22,h:10}, // pothole
+    7:{w:26,h:9}   // speed_bump
+};
+
+const CLASS_SCALE_STOPPERS={
+    0:{laneFrac:0.38,zStop:2.25,unitW:20}, // auto_rickshaw
+    1:{laneFrac:0.48,zStop:2.35,unitW:28}, // bus_truck
+    2:{laneFrac:0.44,zStop:2.20,unitW:24}, // car
+    3:{laneFrac:0.26,zStop:2.30,unitW:13}, // two_wheeler
+    4:{laneFrac:0.24,zStop:2.35,unitW:13}, // pedestrian
+    5:{laneFrac:0.27,zStop:2.40,unitW:18}, // stray_animal
+    6:{laneFrac:0.46,zStop:2.20,unitW:22}, // pothole
+    7:{laneFrac:0.56,zStop:2.15,unitW:26}, // speed_bump
+    pickup:{laneFrac:0.22,zStop:2.30,unitW:12} // Nitro, EMP & Hull particles
+};
+
+let activeRenderClassKey='pickup';
+
+function getRigidPerspectiveScale(zSafe,W,H,classKeyOverride){
+    const key=(classKeyOverride!==undefined)?classKeyOverride:activeRenderClassKey;
+    activeRenderClassKey='pickup';
+    const stopper=CLASS_SCALE_STOPPERS[key]||CLASS_SCALE_STOPPERS.pickup;
+
+    const zClamped=Math.max(1.25,Math.min(60.0,zSafe));
+    const laneWidthAtStopper=LANE_WIDTH_M*((H*0.85)/stopper.zStop)*0.24;
+    const sAtStopper=(laneWidthAtStopper*stopper.laneFrac)/stopper.unitW;
+
+    if(zClamped>=stopper.zStop){
+        return sAtStopper*Math.pow(stopper.zStop/zClamped,0.85);
+    }
+    return sAtStopper*Math.pow(stopper.zStop/zClamped,0.22);
+}
+
+let fairHazardBag=[];
+let variantCounters={0:0,1:0,2:0,3:0,4:0,5:0,6:0,7:0};
+
+function getNextFairHazardClass(){
+    if(fairHazardBag.length===0){
+        fairHazardBag=[0,1,2,3,4,5,6,7];
+        for(let i=fairHazardBag.length-1;i>0;i--){
+            const j=Math.floor(Math.random()*(i+1));
+            const tmp=fairHazardBag[i];
+            fairHazardBag[i]=fairHazardBag[j];
+            fairHazardBag[j]=tmp;
+        }
+    }
+    const nextId=fairHazardBag.pop();
+    return IDD_HAZARD_CLASSES[nextId]||IDD_HAZARD_CLASSES[0];
+}
+
+function ensureHazardVariant(hz){
+    if(hz&&hz.variantInit&&hz.cls){
+        activeRenderClassKey=hz.cls.id;
+        return;
+    }
+    hz.variantInit=true;
+
+    hz.cls=getNextFairHazardClass();
+    activeRenderClassKey=hz.cls.id;
+
+    const activeDiffKey=(gameState.epoch===250)?'void':currentDiffKey;
+    const diff=DIFFICULTY_PRESETS[activeDiffKey]||DIFFICULTY_PRESETS.easy;
+    const endlessSpeedBonus=Math.min(15,Math.log2(1+gameState.epoch)*2.1);
+    const baseCruise=(24+endlessSpeedBonus)*diff.speedMul;
+    hz.speedMps=hz.cls.speedMul*baseCruise*0.52;
+
+    const cid=hz.cls.id;
+    const vCount=(variantCounters[cid]=(variantCounters[cid]||0)+1);
+    const rngBit=(vCount+(Math.random()<0.35?1:0));
+
+    if(cid===0){
+        hz.variantIdx=rngBit%2;
+        hz.palette=hz.variantIdx===0
+            ?{roof:"#fde047",bodyTop:"#facc15",bodyBot:"#111827",trim:"#f59e0b",glass:"#7dd3fc"}
+            :{roof:"#fde047",bodyTop:"#0ea5e9",bodyBot:"#0c4a6e",trim:"#38bdf8",glass:"#e0f2fe"};
+    }else if(cid===1){
+        hz.subType=(rngBit%2===0)?'bus':'truck';
+        if(hz.subType==='bus'){
+            hz.variantIdx=(vCount>>1)%2;
+            hz.palette=hz.variantIdx===0
+                ?{top:"#3b82f6",body:"#1d4ed8",bot:"#0f172a",stripe:"#38bdf8",trim:"#93c5fd"}
+                :{top:"#f43f5e",body:"#dc2626",bot:"#1f080c",stripe:"#facc15",trim:"#fda4af"};
+        }else{
+            hz.variantIdx=(vCount>>1)%3;
+            const truckPals=[
+                {cab:"#f97316",cargo:"#c2410c",bot:"#1c0a04",trim:"#facc15"},
+                {cab:"#10b981",cargo:"#047857",bot:"#041a13",trim:"#6ee7b7"},
+                {cab:"#38bdf8",cargo:"#1d4ed8",bot:"#091024",trim:"#bae6fd"}
+            ];
+            hz.palette=truckPals[hz.variantIdx];
+        }
+    }else if(cid===2){
+        hz.variantIdx=vCount%5;
+        const carPals=[
+            {top:"#0ea5e9",bot:"#0c4a6e",trim:"#38bdf8",canopy:"#bae6fd"},
+            {top:"#ef4444",bot:"#7f1d1d",trim:"#fda4af",canopy:"#fecdd3"},
+            {top:"#f59e0b",bot:"#78350f",trim:"#fde047",canopy:"#fef08a"},
+            {top:"#10b981",bot:"#064e3b",trim:"#6ee7b7",canopy:"#a7f3d0"},
+            {top:"#a855f7",bot:"#4c1d95",trim:"#d8b4fe",canopy:"#f3e8ff"}
+        ];
+        hz.palette=carPals[hz.variantIdx];
+    }else if(cid===3){
+        hz.variantIdx=vCount%3;
+        const bikePals=[
+            {main:"#22c55e",dark:"#065f46",trim:"#86efac",visor:"#00f5d4"},
+            {main:"#ef4444",dark:"#7f1d1d",trim:"#fca5a5",visor:"#fde047"},
+            {main:"#3b82f6",dark:"#1e3a8a",trim:"#c084fc",visor:"#38bdf8"}
+        ];
+        hz.palette=bikePals[hz.variantIdx];
+    }else if(cid===4){
+        hz.subType=(rngBit%2===0)?'boy':'girl';
+        if(hz.subType==='boy'){
+            hz.palette=((vCount>>1)%2===0)
+                ?{top:"#0ea5e9",trim:"#7dd3fc",bottom:"#1e293b",hair:"#0f172a",skin:"#fed7aa"}
+                :{top:"#ef4444",trim:"#fca5a5",bottom:"#0f172a",hair:"#1c1917",skin:"#fdba74"};
+        }else{
+            hz.palette=((vCount>>1)%2===0)
+                ?{top:"#ec4899",trim:"#f9a8d4",bottom:"#1e1b4b",hair:"#1c1917",skin:"#fed7aa"}
+                :{top:"#a855f7",trim:"#d8b4fe",bottom:"#0f172a",hair:"#27170e",skin:"#fdba74"};
+        }
+    }else if(cid===5){
+        hz.subType=(rngBit%2===0)?'dog':'cat';
+        if(hz.subType==='dog'){
+            hz.palette=((vCount>>1)%2===0)
+                ?{coat:"#f59e0b",dark:"#b45309",belly:"#fef3c7",collar:"#ef4444",outline:"#fde68a"}
+                :{coat:"#d97706",dark:"#78350f",belly:"#ffedd5",collar:"#00f5d4",outline:"#fed7aa"};
+        }else{
+            hz.palette=((vCount>>1)%2===0)
+                ?{coat:"#fb923c",dark:"#c2410c",belly:"#ffedd5",eye:"#4ade80",outline:"#fed7aa"}
+                :{coat:"#cbd5e1",dark:"#475569",belly:"#ffffff",eye:"#facc15",outline:"#f8fafc"};
+        }
+    }else if(cid===7){
+        hz.variantIdx=rngBit%2;
+    }
+}
+// --- END OF MINI-CHUNK 6.1 OF 4 ---
+//--- START OF MINI-CHUNK 6.2 OF 4 ---
+function ensureCachedBiomeGradients(W,H,horizonY,theme){
+    const key=`${W}_${H}_${biomeIdx}`;
+    if(cachedGradients.key===key)return;
+    cachedGradients.key=key;
+    const skyGrad=ctx.createLinearGradient(0,0,0,H);
+    skyGrad.addColorStop(0,theme.skyTop);
+    skyGrad.addColorStop(0.42,theme.skyBot);
+    skyGrad.addColorStop(0.43,theme.roadDark);
+    skyGrad.addColorStop(1,theme.roadDark);
+    cachedGradients.sky=skyGrad;
+
+    const sunGrad=ctx.createRadialGradient(W*0.5,horizonY-16,6,W*0.5,horizonY-16,H*0.34);
+    sunGrad.addColorStop(0,"#ffffff");
+    sunGrad.addColorStop(0.26,theme.sun);
+    sunGrad.addColorStop(1,"transparent");
+    cachedGradients.sun=sunGrad;
+}
+
+function renderUniqueDimensionHorizon(W,H,horizonY,theme,now,dynamicWorldColor,cosmicHue){
+    const cx=W*0.5;
+    const hType=theme.horizonType||"cyber";
+    const u=Math.min(W,H);
+
+    if(hType==="cosmic250"||gameState.epoch===250){
+        const cy=horizonY-22,bhR=u*0.115;
+        if(gfxSettings.pillars){
+            const jetW=bhR*0.44;
+            ctx.fillStyle=`hsla(${cosmicHue},95%,65%,0.22)`;
+            ctx.beginPath();ctx.moveTo(cx-jetW*0.2,cy);ctx.lineTo(cx-jetW*1.45,0);ctx.lineTo(cx+jetW*1.45,0);ctx.lineTo(cx+jetW*0.2,cy);ctx.fill();
+            for(let p=-2;p<=2;p++){
+                if(p===0)continue;
+                const px=cx+p*(W*0.185);
+                ctx.fillStyle=`hsla(${(cosmicHue+p*55+360)%360},95%,62%,0.15)`;
+                ctx.fillRect(px-8,0,16,horizonY);
+            }
+        }
+        ctx.fillStyle=cachedGradients.sun;
+        ctx.beginPath();ctx.arc(cx,cy,bhR*2.75,0,Math.PI*2);ctx.fill();
+        if(gfxSettings.pillars){
+            ctx.save();ctx.translate(cx,cy);ctx.rotate(-0.14+Math.sin(now*0.0008)*0.04);
+            for(let r=0;r<3;r++){
+                ctx.strokeStyle=`hsla(${(cosmicHue+r*65)%360},95%,65%,${0.78-r*0.18})`;
+                ctx.lineWidth=3-r*0.65;
+                ctx.beginPath();ctx.ellipse(0,0,bhR*(1.55+r*0.38),bhR*(0.32+r*0.08),0,0,Math.PI*2);ctx.stroke();
+            }
+            ctx.restore();
+        }
+        ctx.fillStyle="#010006";ctx.beginPath();ctx.arc(cx,cy,bhR*0.88,0,Math.PI*2);ctx.fill();
+        ctx.strokeStyle=dynamicWorldColor;ctx.lineWidth=2.8;ctx.beginPath();ctx.arc(cx,cy,bhR*0.90,0,Math.PI*2);ctx.stroke();
+        return;
+    }
+
+    ctx.fillStyle=cachedGradients.sun;
+    ctx.beginPath();ctx.arc(cx,horizonY-10,H*0.28,Math.PI,0,false);ctx.fill();
+
+    if(hType==="cyber"){
+        const sunR=u*0.135;
+        if(gfxSettings.pillars){
+            [-1,1].forEach((s,i)=>{
+                const ang=Math.sin(now*0.0012+i)*0.28;
+                ctx.fillStyle="rgba(56,189,248,0.10)";
+                ctx.beginPath();ctx.moveTo(cx+s*W*0.22,horizonY);
+                ctx.lineTo(cx+s*W*0.22+Math.sin(ang)*140-28,0);
+                ctx.lineTo(cx+s*W*0.22+Math.sin(ang)*140+28,0);
+                ctx.closePath();ctx.fill();
+            });
+        }
+        ctx.save();
+        ctx.beginPath();ctx.arc(cx,horizonY-2,sunR,Math.PI,0,false);ctx.clip();
+        const sg=ctx.createLinearGradient(cx,horizonY-sunR,cx,horizonY);
+        sg.addColorStop(0,"#00f5d4");sg.addColorStop(0.55,"#38bdf8");sg.addColorStop(1,"#ec4899");
+        ctx.fillStyle=sg;ctx.fillRect(cx-sunR,horizonY-sunR-2,sunR*2,sunR+2);
+        ctx.fillStyle=theme.skyBot;
+        for(let s=0;s<7;s++){ctx.fillRect(cx-sunR,horizonY-s*(sunR*0.13)-3,sunR*2,1.8+s*0.65);}
+        ctx.restore();
+        const bCount=24,bw=W/bCount;
+        for(let b=0;b<bCount;b++){
+            const bx=b*bw,distC=Math.abs((bx+bw*0.5)-cx)/(W*0.5);
+            const bh=(18+((b*41)%46))*(0.45+distC*0.75);
+            ctx.fillStyle="#040710";ctx.fillRect(bx,horizonY-bh,bw+1,bh);
+            ctx.strokeStyle="rgba(56,189,248,0.45)";ctx.lineWidth=1;ctx.strokeRect(bx,horizonY-bh,bw,bh);
+            ctx.fillStyle=(b&1)?"#38bdf888":"#f472b688";
+            ctx.fillRect(bx+3,horizonY-bh+4,Math.max(2,bw-6),2);
+            if(bh>34){ctx.beginPath();ctx.moveTo(bx+bw*0.5,horizonY-bh);ctx.lineTo(bx+bw*0.5,horizonY-bh-12);ctx.stroke();}
+        }
+    }else if(hType==="monsoon"){
+        if((Math.floor(now*0.009)%11)===0){
+            ctx.strokeStyle="#a7f3d0";ctx.lineWidth=2.2;
+            ctx.beginPath();ctx.moveTo(cx+W*0.12,0);ctx.lineTo(cx+W*0.09,horizonY*0.38);ctx.lineTo(cx+W*0.13,horizonY*0.52);ctx.lineTo(cx+W*0.07,horizonY);ctx.stroke();
+        }
+        const spanW=W*0.26,towerH=H*0.19,deckY=horizonY-H*0.045;
+        ctx.strokeStyle="rgba(16,185,129,0.42)";ctx.lineWidth=1.2;
+        for(let x=cx-spanW;x<=cx+spanW;x+=18){
+            const norm=(x-cx)/spanW;
+            const cableY=(horizonY-towerH)+(1-norm*norm)*(deckY-(horizonY-towerH)-6);
+            ctx.beginPath();ctx.moveTo(x,cableY);ctx.lineTo(x,deckY);ctx.stroke();
+        }
+        ctx.strokeStyle="#10b981";ctx.lineWidth=2.4;
+        ctx.beginPath();ctx.moveTo(cx-spanW,horizonY-towerH);ctx.quadraticCurveTo(cx,deckY-6,cx+spanW,horizonY-towerH);ctx.stroke();
+        ctx.beginPath();ctx.moveTo(0,deckY);ctx.lineTo(cx-spanW,horizonY-towerH);ctx.moveTo(cx+spanW,horizonY-towerH);ctx.lineTo(W,deckY);ctx.stroke();
+        ctx.fillStyle="#041214";ctx.fillRect(0,deckY,W,4);
+        [-1,1].forEach(s=>{
+            const tx=cx+s*spanW;
+            ctx.fillStyle="#061a1e";ctx.strokeStyle="#10b981";ctx.lineWidth=1.8;
+            ctx.beginPath();ctx.moveTo(tx-12,horizonY);ctx.lineTo(tx-6,horizonY-towerH);ctx.lineTo(tx+6,horizonY-towerH);ctx.lineTo(tx+12,horizonY);ctx.closePath();ctx.fill();ctx.stroke();
+            ctx.fillStyle="#34d399";ctx.beginPath();ctx.arc(tx,horizonY-towerH-3,3,0,Math.PI*2);ctx.fill();
+        });
+    }else if(hType==="solar"){
+        const r=u*0.125,cy=horizonY-r*0.55;
+        ctx.fillStyle="#fff7ed";ctx.strokeStyle="#f97316";ctx.lineWidth=3;
+        ctx.beginPath();ctx.arc(cx,cy,r,Math.PI*0.92,Math.PI*0.08,false);ctx.fill();ctx.stroke();
+        ctx.strokeStyle="rgba(251,146,60,0.65)";ctx.lineWidth=2;
+        for(let i=0;i<6;i++){
+            const a=Math.PI+(i/5)*Math.PI+Math.sin(now*0.002+i)*0.08;
+            ctx.beginPath();ctx.arc(cx+Math.cos(a)*r,cy+Math.sin(a)*r,r*0.24,0,Math.PI*2);ctx.stroke();
+        }
+        [-1,1].forEach(s=>{
+            const px=cx+s*(W*0.27),py=horizonY-H*0.11;
+            if(gfxSettings.pillars){
+                ctx.fillStyle="rgba(245,158,11,0.16)";
+                ctx.fillRect(px-5,0,10,horizonY);
+            }
+            ctx.fillStyle="#1c080d";ctx.strokeStyle="#f59e0b";ctx.lineWidth=1.8;
+            ctx.beginPath();
+            ctx.moveTo(px,py-26);ctx.lineTo(px+22,py);ctx.lineTo(px,py+26);ctx.lineTo(px-22,py);
+            ctx.closePath();ctx.fill();ctx.stroke();
+            ctx.beginPath();ctx.moveTo(px-18,horizonY);ctx.lineTo(px,py+26);ctx.lineTo(px+18,horizonY);ctx.stroke();
+        });
+    }else if(hType==="cryo"){
+        if(gfxSettings.pillars){
+            for(let band=0;band<3;band++){
+                ctx.strokeStyle=band===0?"rgba(56,189,248,0.34)":(band===1?"rgba(52,211,153,0.28)":"rgba(192,132,252,0.22)");
+                ctx.lineWidth=12-band*3;
+                ctx.beginPath();
+                for(let x=0;x<=W;x+=32){
+                    const y=horizonY*(0.22+band*0.12)+Math.sin(x*0.011+now*0.0016+band)*14;
+                    if(x===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+                }
+                ctx.stroke();
+            }
+        }
+        const peaks=[[-0.38,0.11],[-0.22,0.18],[-0.08,0.13],[0.0,0.22],[0.11,0.14],[0.25,0.19],[0.39,0.12]];
+        peaks.forEach(([ox,oh])=>{
+            const px=cx+ox*W,pw=W*0.13,ph=H*oh;
+            ctx.fillStyle="#041529";ctx.strokeStyle="#7dd3fc";ctx.lineWidth=1.4;
+            ctx.beginPath();ctx.moveTo(px-pw,horizonY);ctx.lineTo(px,horizonY-ph);ctx.lineTo(px+pw,horizonY);ctx.closePath();ctx.fill();ctx.stroke();
+            ctx.fillStyle="rgba(224,242,254,0.25)";
+            ctx.beginPath();ctx.moveTo(px,horizonY-ph);ctx.lineTo(px+pw,horizonY);ctx.lineTo(px+pw*0.15,horizonY);ctx.closePath();ctx.fill();
+        });
+    }else if(hType==="bio"){
+        const mr=u*0.095,mcy=horizonY-mr*1.25;
+        const pulse=1+Math.sin(now*0.0035)*0.08;
+        if(gfxSettings.pillars){
+            for(let b=-2;b<=2;b++){
+                if(b===0)continue;
+                const bx=cx+b*(W*0.18)+Math.sin(now*0.0015+b)*10;
+                ctx.fillStyle="rgba(74,222,128,0.11)";
+                ctx.fillRect(bx-5,0,10,horizonY);
+            }
+        }
+        ctx.save();
+        ctx.translate(cx,mcy);
+        ctx.fillStyle="#032211";ctx.strokeStyle="#4ade80";ctx.lineWidth=2.2;
+        ctx.beginPath();ctx.arc(0,0,mr*pulse,0,Math.PI*2);ctx.fill();ctx.stroke();
+        ctx.fillStyle="rgba(34,197,94,0.38)";
+        ctx.beginPath();ctx.arc(0,0,mr*0.58*pulse,0,Math.PI*2);ctx.fill();
+        ctx.fillStyle="#bbf7d0";
+        ctx.beginPath();ctx.arc(0,0,mr*0.24*pulse,0,Math.PI*2);ctx.fill();
+        for(let r=0;r<2;r++){
+            ctx.save();
+            ctx.rotate(now*(r===0?0.0012:-0.0015)+r*1.1);
+            ctx.strokeStyle=r===0?"#4ade80":"#00f5d4";
+            ctx.lineWidth=1.8;
+            ctx.beginPath();ctx.ellipse(0,0,mr*1.48,mr*0.38,0,0,Math.PI*2);ctx.stroke();
+            for(let n=0;n<6;n++){
+                const a=(n/6)*Math.PI*2;
+                ctx.fillStyle="#fef08a";
+                ctx.beginPath();ctx.arc(Math.cos(a)*mr*1.48,Math.sin(a)*mr*0.38,2.5,0,Math.PI*2);ctx.fill();
+            }
+            ctx.restore();
+        }
+        ctx.restore();
+        [-0.35,-0.20,0.20,0.35].forEach((ox,i)=>{
+            const sway=Math.sin(now*0.0022+i)*6;
+            const mx=cx+ox*W+sway,stemH=H*(i%2===0?0.10:0.145),capR=u*(i%2===0?0.052:0.072);
+            const topY=horizonY-stemH;
+            ctx.fillStyle="#041f11";ctx.strokeStyle="#22c55e";ctx.lineWidth=1.6;
+            ctx.beginPath();
+            ctx.moveTo(cx+ox*W-6,horizonY);
+            ctx.quadraticCurveTo(mx-2,horizonY-stemH*0.5,mx-4,topY);
+            ctx.lineTo(mx+4,topY);
+            ctx.quadraticCurveTo(mx+2,horizonY-stemH*0.5,cx+ox*W+6,horizonY);
+            ctx.closePath();ctx.fill();ctx.stroke();
+            ctx.fillStyle="#06371c";ctx.strokeStyle="#4ade80";ctx.lineWidth=2;
+            ctx.beginPath();ctx.ellipse(mx,topY,capR,capR*0.44,0,Math.PI,0,false);ctx.closePath();ctx.fill();ctx.stroke();
+            ctx.strokeStyle="rgba(187,247,208,0.45)";ctx.lineWidth=1;
+            for(let g=-2;g<=2;g++){
+                ctx.beginPath();ctx.moveTo(mx,topY-capR*0.38);ctx.lineTo(mx+g*(capR*0.36),topY);ctx.stroke();
+                const tendrilH=10+Math.sin(now*0.004+i+g)*5;
+                ctx.strokeStyle="rgba(0,245,212,0.55)";
+                ctx.beginPath();ctx.moveTo(mx+g*(capR*0.32),topY);ctx.lineTo(mx+g*(capR*0.32)+sway*0.4,topY+tendrilH);ctx.stroke();
+                ctx.strokeStyle="rgba(187,247,208,0.45)";
+            }
+        });
+    }else if(hType==="eclipse"){
+        const r=u*0.105,ecy=horizonY-r*1.12;
+        ctx.strokeStyle="rgba(244,63,94,0.35)";ctx.lineWidth=8;
+        ctx.beginPath();ctx.arc(cx,ecy,r*1.14,0,Math.PI*2);ctx.stroke();
+        ctx.fillStyle="#040002";ctx.strokeStyle="#fb7185";ctx.lineWidth=2.5;
+        ctx.beginPath();ctx.arc(cx,ecy,r,0,Math.PI*2);ctx.fill();ctx.stroke();
+        ctx.fillStyle="#ffffff";ctx.beginPath();ctx.arc(cx+r*0.72,ecy-r*0.68,5+Math.sin(now*0.005)*1.5,0,Math.PI*2);ctx.fill();
+        for(let s=-5;s<=5;s++){
+            if(s===0)continue;
+            const sx=cx+s*(W*0.075),sh=H*(Math.abs(s)%2===1?0.15:0.10);
+            ctx.fillStyle="#120307";ctx.strokeStyle="#f43f5e88";ctx.lineWidth=1.2;
+            ctx.beginPath();ctx.moveTo(sx-10,horizonY);ctx.lineTo(sx-6,horizonY-sh*0.55);ctx.lineTo(sx,horizonY-sh);ctx.lineTo(sx+6,horizonY-sh*0.55);ctx.lineTo(sx+10,horizonY);ctx.closePath();ctx.fill();ctx.stroke();
+        }
+    }else if(hType==="tachyon"){
+        const coreY=horizonY-H*0.13,coreR=u*0.055;
+        ctx.fillStyle="#1e0b3b";ctx.strokeStyle="#eab308";ctx.lineWidth=2.2;
+        ctx.beginPath();ctx.arc(cx,coreY,coreR,0,Math.PI*2);ctx.fill();ctx.stroke();
+        ctx.strokeStyle="#c084fc";ctx.lineWidth=1.8;
+        ctx.beginPath();ctx.ellipse(cx,coreY,coreR*1.65,coreR*0.45,now*0.002,0,Math.PI*2);ctx.stroke();
+        [-1,1].forEach(s=>{
+            const tx=cx+s*(W*0.24),th=H*0.17;
+            ctx.fillStyle="#120726";ctx.strokeStyle="#c084fc";ctx.lineWidth=1.6;
+            ctx.beginPath();ctx.moveTo(tx-14,horizonY);ctx.lineTo(tx-6,horizonY-th);ctx.lineTo(tx+6,horizonY-th);ctx.lineTo(tx+14,horizonY);ctx.closePath();ctx.fill();ctx.stroke();
+            for(let r=1;r<=3;r++){
+                const ry=horizonY-th*(0.28*r);
+                ctx.strokeRect(tx-11,ry,22,4);
+            }
+            ctx.strokeStyle="#fde047";ctx.lineWidth=2;
+            ctx.beginPath();ctx.moveTo(tx,horizonY-th);
+            ctx.quadraticCurveTo((tx+cx)*0.5,coreY-18+Math.sin(now*0.018+s)*12,cx+s*coreR,coreY);ctx.stroke();
+        });
+    }else if(hType==="dune"){
+        ctx.fillStyle="#fef08a";ctx.beginPath();ctx.arc(cx-W*0.09,horizonY-H*0.15,u*0.038,0,Math.PI*2);ctx.fill();
+        ctx.fillStyle="#f97316";ctx.beginPath();ctx.arc(cx+W*0.10,horizonY-H*0.10,u*0.068,0,Math.PI*2);ctx.fill();
+        [[-0.23,0.11,0.10],[0,0.16,0.15],[0.23,0.11,0.10]].forEach(([ox,pwR,phR])=>{
+            const px=cx+ox*W,pw=W*pwR,ph=H*phR;
+            ctx.fillStyle="#120902";ctx.strokeStyle="#fbbf24";ctx.lineWidth=1.5;
+            ctx.beginPath();ctx.moveTo(px-pw,horizonY);ctx.lineTo(px,horizonY-ph);ctx.lineTo(px+pw*0.85,horizonY);ctx.closePath();ctx.fill();ctx.stroke();
+            ctx.fillStyle="#291505";
+            ctx.beginPath();ctx.moveTo(px,horizonY-ph);ctx.lineTo(px+pw*0.85,horizonY);ctx.lineTo(px+pw*0.1,horizonY);ctx.closePath();ctx.fill();
+            ctx.fillStyle="#fde68a";
+            ctx.beginPath();ctx.moveTo(px-pw*0.18,horizonY-ph*0.82);ctx.lineTo(px,horizonY-ph);ctx.lineTo(px+pw*0.15,horizonY-ph*0.82);ctx.closePath();ctx.fill();
+        });
+    }else if(hType==="sakura"){
+        const mr=u*0.125;
+        ctx.fillStyle="rgba(251,207,232,0.88)";
+        ctx.beginPath();ctx.arc(cx,horizonY-mr*0.55,mr,Math.PI,0,false);ctx.fill();
+        const fw=W*0.26,fh=H*0.16;
+        ctx.fillStyle="#12061c";ctx.strokeStyle="#f472b6";ctx.lineWidth=1.6;
+        ctx.beginPath();ctx.moveTo(cx-fw,horizonY);ctx.quadraticCurveTo(cx-fw*0.35,horizonY-fh*0.35,cx-fw*0.14,horizonY-fh);
+        ctx.lineTo(cx+fw*0.14,horizonY-fh);ctx.quadraticCurveTo(cx+fw*0.35,horizonY-fh*0.35,cx+fw,horizonY);ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.fillStyle="#fdf2f8";
+        ctx.beginPath();ctx.moveTo(cx-fw*0.14,horizonY-fh);ctx.lineTo(cx+fw*0.14,horizonY-fh);
+        ctx.lineTo(cx+fw*0.22,horizonY-fh*0.68);ctx.lineTo(cx,horizonY-fh*0.76);ctx.lineTo(cx-fw*0.22,horizonY-fh*0.68);ctx.closePath();ctx.fill();
+        const px=cx-W*0.29;
+        for(let t=0;t<4;t++){
+            const tw=26-t*4,ty=horizonY-10-t*11;
+            ctx.fillStyle="#1a0826";ctx.strokeStyle="#ec4899";ctx.lineWidth=1.2;
+            ctx.fillRect(px-tw*0.5,ty,tw,8);
+            ctx.beginPath();ctx.moveTo(px-tw*0.75,ty);ctx.lineTo(px+tw*0.75,ty);ctx.stroke();
+        }
+        const tx=cx+W*0.29;
+        ctx.fillStyle="#ec4899";
+        ctx.fillRect(tx-14,horizonY-32,4,32);ctx.fillRect(tx+10,horizonY-32,4,32);
+        ctx.fillRect(tx-22,horizonY-34,44,4);ctx.fillRect(tx-17,horizonY-23,34,3);
+    }else if(hType==="matrix"){
+        if(gfxSettings.pillars){
+            ctx.fillStyle="rgba(34,197,94,0.28)";
+            for(let c=0;c<22;c++){
+                const mx=(c/22)*W,my=((now*0.09+c*53)%(horizonY-14));
+                ctx.fillRect(mx,my,2.5,14);
+                ctx.fillStyle="#bbf7d0";ctx.fillRect(mx,my+12,2.5,3);
+                ctx.fillStyle="rgba(34,197,94,0.28)";
+            }
+        }
+        const mr=u*0.105,cy=horizonY-mr*1.08;
+        ctx.save();ctx.translate(cx,cy);
+        ctx.strokeStyle="#22c55e";ctx.lineWidth=2;
+        ctx.beginPath();ctx.arc(0,0,mr*1.18,0,Math.PI*2);ctx.stroke();
+        ctx.rotate(now*0.0008);
+        ctx.fillStyle="#021407";
+        ctx.beginPath();ctx.moveTo(0,-mr);ctx.lineTo(mr,0);ctx.lineTo(0,mr);ctx.lineTo(-mr,0);ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.strokeRect(-mr*0.55,-mr*0.55,mr*1.1,mr*1.1);
+        ctx.restore();
+    }else if(hType==="saturn"){
+        const r=u*0.105,cy=horizonY-r*1.02;
+        ctx.save();
+        ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.clip();
+        ctx.fillStyle="#1e1b4b";ctx.fillRect(cx-r,cy-r,r*2,r*2);
+        ctx.fillStyle="rgba(129,140,248,0.28)";
+        for(let b=-3;b<=3;b++){ctx.fillRect(cx-r,cy+b*(r*0.24),r*2,r*0.11);}
+        ctx.restore();
+        ctx.strokeStyle="#818cf8";ctx.lineWidth=2;ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.stroke();
+        ctx.save();ctx.translate(cx,cy);ctx.rotate(-0.18+Math.sin(now*0.0005)*0.03);
+        for(let ring=0;ring<3;ring++){
+            ctx.strokeStyle=ring===1?"rgba(199,210,254,0.85)":"rgba(129,140,248,0.55)";
+            ctx.lineWidth=ring===1?3.5:1.8;
+            ctx.beginPath();ctx.ellipse(0,0,r*(1.65+ring*0.35),r*(0.28+ring*0.07),0,0,Math.PI*2);ctx.stroke();
+        }
+        ctx.restore();
+        ctx.fillStyle="#c7d2fe";
+        ctx.beginPath();ctx.arc(cx-r*2.4,cy-r*0.5,5,0,Math.PI*2);ctx.arc(cx+r*2.3,cy+r*0.3,7,0,Math.PI*2);ctx.fill();
+    }else if(hType==="magma"){
+        const vh=H*0.17,vw=W*0.24;
+        ctx.fillStyle="#170401";ctx.strokeStyle="#fb923c";ctx.lineWidth=1.8;
+        ctx.beginPath();ctx.moveTo(0,horizonY);ctx.lineTo(cx-vw,horizonY-vh*0.42);
+        ctx.lineTo(cx-vw*0.22,horizonY-vh);ctx.lineTo(cx,horizonY-vh*0.86);ctx.lineTo(cx+vw*0.22,horizonY-vh);
+        ctx.lineTo(cx+vw,horizonY-vh*0.42);ctx.lineTo(W,horizonY);ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.fillStyle="#ef4444";
+        ctx.beginPath();ctx.arc(cx,horizonY-vh,14+Math.sin(now*0.012)*4,Math.PI,0,false);ctx.fill();
+        ctx.strokeStyle="#facc15";ctx.lineWidth=2.4;
+        ctx.beginPath();
+        ctx.moveTo(cx-6,horizonY-vh*0.9);ctx.quadraticCurveTo(cx-24,horizonY-vh*0.4,cx-38,horizonY);
+        ctx.moveTo(cx+6,horizonY-vh*0.9);ctx.quadraticCurveTo(cx+20,horizonY-vh*0.45,cx+32,horizonY);
+        ctx.stroke();
+    }else if(hType==="astral"){
+        const cy=horizonY-H*0.12,r=u*0.075;
+        ctx.save();ctx.translate(cx,cy);ctx.rotate(now*0.0008);
+        ctx.strokeStyle="#f8fafc";ctx.lineWidth=1.8;
+        ctx.beginPath();ctx.arc(0,0,r,0,Math.PI*2);ctx.stroke();
+        ctx.strokeRect(-r*0.7,-r*0.7,r*1.4,r*1.4);
+        ctx.restore();
+        for(let m=-3;m<=3;m++){
+            if(m===0)continue;
+            const mx=cx+m*(W*0.105),mh=34-(Math.abs(m)*4);
+            const fy=horizonY-18-Math.sin(now*0.0022+m)*6;
+            ctx.fillStyle="#0b0f19";ctx.strokeStyle="#e2e8f0";ctx.lineWidth=1.5;
+            ctx.beginPath();ctx.moveTo(mx-8,fy);ctx.lineTo(mx-8,fy-mh);ctx.lineTo(mx,fy-mh-8);ctx.lineTo(mx+8,fy-mh);ctx.lineTo(mx+8,fy);ctx.closePath();ctx.fill();ctx.stroke();
+            ctx.fillStyle="#38bdf8";ctx.fillRect(mx-1.5,fy-mh+4,3,mh-10);
+        }
+    }
+}
+
+const empDisintegrationFX=[];
+let empFlashAlpha=0;
+
+function triggerNeuralEmp(){
+    if(!gameState.running||gameState.paused)return;
+    if(gameState.empCharge<100){
+        spawnFloatingText("⚡ EMP CHARGING...","#94a3b8",0,-20);
+        return;
+    }
+    gameState.empCharge=0;
+    gameState.empWaveRadius=1;
+    empFlashAlpha=0.45;
+    if(gfxSettings.shake)gameState.screenShake=10;
+    playGameSfx('emp');
+
+    for(let i=0;i<gameState.hazards.length;i++){
+        const h=gameState.hazards[i];
+        ensureHazardVariant(h);
+        const shards=[];
+        const shardCount=isMobileHardware?10:16;
+        const mainCol=(h.palette&&(h.palette.top||h.palette.main||h.palette.coat||h.palette.bodyTop))||h.cls.color||"#38bdf8";
+        for(let s=0;s<shardCount;s++){
+            const ang=(s/shardCount)*Math.PI*2+(Math.random()*0.35);
+            const spd=24+Math.random()*50;
+            shards.push({
+                vx:Math.cos(ang)*spd,
+                vy:Math.sin(ang)*spd-22,
+                sz:2.0+Math.random()*2.4,
+                col:(s%3===0)?"#ffffff":((s%2===0)?"#00f5d4":mainCol)
+            });
+        }
+        empDisintegrationFX.push({
+            lane:h.lane,
+            z:Math.max(0.9,h.z),
+            cls:h.cls,
+            mainCol,
+            life:1.0,
+            shards
+        });
+    }
+
+    const cleared=gameState.hazards.length;
+    const bonus=cleared*Math.round(160*gameState.combo);
+    gameState.score+=bonus;
+    gameState.hazards=[];
+    spawnFloatingText(`⚡ NEURAL EMP VAPORIZED ${cleared} HAZARDS! +${bonus}`,"#38bdf8",0,-60);
+    updateHudDOM(true);
+}
+
+function updateAndRenderEmpDisintegrations(dt,W,H,roadCurve,activeRailColor){
+    if(empFlashAlpha>0){
+        empFlashAlpha=Math.max(0,empFlashAlpha-dt*1.35);
+    }
+    if(empDisintegrationFX.length===0)return;
+
+    for(let i=empDisintegrationFX.length-1;i>=0;i--){
+        const fx=empDisintegrationFX[i];
+        fx.life-=dt*1.65;
+        if(fx.life<=0){
+            empDisintegrationFX.splice(i,1);
+            continue;
+        }
+        const prog=1-fx.life;
+        const bx=projectX(fx.lane,fx.z,W,H,roadCurve);
+        const by=projectY(fx.z,0,H)-prog*18;
+        const s=getRigidPerspectiveScale(fx.z,W,H);
+        const dims=gfxSettings.legacyModels?{w:25,h:23}:(REAL_LIFE_HAZARD_DIMS[fx.cls.id]||{w:24,h:21});
+        const boxW=dims.w*s*(1+prog*0.35);
+        const boxH=dims.h*s*(1-prog*0.25);
+
+        ctx.save();
+        ctx.globalAlpha=Math.max(0,fx.life);
+
+        ctx.fillStyle="rgba(0,245,212,0.28)";
+        const beamW=Math.max(2.5,boxW*0.32*fx.life);
+        ctx.fillRect(bx-beamW*0.5,by-boxH*2.2,beamW,boxH*2.2);
+
+        ctx.strokeStyle=prog<0.35?"#ffffff":"#00f5d4";
+        ctx.lineWidth=1.8;
+        ctx.beginPath();
+        ctx.ellipse(bx,by-boxH*0.35,boxW*(0.55+prog*0.95),boxH*(0.32+prog*0.55),0,0,Math.PI*2);
+        ctx.stroke();
+
+        const sliceCount=isMobileHardware?4:6;
+        const sliceH=boxH/sliceCount;
+        for(let sl=0;sl<sliceCount;sl++){
+            const jitter=(sl%2===0?1:-1)*prog*13*s;
+            ctx.fillStyle=(sl%2===0)?"#00f5d4":(fx.mainCol||activeRailColor);
+            ctx.fillRect(bx-boxW*0.46+jitter,by-boxH+sl*sliceH,boxW*0.92,sliceH*0.58);
+        }
+
+        for(let k=0;k<fx.shards.length;k++){
+            const sh=fx.shards[k];
+            const sx=bx+sh.vx*prog*s;
+            const sy=(by-boxH*0.5)+sh.vy*prog*s;
+            ctx.fillStyle=sh.col;
+            const sz=sh.sz*s*fx.life;
+            ctx.fillRect(sx-sz*0.5,sy-sz*0.5,sz,sz);
+        }
+
+        ctx.restore();
+    }
+}
+
+// Compact Pickup Renderer (Reduced proportion r=6.0*s, scales with path from horizon to car)
+function renderHighTexturePickup(pk,W,H,roadCurve,now){
+    const zSafe=Math.max(0.55,pk.z);
+    const px=projectX(pk.lane,zSafe,W,H,roadCurve);
+    const roadY=projectY(zSafe,0,H);
+    const s=getRigidPerspectiveScale(zSafe,W,H);
+    const r=6.0*s;
+
+    if(gfxSettings.legacyModels){
+        const py=roadY-r*1.4;
+        ctx.save();
+        ctx.translate(px,py);
+        ctx.rotate(pk.spin);
+        ctx.fillStyle=pk.type==='nitro'?"#fbbf24":(pk.type==='emp'?"#38bdf8":"#10b981");
+        ctx.strokeStyle="#ffffff";
+        ctx.lineWidth=Math.max(1.1,1.4*s);
+        ctx.fillRect(-r,-r,r*2,r*2);
+        ctx.strokeRect(-r,-r,r*2,r*2);
+        ctx.fillStyle="#ffffff";
+        ctx.fillRect(-r*0.35,-r*0.35,r*0.7,r*0.7);
+        ctx.restore();
+        return;
+    }
+
+    const hoverBob=gfxSettings.transitions?Math.sin(now*0.0065+pk.spin)*1.6*s:0;
+    const py=roadY-r*1.45+hoverBob;
+    const mainCol=pk.type==='nitro'?"#fbbf24":(pk.type==='emp'?"#38bdf8":"#10b981");
+    const coreCol=pk.type==='nitro'?"#fef08a":(pk.type==='emp'?"#e0f2fe":"#a7f3d0");
+    const darkCol=pk.type==='nitro'?"#78350f":(pk.type==='emp'?"#0c4a6e":"#064e3b");
+    const highDetail=(gfxSettings.preset==='high'||gfxSettings.preset==='ultra');
+
+    ctx.fillStyle="rgba(0,0,0,0.52)";
+    ctx.beginPath();
+    ctx.ellipse(px,roadY+1.2*s,r*0.92,r*0.26,0,0,Math.PI*2);
+    ctx.fill();
+
+    ctx.save();
+    ctx.translate(px,py);
+
+    if(highDetail){
+        ctx.save();
+        ctx.rotate(-pk.spin*0.65);
+        ctx.strokeStyle=`${mainCol}88`;
+        ctx.lineWidth=Math.max(0.9,1.05*s);
+        const rOuter=r*1.14;
+        ctx.strokeRect(-rOuter,-rOuter,rOuter*2,rOuter*2);
+        ctx.restore();
+    }
+
+    ctx.rotate(pk.spin);
+    if(gfxSettings.bloom&&!isMobileHardware){
+        ctx.shadowBlur=10;
+        ctx.shadowColor=mainCol;
+    }
+    ctx.fillStyle=mainCol;
+    ctx.strokeStyle="#ffffff";
+    ctx.lineWidth=Math.max(1.1,1.4*s);
+    ctx.fillRect(-r,-r,r*2,r*2);
+    ctx.strokeRect(-r,-r,r*2,r*2);
+    ctx.shadowBlur=0;
+
+    ctx.fillStyle=darkCol;
+    ctx.fillRect(-r*0.66,-r*0.66,r*1.32,r*1.32);
+    ctx.strokeStyle=coreCol;
+    ctx.lineWidth=Math.max(0.8,0.95*s);
+    ctx.strokeRect(-r*0.66,-r*0.66,r*1.32,r*1.32);
+
+    ctx.fillStyle="#ffffff";
+    ctx.fillRect(-r*0.35,-r*0.35,r*0.70,r*0.70);
+
+    ctx.restore();
+}
+// --- END OF MINI-CHUNK 6.2 OF 4 ---
+// --- START OF MINI-CHUNK 6.3 OF 4 ---
+function renderLegacyHazardModel(hz,bx,by,s,boxW,boxH,primaryCol){
+    const x1=bx-boxW*0.5,y2=by,y1=y2-boxH;
+    const cid=hz.cls.id;
+    if(cid===0){
+        ctx.fillStyle="#05070b";
+        ctx.fillRect(x1+1*s,y2-6*s,4*s,6*s);ctx.fillRect(x1+boxW-5*s,y2-6*s,4*s,6*s);ctx.fillRect(bx-2*s,y2-5*s,4*s,5*s);
+        ctx.fillStyle="#111827";ctx.strokeStyle=primaryCol;ctx.lineWidth=1.5;
+        ctx.beginPath();
+        ctx.moveTo(x1+2*s,y2-3*s);ctx.lineTo(x1+3*s,y1+boxH*0.36);ctx.quadraticCurveTo(bx,y1-3*s,x1+boxW-3*s,y1+boxH*0.36);
+        ctx.lineTo(x1+boxW-2*s,y2-3*s);ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.fillStyle=primaryCol;
+        ctx.fillRect(x1+3*s,y1+boxH*0.48,boxW-6*s,boxH*0.40);
+        ctx.fillStyle="#060b14";ctx.strokeStyle="#38bdf888";ctx.lineWidth=1;
+        ctx.fillRect(x1+5*s,y1+boxH*0.18,boxW-10*s,boxH*0.25);ctx.strokeRect(x1+5*s,y1+boxH*0.18,boxW-10*s,boxH*0.25);
+        ctx.fillStyle="#ff1e42";
+        ctx.fillRect(x1+4*s,y2-7*s,5*s,3*s);ctx.fillRect(x1+boxW-9*s,y2-7*s,5*s,3*s);
+        ctx.fillStyle="#fde047";ctx.fillRect(bx-3*s,y2-6*s,6*s,2*s);
+    }else if(cid===1){
+        ctx.fillStyle="#05070b";
+        ctx.fillRect(x1,y2-7*s,5*s,7*s);ctx.fillRect(x1+boxW-5*s,y2-7*s,5*s,7*s);
+        ctx.fillStyle=hz.cls.roof;ctx.strokeStyle=primaryCol;ctx.lineWidth=1.6;
+        ctx.beginPath();
+        ctx.moveTo(x1+1*s,y2-2*s);ctx.lineTo(x1+1*s,y1+3*s);ctx.lineTo(x1+4*s,y1);
+        ctx.lineTo(x1+boxW-4*s,y1);ctx.lineTo(x1+boxW-1*s,y1+3*s);ctx.lineTo(x1+boxW-1*s,y2-2*s);
+        ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.fillStyle=primaryCol;
+        ctx.fillRect(x1+3*s,y1+boxH*0.22,boxW-6*s,boxH*0.62);
+        ctx.fillStyle="#09101d";
+        ctx.fillRect(x1+4*s,y1+boxH*0.26,boxW-8*s,boxH*0.22);
+        ctx.strokeStyle="rgba(255,255,255,0.35)";ctx.lineWidth=1;
+        ctx.beginPath();ctx.moveTo(x1+4*s,y1+boxH*0.58);ctx.lineTo(x1+boxW-4*s,y1+boxH*0.58);
+        ctx.moveTo(x1+4*s,y1+boxH*0.70);ctx.lineTo(x1+boxW-4*s,y1+boxH*0.70);ctx.stroke();
+        ctx.fillStyle="#fbbf24";
+        ctx.fillRect(x1+5*s,y1+1*s,3*s,2*s);ctx.fillRect(bx-1.5*s,y1+1*s,3*s,2*s);ctx.fillRect(x1+boxW-8*s,y1+1*s,3*s,2*s);
+        ctx.fillStyle="#ff1e42";
+        ctx.fillRect(x1+3*s,y2-6*s,6*s,3*s);ctx.fillRect(x1+boxW-9*s,y2-6*s,6*s,3*s);
+    }else if(cid===2){
+        ctx.fillStyle="#05070b";
+        ctx.fillRect(x1,y2-6*s,4.5*s,6*s);ctx.fillRect(x1+boxW-4.5*s,y2-6*s,4.5*s,6*s);
+        ctx.fillStyle=hz.cls.roof;ctx.strokeStyle=primaryCol;ctx.lineWidth=1.6;
+        ctx.beginPath();
+        ctx.moveTo(bx,y1);
+        ctx.quadraticCurveTo(x1+4*s,y1+2*s,x1+2*s,y1+boxH*0.36);
+        ctx.lineTo(x1,y2-2*s);
+        ctx.lineTo(x1+boxW,y2-2*s);
+        ctx.lineTo(x1+boxW-2*s,y1+boxH*0.36);
+        ctx.quadraticCurveTo(x1+boxW-4*s,y1+2*s,bx,y1);
+        ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.fillStyle="#7dd3fc";
+        ctx.beginPath();
+        ctx.moveTo(bx,y1+5*s);
+        ctx.lineTo(x1+5*s,y1+boxH*0.44);
+        ctx.lineTo(x1+boxW-5*s,y1+boxH*0.44);
+        ctx.closePath();ctx.fill();
+        ctx.fillStyle="#06080f";
+        ctx.fillRect(x1+3*s,y2-8*s,boxW-6*s,5*s);
+        ctx.fillStyle="#ff1e42";
+        ctx.fillRect(x1+3.5*s,y2-7.5*s,7*s,3*s);ctx.fillRect(x1+boxW-10.5*s,y2-7.5*s,7*s,3*s);
+    }else if(cid===3){
+        ctx.fillStyle="#05070b";
+        ctx.fillRect(bx-3*s,y2-9*s,6*s,9*s);
+        ctx.fillStyle=hz.cls.roof;ctx.strokeStyle=primaryCol;ctx.lineWidth=1.6;
+        ctx.beginPath();
+        ctx.moveTo(bx-6*s,y2-3*s);ctx.lineTo(bx-7*s,y1+boxH*0.44);ctx.lineTo(bx,y1+2*s);
+        ctx.lineTo(bx+7*s,y1+boxH*0.44);ctx.lineTo(bx+6*s,y2-3*s);
+        ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.strokeStyle="#e2e8f0";ctx.lineWidth=1.4;
+        ctx.beginPath();ctx.moveTo(bx-9*s,y1+boxH*0.38);ctx.lineTo(bx+9*s,y1+boxH*0.38);ctx.stroke();
+        ctx.fillStyle="#f8fafc";ctx.strokeStyle=primaryCol;ctx.lineWidth=1.1;
+        ctx.beginPath();ctx.arc(bx,y1+6*s,4.2*s,0,Math.PI*2);ctx.fill();ctx.stroke();
+        ctx.fillStyle="#00f5d4";ctx.fillRect(bx-2.5*s,y1+5*s,5*s,2*s);
+        ctx.fillStyle="#ff1e42";ctx.fillRect(bx-3*s,y2-8*s,6*s,3*s);
+    }else if(cid===4){
+        ctx.strokeStyle="rgba(251,113,133,0.45)";ctx.lineWidth=1.1;
+        ctx.beginPath();ctx.ellipse(bx,y2,boxW*0.38,3*s,0,0,Math.PI*2);ctx.stroke();
+        ctx.fillStyle="#0f172a";ctx.strokeStyle=primaryCol;ctx.lineWidth=1.5;
+        ctx.beginPath();ctx.arc(bx,y1+4.5*s,4.2*s,0,Math.PI*2);ctx.fill();ctx.stroke();
+        ctx.fillStyle="#00f5d4";ctx.fillRect(bx-2.5*s,y1+3.5*s,5*s,2*s);
+        ctx.fillStyle=primaryCol;
+        ctx.beginPath();
+        ctx.moveTo(bx-6*s,y1+9.5*s);ctx.lineTo(bx+6*s,y1+9.5*s);ctx.lineTo(bx+4.5*s,y1+19*s);ctx.lineTo(bx-4.5*s,y1+19*s);
+        ctx.closePath();ctx.fill();
+        ctx.fillStyle="#1e293b";ctx.fillRect(bx-3*s,y1+11*s,6*s,5*s);
+        ctx.strokeStyle="#e2e8f0";ctx.lineWidth=1.8;
+        ctx.beginPath();
+        ctx.moveTo(bx-5.5*s,y1+10.5*s);ctx.lineTo(bx-9*s,y1+17*s);
+        ctx.moveTo(bx+5.5*s,y1+10.5*s);ctx.lineTo(bx+9*s,y1+17*s);
+        ctx.moveTo(bx-2.5*s,y1+19*s);ctx.lineTo(bx-3.5*s,y2);
+        ctx.moveTo(bx+2.5*s,y1+19*s);ctx.lineTo(bx+3.5*s,y2);
+        ctx.stroke();
+    }else if(cid===5){
+        ctx.fillStyle=hz.cls.roof;ctx.strokeStyle=primaryCol;ctx.lineWidth=1.5;
+        ctx.beginPath();
+        ctx.moveTo(x1+4*s,y1+9*s);ctx.lineTo(x1+boxW-4*s,y1+9*s);ctx.lineTo(x1+boxW-3*s,y1+18*s);ctx.lineTo(x1+3*s,y1+18*s);
+        ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(bx-5*s,y1+9*s);ctx.lineTo(bx,y1+3*s);ctx.lineTo(bx+5*s,y1+9*s);
+        ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.strokeStyle="#fde68a";ctx.lineWidth=1.3;
+        ctx.beginPath();ctx.moveTo(bx-3*s,y1+4*s);ctx.lineTo(bx-5*s,y1+1*s);ctx.moveTo(bx+3*s,y1+4*s);ctx.lineTo(bx+5*s,y1+1*s);ctx.stroke();
+        ctx.fillStyle=primaryCol;
+        ctx.fillRect(x1+4*s,y1+18*s,3*s,7*s);ctx.fillRect(x1+9*s,y1+18*s,2.5*s,6.5*s);
+        ctx.fillRect(x1+boxW-11.5*s,y1+18*s,2.5*s,6.5*s);ctx.fillRect(x1+boxW-7*s,y1+18*s,3*s,7*s);
+        ctx.fillStyle="#00f5d4";ctx.fillRect(bx-1.5*s,y1+6*s,3*s,2*s);
+    }else if(cid===6){
+        ctx.fillStyle="#05070c";ctx.strokeStyle=primaryCol;ctx.lineWidth=1.6;
+        ctx.beginPath();
+        ctx.moveTo(x1+1*s,y2-6*s);ctx.lineTo(x1+6*s,y2-12*s);ctx.lineTo(bx+2*s,y2-13*s);
+        ctx.lineTo(x1+boxW-2*s,y2-9*s);ctx.lineTo(x1+boxW-1*s,y2-3*s);ctx.lineTo(bx-3*s,y2-1*s);
+        ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.strokeStyle="#38bdf8";ctx.lineWidth=1.3;
+        ctx.beginPath();ctx.moveTo(x1+6*s,y2-6*s);ctx.lineTo(bx,y2-8*s);ctx.lineTo(x1+boxW-6*s,y2-5*s);ctx.stroke();
+        ctx.fillStyle="#f59e0b";
+        ctx.fillRect(x1+3*s,y2-15*s,4*s,2*s);ctx.fillRect(x1+boxW-7*s,y2-15*s,4*s,2*s);
+    }else{
+        ctx.fillStyle=hz.cls.roof;ctx.strokeStyle=primaryCol;ctx.lineWidth=1.5;
+        ctx.beginPath();
+        ctx.moveTo(x1,y2-2*s);ctx.lineTo(x1+3*s,y2-11*s);ctx.lineTo(x1+boxW-3*s,y2-11*s);ctx.lineTo(x1+boxW,y2-2*s);
+        ctx.closePath();ctx.fill();ctx.stroke();
+        ctx.fillStyle=primaryCol;
+        for(let c=0;c<4;c++){
+            const sx=x1+4*s+c*(boxW-8*s)/4;
+            ctx.beginPath();
+            ctx.moveTo(sx,y2-3*s);ctx.lineTo(sx+2.5*s,y2-10*s);ctx.lineTo(sx+5*s,y2-10*s);ctx.lineTo(sx+2.5*s,y2-3*s);
+            ctx.closePath();
+            ctx.fill();
+        }
+        ctx.fillStyle="#ef4444";
+        ctx.fillRect(x1+2*s,y2-5*s,3*s,2*s);ctx.fillRect(x1+boxW-5*s,y2-5*s,3*s,2*s);
+    }
+}
+
+function renderHighTextureDistinctHazard(hz,zSafe,W,H,roadCurve,dynamicWorldColor,isCosmic250,cosmicHue,now=0){
+    ensureHazardVariant(hz);
+
+    const bx=projectX(hz.lane,zSafe,W,H,roadCurve);
+    const by=projectY(zSafe,0,H);
+    const s=getRigidPerspectiveScale(zSafe,W,H);
+    const cid=hz.cls.id;
+    const dims=gfxSettings.legacyModels?{w:25,h:23}:(REAL_LIFE_HAZARD_DIMS[cid]||{w:24,h:21});
+    const boxW=dims.w*s;
+    const boxH=dims.h*s;
+    const x1=bx-boxW*0.5,y2=by,y1=y2-boxH;
+    const tierColor=(hz.rFinal>=0.85)?"#ef4444":(hz.rFinal>=0.65?"#f97316":(hz.rFinal>=0.35?"#f59e0b":dynamicWorldColor));
+
+    ctx.fillStyle="rgba(0,0,0,0.62)";
+    ctx.beginPath();
+    ctx.ellipse(bx,y2+1.8*s,boxW*0.50,3.0*s,0,0,Math.PI*2);
+    ctx.fill();
+
+    if(gfxSettings.legacyModels){
+        const primaryCol=isCosmic250?`hsl(${(cosmicHue+cid*45)%360},90%,58%)`:hz.cls.color;
+        renderLegacyHazardModel(hz,bx,by,s*0.84,boxW,boxH,primaryCol);
+    }else{
+        const highDetail=(gfxSettings.preset==='high'||gfxSettings.preset==='ultra');
+        const ms=s*0.84;
+        ctx.save();
+        ctx.translate(bx,y2);
+        ctx.scale(ms,ms);
+
+        if(cid===0){
+            const pal=hz.palette;
+            ctx.fillStyle="#05070b";
+            ctx.fillRect(-10.5,-6,3.2,6);
+            ctx.fillRect(7.3,-6,3.2,6);
+            ctx.fillRect(-1.8,-5,3.6,5.5);
+
+            ctx.fillStyle=pal.bodyBot;
+            ctx.strokeStyle=pal.trim;
+            ctx.lineWidth=1.5;
+            ctx.beginPath();
+            ctx.roundRect(-10,-14.5,20,12.5,2);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle=pal.bodyTop;
+            ctx.fillRect(-9.2,-14,18.4,5.5);
+
+            ctx.fillStyle=pal.roof;
+            ctx.strokeStyle="#fde047";
+            ctx.lineWidth=1.4;
+            ctx.beginPath();
+            ctx.moveTo(-10,-14);
+            ctx.lineTo(-8.8,-21.5);
+            ctx.quadraticCurveTo(0,-26,8.8,-21.5);
+            ctx.lineTo(10,-14);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle=pal.glass;
+            ctx.strokeStyle="#0f172a";
+            ctx.lineWidth=1;
+            ctx.beginPath();
+            ctx.roundRect(-7.6,-20.8,15.2,6.2,1.5);
+            ctx.fill();
+            ctx.stroke();
+            ctx.beginPath();ctx.moveTo(0,-20.8);ctx.lineTo(0,-14.6);ctx.stroke();
+
+            ctx.fillStyle="#ffffff";
+            ctx.beginPath();ctx.arc(0,-8.5,2.2,0,Math.PI*2);ctx.fill();
+            ctx.fillStyle="#ff1e42";
+            ctx.fillRect(-8.5,-9,3,2.2);
+            ctx.fillRect(5.5,-9,3,2.2);
+
+        }else if(cid===1){
+            const pal=hz.palette;
+            if(hz.subType==='bus'){
+                ctx.fillStyle="#05070b";
+                ctx.fillRect(-15.5,-7,4.2,7);
+                ctx.fillRect(11.3,-7,4.2,7);
+
+                ctx.fillStyle=pal.body;
+                ctx.strokeStyle=pal.trim;
+                ctx.lineWidth=1.7;
+                ctx.beginPath();
+                ctx.roundRect(-15.5,-32.5,31,30.5,3.5);
+                ctx.fill();
+                ctx.stroke();
+
+                if(highDetail){
+                    ctx.fillStyle=pal.top;
+                    ctx.fillRect(-14.5,-31.5,29,6);
+                }
+
+                ctx.fillStyle="#050811";
+                ctx.fillRect(-11.5,-30.5,23,3.5);
+                ctx.fillStyle="#fde047";
+                ctx.fillRect(-8.5,-29.4,17,1.4);
+
+                ctx.fillStyle="#38bdf8";
+                ctx.beginPath();
+                ctx.roundRect(-13.5,-26,27,10.5,2);
+                ctx.fill();
+                if(highDetail){
+                    ctx.fillStyle="#e0f2fe";
+                    ctx.fillRect(-12.5,-25.2,25,2.2);
+                }
+
+                ctx.fillStyle=pal.stripe;
+                ctx.fillRect(-14.8,-14,29.6,2.5);
+                ctx.fillStyle="#090d16";
+                ctx.fillRect(-8.5,-10,17,5);
+
+                ctx.fillStyle="#ffffff";
+                ctx.fillRect(-13.8,-9,4,2.8);
+                ctx.fillRect(9.8,-9,4,2.8);
+                ctx.fillStyle="#fbbf24";
+                ctx.fillRect(-13.8,-5.5,3,2);
+                ctx.fillRect(10.8,-5.5,3,2);
+            }else{
+                ctx.fillStyle="#05070b";
+                ctx.fillRect(-16,-7.5,4.5,7.5);
+                ctx.fillRect(11.5,-7.5,4.5,7.5);
+
+                ctx.fillStyle=pal.cargo;
+                ctx.strokeStyle=pal.trim;
+                ctx.lineWidth=1.5;
+                ctx.beginPath();
+                ctx.roundRect(-16.5,-34,33,19,2);
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.fillStyle="#fde047";
+                [-10,-5,0,5,10].forEach(lx=>ctx.fillRect(lx-1.1,-33,2.2,1.8));
+
+                ctx.fillStyle=pal.cab;
+                ctx.strokeStyle=pal.trim;
+                ctx.lineWidth=1.6;
+                ctx.beginPath();
+                ctx.roundRect(-14,-26,28,24,3);
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.fillStyle="#7dd3fc";
+                ctx.fillRect(-12,-23.5,11,7);
+                ctx.fillRect(1,-23.5,11,7);
+
+                ctx.fillStyle="#0f172a";
+                ctx.strokeStyle="#f8fafc";
+                ctx.lineWidth=1.3;
+                ctx.beginPath();
+                ctx.roundRect(-8,-14.5,16,9.5,1.5);
+                ctx.fill();
+                ctx.stroke();
+                for(let g=-5;g<=5;g+=2.5){
+                    ctx.beginPath();ctx.moveTo(g,-14);ctx.lineTo(g,-5.5);ctx.stroke();
+                }
+
+                ctx.fillStyle="#fef08a";
+                ctx.fillRect(-13,-11.5,3.8,3.2);
+                ctx.fillRect(9.2,-11.5,3.8,3.2);
+            }
+
+        }else if(cid===2){
+            const pal=hz.palette;
+            ctx.fillStyle="#05070b";
+            ctx.beginPath();
+            ctx.roundRect(-14,-6.5,4,6.5,1.5);
+            ctx.roundRect(10,-6.5,4,6.5,1.5);
+            ctx.fill();
+
+            ctx.fillStyle=pal.top;
+            ctx.strokeStyle=pal.trim;
+            ctx.lineWidth=1.7;
+            ctx.beginPath();
+            ctx.moveTo(-13,-2);
+            ctx.quadraticCurveTo(-14.5,-8.5,-12,-13.5);
+            ctx.lineTo(-8,-21.5);
+            ctx.quadraticCurveTo(0,-23.5,8,-21.5);
+            ctx.lineTo(12,-13.5);
+            ctx.quadraticCurveTo(14.5,-8.5,13,-2);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle=pal.bot;
+            ctx.fillRect(-12.2,-11,24.4,8);
+
+            ctx.fillStyle=pal.canopy;
+            ctx.beginPath();
+            ctx.moveTo(-6.8,-20);
+            ctx.quadraticCurveTo(0,-21.4,6.8,-20);
+            ctx.lineTo(9.4,-13.2);
+            ctx.quadraticCurveTo(0,-12,-9.4,-13.2);
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.fillStyle="#05070c";
+            ctx.beginPath();
+            ctx.roundRect(-11,-7.2,22,4.8,2);
+            ctx.fill();
+            ctx.fillStyle="#ff1e42";
+            ctx.fillRect(-10.2,-6.5,6.2,2.5);
+            ctx.fillRect(4,-6.5,6.2,2.5);
+            ctx.fillStyle=pal.trim;
+            ctx.fillRect(-2.4,-6,4.8,1.6);
+
+        }else if(cid===3){
+            const pal=hz.palette;
+            ctx.fillStyle="#05070b";
+            ctx.strokeStyle="#475569";
+            ctx.lineWidth=1;
+            ctx.beginPath();
+            ctx.roundRect(-2.8,-10,5.6,10,2);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle="#0f172a";
+            ctx.fillRect(-6.8,-15,3,7);
+            ctx.fillRect(3.8,-15,3,7);
+
+            ctx.fillStyle=pal.main;
+            ctx.strokeStyle=pal.trim;
+            ctx.lineWidth=1.5;
+            ctx.beginPath();
+            ctx.moveTo(0,-4.5);
+            ctx.lineTo(-6.2,-13.5);
+            ctx.lineTo(-4.4,-20.5);
+            ctx.lineTo(4.4,-20.5);
+            ctx.lineTo(6.2,-13.5);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.strokeStyle="#e2e8f0";
+            ctx.lineWidth=1.6;
+            ctx.beginPath();
+            ctx.moveTo(-8.5,-18.5);ctx.lineTo(8.5,-18.5);
+            ctx.stroke();
+
+            ctx.fillStyle="#0f172a";
+            ctx.strokeStyle=pal.trim;
+            ctx.lineWidth=1.3;
+            ctx.beginPath();
+            ctx.arc(0,-22.5,4.2,0,Math.PI*2);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle=pal.visor;
+            ctx.fillRect(-2.8,-23.4,5.6,2.2);
+
+            ctx.fillStyle="#fef08a";
+            ctx.fillRect(-4.2,-13.5,2.6,2.2);
+            ctx.fillRect(1.6,-13.5,2.6,2.2);
+
+        }else if(cid===4){
+            const pal=hz.palette;
+            const runCycle=now*0.015+(hz.phase||0);
+            const swing=Math.sin(runCycle);
+            const bob=Math.abs(Math.cos(runCycle))*1.6;
+
+            ctx.translate(0,-bob);
+
+            const leftLegLift=swing>0?swing*4.0:swing*1.2;
+            const rightLegLift=swing<0?-swing*4.0:-swing*1.2;
+
+            ctx.lineCap="round";
+            ctx.lineWidth=2.8;
+            ctx.strokeStyle="#e2e8f0";
+            ctx.beginPath();
+            ctx.moveTo(-2.5,-10);ctx.lineTo(-3.0,-2.2-leftLegLift);
+            ctx.moveTo(2.5,-10);ctx.lineTo(3.0,-2.2-rightLegLift);
+            ctx.stroke();
+
+            ctx.fillStyle=pal.trim;
+            ctx.beginPath();
+            ctx.arc(-3.0,-1.6-leftLegLift,1.7,0,Math.PI*2);
+            ctx.arc(3.0,-1.6-rightLegLift,1.7,0,Math.PI*2);
+            ctx.fill();
+
+            const leftArmY=-13+swing*3.0;
+            const rightArmY=-13-swing*3.0;
+            ctx.strokeStyle=pal.top;
+            ctx.lineWidth=2.4;
+            ctx.beginPath();
+            ctx.moveTo(-4.4,-18.5);ctx.lineTo(-7.0,leftArmY);
+            ctx.moveTo(4.4,-18.5);ctx.lineTo(7.0,rightArmY);
+            ctx.stroke();
+
+            ctx.fillStyle=pal.skin;
+            ctx.beginPath();
+            ctx.arc(-7.0,leftArmY,1.3,0,Math.PI*2);
+            ctx.arc(7.0,rightArmY,1.3,0,Math.PI*2);
+            ctx.fill();
+
+            ctx.fillStyle=pal.top;
+            ctx.strokeStyle=pal.trim;
+            ctx.lineWidth=1.3;
+            if(hz.subType==='girl'){
+                ctx.beginPath();
+                ctx.moveTo(-4.2,-19.5);ctx.lineTo(4.2,-19.5);
+                ctx.lineTo(3.5,-13);ctx.lineTo(-3.5,-13);
+                ctx.closePath();ctx.fill();ctx.stroke();
+                ctx.fillStyle=pal.trim;
+                ctx.beginPath();
+                ctx.moveTo(-3.8,-13.2);ctx.lineTo(3.8,-13.2);
+                ctx.lineTo(5.8,-8.8);ctx.lineTo(-5.8,-8.8);
+                ctx.closePath();ctx.fill();
+            }else{
+                ctx.beginPath();
+                ctx.roundRect(-4.8,-19.5,9.6,9.8,2);
+                ctx.fill();ctx.stroke();
+                ctx.fillStyle=pal.trim;
+                ctx.fillRect(-4.2,-16.2,8.4,1.8);
+            }
+
+            ctx.fillStyle=pal.skin;
+            ctx.beginPath();
+            ctx.arc(0,-23.5,3.8,0,Math.PI*2);
+            ctx.fill();
+
+            ctx.fillStyle=pal.hair;
+            if(hz.subType==='girl'){
+                const tailSway=swing*2.5;
+                ctx.beginPath();
+                ctx.ellipse(3.5+tailSway*0.35,-23.8,3.0,1.6,0.35,0,Math.PI*2);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.arc(0,-24.6,3.9,Math.PI*0.95,Math.PI*0.05,false);
+                ctx.fill();
+            }else{
+                ctx.beginPath();
+                ctx.arc(0,-24.8,4.0,Math.PI,0,false);
+                ctx.lineTo(3.2,-27.6);ctx.lineTo(0,-26.5);ctx.lineTo(-3.2,-27.6);
+                ctx.closePath();
+                ctx.fill();
+            }
+
+            ctx.fillStyle="#0f172a";
+            ctx.fillRect(-1.8,-23.8,1.1,1.3);
+            ctx.fillRect(0.7,-23.8,1.1,1.3);
+
+        }else if(cid===5){
+            const pal=hz.palette;
+            const runCycle=now*0.020+(hz.phase||0);
+            const stride=Math.sin(runCycle);
+            const bounce=Math.abs(Math.cos(runCycle))*1.4;
+
+            ctx.translate(0,-bounce);
+
+            const tailSway=Math.sin(runCycle*1.6)*4.2;
+            ctx.strokeStyle=pal.coat;
+            ctx.lineCap="round";
+            ctx.lineWidth=hz.subType==='cat'?2.2:2.8;
+            ctx.beginPath();
+            ctx.moveTo(0,-15.5);
+            ctx.quadraticCurveTo(tailSway*0.6,-20,tailSway,-23.2);
+            ctx.stroke();
+
+            ctx.fillStyle=pal.dark;
+            ctx.strokeStyle=pal.outline;
+            ctx.lineWidth=1.0;
+            ctx.beginPath();
+            ctx.ellipse(0,-13.2,6.8,4.2,0,0,Math.PI*2);
+            ctx.fill();
+            ctx.stroke();
+
+            const hindLeftLift=stride<0?-stride*3.6:0;
+            const hindRightLift=stride>0?stride*3.6:0;
+            ctx.strokeStyle=pal.dark;
+            ctx.lineWidth=2.6;
+            ctx.beginPath();
+            ctx.moveTo(-6.2,-11.5);ctx.lineTo(-6.6,-3.2-hindLeftLift);
+            ctx.moveTo(6.2,-11.5);ctx.lineTo(6.6,-3.2-hindRightLift);
+            ctx.stroke();
+
+            ctx.fillStyle=pal.belly;
+            ctx.beginPath();
+            ctx.arc(-6.6,-2.6-hindLeftLift,1.3,0,Math.PI*2);
+            ctx.arc(6.6,-2.6-hindRightLift,1.3,0,Math.PI*2);
+            ctx.fill();
+
+            ctx.fillStyle=pal.coat;
+            ctx.strokeStyle=pal.outline;
+            ctx.lineWidth=1.2;
+            ctx.beginPath();
+            ctx.ellipse(0,-9.8,5.8,4.6,0,0,Math.PI*2);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle=pal.belly;
+            ctx.beginPath();
+            ctx.ellipse(0,-9.2,3.4,3.0,0,0,Math.PI*2);
+            ctx.fill();
+
+            const frontLeftLift=stride>0?stride*3.8:0;
+            const frontRightLift=stride<0?-stride*3.8:0;
+            ctx.strokeStyle=pal.coat;
+            ctx.lineWidth=2.7;
+            ctx.beginPath();
+            ctx.moveTo(-3.1,-8.0);ctx.lineTo(-3.2,-1.0-frontLeftLift);
+            ctx.moveTo(3.1,-8.0);ctx.lineTo(3.2,-1.0-frontRightLift);
+            ctx.stroke();
+
+            ctx.fillStyle=pal.belly;
+            ctx.beginPath();
+            ctx.arc(-3.2,-0.6-frontLeftLift,1.4,0,Math.PI*2);
+            ctx.arc(3.2,-0.6-frontRightLift,1.4,0,Math.PI*2);
+            ctx.fill();
+
+            if(hz.subType==='dog'){
+                ctx.strokeStyle=pal.collar;
+                ctx.lineWidth=2.1;
+                ctx.beginPath();
+                ctx.moveTo(-4.4,-12.6);ctx.quadraticCurveTo(0,-11.0,4.4,-12.6);
+                ctx.stroke();
+
+                ctx.fillStyle=pal.dark;
+                ctx.beginPath();
+                ctx.ellipse(-4.8,-16.8+stride*0.6,2.0,3.6,0.32,0,Math.PI*2);
+                ctx.ellipse(4.8,-16.8-stride*0.6,2.0,3.6,-0.32,0,Math.PI*2);
+                ctx.fill();
+
+                ctx.fillStyle=pal.coat;
+                ctx.strokeStyle=pal.outline;
+                ctx.lineWidth=1.1;
+                ctx.beginPath();
+                ctx.arc(0,-16.5,4.6,0,Math.PI*2);
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.fillStyle=pal.belly;
+                ctx.beginPath();
+                ctx.ellipse(0,-14.8,2.6,2.0,0,0,Math.PI*2);
+                ctx.fill();
+                ctx.fillStyle="#090d16";
+                ctx.beginPath();
+                ctx.arc(0,-15.4,1.2,0,Math.PI*2);
+                ctx.fill();
+
+                ctx.fillStyle="#ffffff";
+                ctx.beginPath();
+                ctx.arc(-1.8,-17.5,1.05,0,Math.PI*2);
+                ctx.arc(1.8,-17.5,1.05,0,Math.PI*2);
+                ctx.fill();
+                ctx.fillStyle="#090d16";
+                ctx.beginPath();
+                ctx.arc(-1.8,-17.5,0.5,0,Math.PI*2);
+                ctx.arc(1.8,-17.5,0.5,0,Math.PI*2);
+                ctx.fill();
+            }else{
+                ctx.fillStyle=pal.coat;
+                ctx.strokeStyle=pal.outline;
+                ctx.lineWidth=1.1;
+                ctx.beginPath();
+                ctx.moveTo(-4.4,-17.8);ctx.lineTo(-5.4,-22.6);ctx.lineTo(-1.4,-19.8);
+                ctx.moveTo(4.4,-17.8);ctx.lineTo(5.4,-22.6);ctx.lineTo(1.4,-19.8);
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.fillStyle="#f472b6";
+                ctx.beginPath();
+                ctx.moveTo(-3.9,-18.2);ctx.lineTo(-4.6,-21.4);ctx.lineTo(-2.0,-19.5);
+                ctx.moveTo(3.9,-18.2);ctx.lineTo(4.6,-21.4);ctx.lineTo(2.0,-19.5);
+                ctx.closePath();
+                ctx.fill();
+
+                ctx.fillStyle=pal.coat;
+                ctx.strokeStyle=pal.outline;
+                ctx.lineWidth=1.1;
+                ctx.beginPath();
+                ctx.arc(0,-16.4,4.3,0,Math.PI*2);
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.fillStyle=pal.eye;
+                ctx.beginPath();
+                ctx.ellipse(-1.8,-17.0,1.15,0.85,-0.18,0,Math.PI*2);
+                ctx.ellipse(1.8,-17.0,1.15,0.85,0.18,0,Math.PI*2);
+                ctx.fill();
+
+                ctx.fillStyle="#fb7185";
+                ctx.beginPath();
+                ctx.arc(0,-15.2,0.85,0,Math.PI*2);
+                ctx.fill();
+                ctx.strokeStyle="#ffffff";
+                ctx.lineWidth=0.75;
+                ctx.beginPath();
+                ctx.moveTo(-1.8,-15.3);ctx.lineTo(-6.2,-15.9);
+                ctx.moveTo(-1.8,-14.8);ctx.lineTo(-6.2,-14.5);
+                ctx.moveTo(1.8,-15.3);ctx.lineTo(6.2,-15.9);
+                ctx.moveTo(1.8,-14.8);ctx.lineTo(6.2,-14.5);
+                ctx.stroke();
+            }
+
+        }else if(cid===6){
+            ctx.fillStyle="#334155";
+            ctx.strokeStyle="#cbd5e1";
+            ctx.lineWidth=1.5;
+            ctx.beginPath();
+            ctx.moveTo(-12.5,-5);
+            ctx.lineTo(-9,-9.8);
+            ctx.lineTo(-2,-11);
+            ctx.lineTo(6.5,-10.2);
+            ctx.lineTo(12.5,-6);
+            ctx.lineTo(10,-1.2);
+            ctx.lineTo(1.5,-0.4);
+            ctx.lineTo(-8.5,-1);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle="#020617";
+            ctx.beginPath();
+            ctx.ellipse(0,-5.2,9.2,3.4,0,0,Math.PI*2);
+            ctx.fill();
+
+            ctx.fillStyle="#38bdf8";
+            ctx.beginPath();
+            ctx.ellipse(-1,-4.8,5.5,1.5,0,0,Math.PI*2);
+            ctx.fill();
+
+            ctx.fillStyle="#f97316";
+            ctx.fillRect(-11.5,-11.5,3.2,2.2);
+            ctx.fillRect(8.3,-11.5,3.2,2.2);
+
+        }else{
+            const isYellow=(hz.variantIdx===0);
+            const stripeLight=isYellow?"#facc15":"#ffffff";
+            const stripeDark=isYellow?"#090d16":"#334155";
+
+            ctx.fillStyle=stripeDark;
+            ctx.strokeStyle=isYellow?"#fde047":"#cbd5e1";
+            ctx.lineWidth=1.5;
+            ctx.beginPath();
+            ctx.moveTo(-15.5,-1.2);
+            ctx.quadraticCurveTo(-14,-9.8,-11,-9.8);
+            ctx.lineTo(11,-9.8);
+            ctx.quadraticCurveTo(14,-9.8,15.5,-1.2);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle=stripeLight;
+            for(let c=-2;c<=2;c++){
+                const sx=c*5.2;
+                ctx.beginPath();
+                ctx.moveTo(sx-1.8,-1.8);
+                ctx.lineTo(sx-0.2,-9.0);
+                ctx.lineTo(sx+2.2,-9.0);
+                ctx.lineTo(sx+0.6,-1.8);
+                ctx.closePath();
+                ctx.fill();
+            }
+
+            ctx.fillStyle="#ef4444";
+            ctx.fillRect(-13.5,-4.5,2.5,1.8);
+            ctx.fillRect(11,-4.5,2.5,1.8);
+        }
+
+        ctx.restore();
+    }
+
+    if(gfxSettings.hudBoxes){
+        ctx.strokeStyle=tierColor;
+        ctx.lineWidth=hz.rFinal>=0.65?1.8:1.2;
+        ctx.strokeRect(x1-2,y1-2,boxW+4,boxH+4);
+        if(hz.z<34){
+            const label=`${hz.cls.name} ${hz.z.toFixed(1)}m | DGI ${hz.dgi}`;
+            const estW=label.length*6.0+8;
+            ctx.fillStyle="rgba(9,11,16,0.88)";
+            ctx.fillRect(bx-estW*0.5,y1-17,estW,13);
+            ctx.fillStyle=tierColor;
+            ctx.fillText(label,bx-estW*0.5+4,y1-7);
+        }
+    }
+}
+// --- END OF MINI-CHUNK 6.3 OF 4 ---
+// --- START OF MINI-CHUNK 6.4 OF 4 ---
+let lastRenderNow=performance.now();
+function renderSceneFrame(now){
+    const dtRender=Math.min(0.05,Math.max(0.001,(now-lastRenderNow)/1000));
+    lastRenderNow=now;
+
+    const W=gameState.viewW||window.innerWidth;
+    const H=gameState.viewH||window.innerHeight;
+    const theme=BIOME_THEMES[biomeIdx]||BIOME_THEMES[0];
+    const isCosmic250=Boolean(theme.isEpoch250Special||gameState.epoch===250);
+    const horizonY=H*0.42;
+
+    ensureCachedBiomeGradients(W,H,horizonY,theme);
+
+    ctx.save();
+    if(gameState.screenShake>0&&gfxSettings.shake){
+        ctx.translate((Math.random()-0.5)*gameState.screenShake,(Math.random()-0.5)*gameState.screenShake);
+    }
+
+    ctx.fillStyle=cachedGradients.sky;
+    ctx.fillRect(0,0,W,H);
+
+    const cosmicHue=(now*0.08)%360;
+    const dynamicWorldColor=isCosmic250?`hsl(${cosmicHue},95%,62%)`:theme.curb;
+
+    const starBase=isMobileHardware?42:65;
+    const starCount=Math.min(gameState.stars.length,Math.floor(starBase*gfxSettings.particles));
+    const streakLen=(gfxSettings.speedLines||isCosmic250||gameState.boosting)?5.8:1.5;
+    for(let i=0;i<starCount;i++){
+        const st=gameState.stars[i];
+        const sx=((st.x*W-gameState.distanceM*st.sp)%W+W)%W;
+        const sy=st.y*H;
+        ctx.fillStyle=isCosmic250?st.col:(i%3===0?theme.curb:"#e2e8f0");
+        ctx.fillRect(sx,sy,st.s*streakLen,st.s*0.95);
+    }
+
+    renderUniqueDimensionHorizon(W,H,horizonY,theme,now,dynamicWorldColor,cosmicHue);
+
+    ctx.fillStyle=theme.roadDark;
+    ctx.fillRect(0,horizonY,W,H-horizonY);
+
+    const roadCurve=Math.sin(gameState.distanceM*0.012)*0.65;
+    const totalSlices=gfxSettings.roadSlices||(isMobileHardware?26:36);
+    const sliceStep=55.0/totalSlices;
+
+    const voidHue=(now*0.14)%360;
+    const activeRailColor=activeLiveryProfile.isVoidChroma?`hsl(${voidHue},95%,60%)`:activeLiveryProfile.railColor;
+
+    for(let i=totalSlices;i>=1;i--){
+        const zNear=0.55+(i-1)*sliceStep;
+        const zFar=0.55+i*sliceStep;
+        const yNear=projectY(zNear,0,H),yFar=i===totalSlices?horizonY:projectY(zFar,0,H);
+        const xNearLeft=projectX(-2.6,zNear,W,H,roadCurve),xNearRight=projectX(2.6,zNear,W,H,roadCurve);
+        const xFarLeft=projectX(-2.6,zFar,W,H,roadCurve),xFarRight=projectX(2.6,zFar,W,H,roadCurve);
+
+        const isAlt=(Math.floor((gameState.distanceM+zNear)/3.2)&1)===0;
+        ctx.fillStyle=isAlt?theme.roadLight:theme.roadDark;
+        ctx.beginPath();
+        ctx.moveTo(xFarLeft,yFar);ctx.lineTo(xFarRight,yFar);ctx.lineTo(xNearRight,yNear);ctx.lineTo(xNearLeft,yNear);
+        ctx.closePath();ctx.fill();
+
+        if(isAlt){
+            ctx.strokeStyle=dynamicWorldColor;
+            ctx.lineWidth=2;
+            ctx.beginPath();
+            ctx.moveTo(xFarLeft,yFar);ctx.lineTo(xNearLeft,yNear);
+            ctx.moveTo(xFarRight,yFar);ctx.lineTo(xNearRight,yNear);
+            ctx.stroke();
+        }
+    }
+
+    ctx.strokeStyle=`${dynamicWorldColor}88`;
+    ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(0,horizonY);ctx.lineTo(W,horizonY);ctx.stroke();
+
+    if(gfxSettings.reflections){
+        ctx.fillStyle=`${dynamicWorldColor}12`;
+        ctx.beginPath();
+        ctx.moveTo(W*0.46,horizonY);ctx.lineTo(W*0.54,horizonY);ctx.lineTo(W*0.64,H);ctx.lineTo(W*0.36,H);
+        ctx.closePath();ctx.fill();
+    }
+
+    ctx.strokeStyle=`${dynamicWorldColor}55`;
+    ctx.lineWidth=1.2;
+    ctx.beginPath();
+    const divSteps=isMobileHardware?14:18,divStepM=48.0/divSteps;
+    for(let l=0;l<4;l++){
+        const divLane=-1.5+l;
+        for(let s=0;s<divSteps;s+=2){
+            const z1=0.65+s*divStepM,z2=z1+divStepM*0.75;
+            ctx.moveTo(projectX(divLane,z1,W,H,roadCurve),projectY(z1,0,H));
+            ctx.lineTo(projectX(divLane,z2,W,H,roadCurve),projectY(z2,0,H));
+        }
+    }
+    ctx.stroke();
+
+    const corridorSteps=isMobileHardware?14:20,corridorStepM=42.0/corridorSteps;
+    ctx.fillStyle=`${activeRailColor}1f`;
+    ctx.beginPath();
+    for(let s=0;s<=corridorSteps;s++){
+        const z=0.58+s*corridorStepM;
+        const xL=projectX(gameState.egoLaneX-0.46,z,W,H,roadCurve),y=projectY(z,0,H);
+        if(s===0)ctx.moveTo(xL,y);else ctx.lineTo(xL,y);
+    }
+    for(let s=corridorSteps;s>=0;s--){
+        const z=0.58+s*corridorStepM;
+        ctx.lineTo(projectX(gameState.egoLaneX+0.46,z,W,H,roadCurve),projectY(z,0,H));
+    }
+    ctx.closePath();ctx.fill();
+
+    ctx.strokeStyle=activeRailColor;
+    ctx.lineWidth=2.0;
+    ctx.beginPath();
+    for(let s=0;s<=corridorSteps;s++){
+        const z=0.58+s*corridorStepM;
+        const xL=projectX(gameState.egoLaneX-0.46,z,W,H,roadCurve),y=projectY(z,0,H);
+        if(s===0)ctx.moveTo(xL,y);else ctx.lineTo(xL,y);
+    }
+    for(let s=0;s<=corridorSteps;s++){
+        const z=0.58+s*corridorStepM;
+        const xR=projectX(gameState.egoLaneX+0.46,z,W,H,roadCurve),y=projectY(z,0,H);
+        if(s===0)ctx.moveTo(xR,y);else ctx.lineTo(xR,y);
+    }
+    ctx.stroke();
+
+    for(let i=gameState.pickups.length-1;i>=0;i--){
+        renderHighTexturePickup(gameState.pickups[i],W,H,roadCurve,now);
+    }
+
+    gameState.hazards.sort((a,b)=>b.z-a.z);
+    ctx.font="bold 10px 'JetBrains Mono',monospace";
+    for(let i=0;i<gameState.hazards.length;i++){
+        const hz=gameState.hazards[i];
+        renderHighTextureDistinctHazard(hz,Math.max(0.55,hz.z),W,H,roadCurve,dynamicWorldColor,isCosmic250,cosmicHue,now);
+    }
+
+    updateAndRenderEmpDisintegrations(dtRender,W,H,roadCurve,activeRailColor);
+
+    // ==================== 3D REAR-CHASE TESLA ROADSTER 2.0 ====================
+    const CAR_LENGTH_SCALE=1.05;
+    const CAR_WIDTH_SCALE=0.86;
+
+    const zCarRear=1.34;
+    const zCarFront=1.54;
+    const rearX=projectX(gameState.egoLaneX,zCarRear,W,H,roadCurve);
+    const frontX=projectX(gameState.egoLaneX,zCarFront,W,H,roadCurve);
+    const carCenterX=Math.round(rearX);
+    const hoodLeadX=Math.round((frontX-rearX)*0.65);
+
+    const rearY=Math.round(projectY(zCarRear,0,H));
+    const halfW=Math.round(((H*0.85)/zCarRear)*EGO_HALF_LANE_W*LANE_WIDTH_M*0.24*CAR_WIDTH_SCALE);
+    const carH=Math.round(halfW*0.92*CAR_LENGTH_SCALE);
+
+    const diffuserBotY=rearY;
+    const fasciaTopY=rearY-Math.round(carH*0.34);
+    const shoulderY=rearY-Math.round(carH*0.56);
+    const roofTopY=rearY-carH;
+
+    const shoulderHalfW=Math.round(halfW*0.96);
+    const roofHalfW=Math.round(halfW*0.56);
+    const hoodHalfW=Math.round(halfW*0.44);
+
+    ctx.fillStyle="rgba(0,0,0,0.75)";
+    ctx.beginPath();
+    ctx.ellipse(carCenterX,diffuserBotY+3,halfW*0.98,6,0,0,Math.PI*2);
+    ctx.fill();
+
+    const tireW=Math.max(9,Math.round(halfW*0.26));
+    const tireH=Math.max(13,Math.round(carH*0.36));
+    ctx.fillStyle="#04060a";
+    ctx.strokeStyle="#1e293b";
+    ctx.lineWidth=1.2;
+    ctx.beginPath();
+    ctx.roundRect(carCenterX-halfW-2,diffuserBotY-tireH+3,tireW,tireH,3);
+    ctx.roundRect(carCenterX+halfW-tireW+2,diffuserBotY-tireH+3,tireW,tireH,3);
+    ctx.fill();
+    ctx.stroke();
+
+    // Keep car body, mirrors, canopy & spoiler in true livery color (never forced yellow when boosting)
+    const borderGlowCol=activeRailColor;
+    if(gfxSettings.bloom){
+        ctx.shadowBlur=isMobileHardware?12:18;
+        ctx.shadowColor=borderGlowCol;
+    }
+
+    const bodyGrad=ctx.createLinearGradient(carCenterX,roofTopY,carCenterX,diffuserBotY);
+    bodyGrad.addColorStop(0,activeLiveryProfile.chassisTop||"#1e293b");
+    bodyGrad.addColorStop(0.48,activeLiveryProfile.dotColor+"44");
+    bodyGrad.addColorStop(1,activeLiveryProfile.chassisBot||"#090d16");
+
+    ctx.fillStyle=bodyGrad;
+    ctx.strokeStyle=borderGlowCol;
+    ctx.lineWidth=2.2;
+    ctx.beginPath();
+    ctx.moveTo(carCenterX-halfW+2,diffuserBotY-3);
+    ctx.quadraticCurveTo(carCenterX-halfW-4,fasciaTopY+4,carCenterX-shoulderHalfW,shoulderY);
+    ctx.quadraticCurveTo(carCenterX+hoodLeadX*0.5-roofHalfW*1.12,roofTopY+Math.round(carH*0.18),carCenterX+hoodLeadX-hoodHalfW,roofTopY+3);
+    ctx.quadraticCurveTo(carCenterX+hoodLeadX,roofTopY-3,carCenterX+hoodLeadX+hoodHalfW,roofTopY+3);
+    ctx.quadraticCurveTo(carCenterX+hoodLeadX*0.5+roofHalfW*1.12,roofTopY+Math.round(carH*0.18),carCenterX+shoulderHalfW,shoulderY);
+    ctx.quadraticCurveTo(carCenterX+halfW+4,fasciaTopY+4,carCenterX+halfW-2,diffuserBotY-3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.shadowBlur=0;
+
+    ctx.fillStyle=activeLiveryProfile.chassisTop||"#1e293b";
+    ctx.strokeStyle=borderGlowCol;
+    ctx.lineWidth=1.2;
+    const mirrorY=shoulderY-Math.round(carH*0.16);
+    const mirrorCenterX=carCenterX+Math.round(hoodLeadX*0.45);
+    ctx.beginPath();
+    ctx.moveTo(mirrorCenterX-roofHalfW*1.10,mirrorY);
+    ctx.lineTo(mirrorCenterX-roofHalfW*1.28,mirrorY-2);
+    ctx.lineTo(mirrorCenterX-roofHalfW*1.18,mirrorY+3);
+    ctx.closePath();
+    ctx.moveTo(mirrorCenterX+roofHalfW*1.10,mirrorY);
+    ctx.lineTo(mirrorCenterX+roofHalfW*1.28,mirrorY-2);
+    ctx.lineTo(mirrorCenterX+roofHalfW*1.18,mirrorY+3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    const glassGrad=ctx.createLinearGradient(carCenterX,roofTopY+2,carCenterX,shoulderY+4);
+    glassGrad.addColorStop(0,activeLiveryProfile.canopyColor||"#7dd3fc");
+    glassGrad.addColorStop(0.55,"#0f172a");
+    glassGrad.addColorStop(1,"#060911");
+
+    ctx.fillStyle=glassGrad;
+    ctx.strokeStyle=`${borderGlowCol}99`;
+    ctx.lineWidth=1.3;
+    ctx.beginPath();
+    ctx.moveTo(carCenterX+hoodLeadX-hoodHalfW*0.82,roofTopY+4);
+    ctx.quadraticCurveTo(carCenterX+hoodLeadX,roofTopY+1,carCenterX+hoodLeadX+hoodHalfW*0.82,roofTopY+4);
+    ctx.lineTo(carCenterX+roofHalfW*0.76,shoulderY+2);
+    ctx.quadraticCurveTo(carCenterX,shoulderY+5,carCenterX-roofHalfW*0.76,shoulderY+2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.strokeStyle="rgba(255,255,255,0.28)";
+    ctx.lineWidth=1.1;
+    ctx.beginPath();
+    ctx.moveTo(carCenterX+hoodLeadX*0.55-roofHalfW*0.68,roofTopY+Math.round(carH*0.18));
+    ctx.quadraticCurveTo(carCenterX+hoodLeadX*0.55,roofTopY+Math.round(carH*0.15),carCenterX+hoodLeadX*0.55+roofHalfW*0.68,roofTopY+Math.round(carH*0.18));
+    ctx.stroke();
+
+    ctx.strokeStyle=`${borderGlowCol}bb`;
+    ctx.lineWidth=1.3;
+    ctx.beginPath();
+    ctx.moveTo(carCenterX-shoulderHalfW+2,shoulderY);
+    ctx.quadraticCurveTo(carCenterX-halfW*0.68,fasciaTopY-4,carCenterX-halfW*0.42,fasciaTopY);
+    ctx.moveTo(carCenterX+shoulderHalfW-2,shoulderY);
+    ctx.quadraticCurveTo(carCenterX+halfW*0.68,fasciaTopY-4,carCenterX+halfW*0.42,fasciaTopY);
+    ctx.stroke();
+
+    const wingLift=(gameState.boosting||gameState.braking)?4:0;
+    const wingY=fasciaTopY-2-wingLift;
+    const wingW=Math.round(shoulderHalfW*0.92);
+    ctx.fillStyle="#070b14";
+    ctx.strokeStyle=borderGlowCol;
+    ctx.lineWidth=1.5;
+    ctx.beginPath();
+    ctx.moveTo(carCenterX-wingW,wingY+2);
+    ctx.quadraticCurveTo(carCenterX,wingY-2,carCenterX+wingW,wingY+2);
+    ctx.lineTo(carCenterX+wingW-3,wingY+5);
+    ctx.quadraticCurveTo(carCenterX,wingY+2,carCenterX-wingW+3,wingY+5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    const fasciaW=Math.round(halfW*0.90);
+    const fasciaH=Math.max(10,diffuserBotY-fasciaTopY-3);
+    ctx.fillStyle="#05070e";
+    ctx.strokeStyle="#1e293b";
+    ctx.lineWidth=1.2;
+    ctx.beginPath();
+    ctx.roundRect(carCenterX-fasciaW,fasciaTopY,fasciaW*2,fasciaH,4);
+    ctx.fill();
+    ctx.stroke();
+
+    // Tail light blades keep their true livery/brake color (not forced yellow on Nitro)
+    const tailCol=gameState.braking?"#ff1e42":(activeLiveryProfile.isVoidChroma?activeRailColor:"#f43f5e");
+    if(gfxSettings.bloom){
+        ctx.shadowBlur=gameState.braking?18:10;
+        ctx.shadowColor=tailCol;
+    }
+    ctx.fillStyle=tailCol;
+    const bladeW=Math.round(fasciaW*0.42);
+    const bladeY=fasciaTopY+2;
+    ctx.beginPath();
+    ctx.roundRect(carCenterX-fasciaW+3,bladeY,bladeW,3.5,2);
+    ctx.roundRect(carCenterX+fasciaW-bladeW-3,bladeY,bladeW,3.5,2);
+    ctx.roundRect(carCenterX-4,bladeY+0.5,8,2.5,1);
+    ctx.fill();
+    ctx.shadowBlur=0;
+
+    const diffY=diffuserBotY-8;
+    ctx.strokeStyle=`${borderGlowCol}88`;
+    ctx.lineWidth=1.2;
+    ctx.beginPath();
+    [-0.55,-0.25,0.25,0.55].forEach(r=>{
+        const sx=carCenterX+Math.round(fasciaW*r);
+        ctx.moveTo(sx,diffY);
+        ctx.lineTo(sx,diffuserBotY-2);
+    });
+    ctx.stroke();
+
+    // Dedicated Twin Side Thruster Ports + Center Afterburner Nozzle (shows where Nitro flames originate)
+    const usePrismaticNitro=Boolean(activeLiveryProfile.isVoidChroma&&gfxSettings.voidChromaNitro!==false);
+    const chromaFlame1=`hsl(${voidHue},100%,62%)`;
+    const chromaFlame2=`hsl(${(voidHue+115)%360},100%,64%)`;
+    const chromaFlame3=`hsl(${(voidHue+230)%360},100%,68%)`;
+    const nozzleRimCol=gameState.boosting?(usePrismaticNitro?chromaFlame1:"#fbbf24"):activeLiveryProfile.thrusterColor;
+    const leftNozzleX=Math.round(carCenterX-fasciaW*0.36);
+    const rightNozzleX=Math.round(carCenterX+fasciaW*0.36);
+
+    ctx.fillStyle="#090d16";
+    ctx.strokeStyle=nozzleRimCol;
+    ctx.lineWidth=1.4;
+    ctx.beginPath();
+    ctx.roundRect(leftNozzleX-6,diffY+1,12,4.5,2);
+    ctx.roundRect(rightNozzleX-6,diffY+1,12,4.5,2);
+    ctx.roundRect(carCenterX-8,diffY+1,16,5,2);
+    ctx.fill();
+    ctx.stroke();
+
+    if(gameState.boosting){
+        const flameLen=14+Math.random()*12;
+        if(usePrismaticNitro){
+            // Dark-Matter Prismatic Chroma Nitro (ID 1117 Livery)
+            if(gfxSettings.bloom){
+                ctx.shadowBlur=18;
+                ctx.shadowColor=chromaFlame1;
+            }
+            ctx.fillStyle=chromaFlame1;
+            ctx.beginPath();
+            ctx.moveTo(carCenterX-fasciaW*0.52,diffuserBotY-2);
+            ctx.lineTo(leftNozzleX,diffuserBotY+flameLen*1.08);
+            ctx.lineTo(carCenterX-fasciaW*0.20,diffuserBotY-2);
+            ctx.moveTo(carCenterX+fasciaW*0.20,diffuserBotY-2);
+            ctx.lineTo(rightNozzleX,diffuserBotY+flameLen*1.08);
+            ctx.lineTo(carCenterX+fasciaW*0.52,diffuserBotY-2);
+            ctx.fill();
+
+            ctx.fillStyle=chromaFlame2;
+            ctx.beginPath();
+            ctx.moveTo(leftNozzleX-4,diffuserBotY-2);
+            ctx.lineTo(leftNozzleX,diffuserBotY+flameLen*0.72);
+            ctx.lineTo(leftNozzleX+4,diffuserBotY-2);
+            ctx.moveTo(rightNozzleX-4,diffuserBotY-2);
+            ctx.lineTo(rightNozzleX,diffuserBotY+flameLen*0.72);
+            ctx.lineTo(rightNozzleX+4,diffuserBotY-2);
+            ctx.moveTo(carCenterX-7,diffuserBotY-2);
+            ctx.lineTo(carCenterX,diffuserBotY+flameLen*1.32);
+            ctx.lineTo(carCenterX+7,diffuserBotY-2);
+            ctx.fill();
+
+            ctx.fillStyle=chromaFlame3;
+            ctx.beginPath();
+            ctx.moveTo(carCenterX-4,diffuserBotY-2);
+            ctx.lineTo(carCenterX,diffuserBotY+flameLen*0.92);
+            ctx.lineTo(carCenterX+4,diffuserBotY-2);
+            ctx.fill();
+            ctx.shadowBlur=0;
+        }else{
+            // Default Nitro (Other Core Accounts, Guests, or when Default Nitro is toggled on)
+            if(gfxSettings.bloom){
+                ctx.shadowBlur=16;
+                ctx.shadowColor="#fbbf24";
+            }
+            ctx.fillStyle="rgba(251,191,36,0.92)";
+            ctx.beginPath();
+            ctx.moveTo(carCenterX-fasciaW*0.52,diffuserBotY-2);
+            ctx.lineTo(leftNozzleX,diffuserBotY+flameLen);
+            ctx.lineTo(carCenterX-fasciaW*0.20,diffuserBotY-2);
+            ctx.moveTo(carCenterX+fasciaW*0.20,diffuserBotY-2);
+            ctx.lineTo(rightNozzleX,diffuserBotY+flameLen);
+            ctx.lineTo(carCenterX+fasciaW*0.52,diffuserBotY-2);
+            ctx.fill();
+
+            ctx.fillStyle="#e0f2fe";
+            ctx.beginPath();
+            ctx.moveTo(carCenterX-6,diffuserBotY-2);
+            ctx.lineTo(carCenterX,diffuserBotY+flameLen*1.25);
+            ctx.lineTo(carCenterX+6,diffuserBotY-2);
+            ctx.fill();
+            ctx.shadowBlur=0;
+        }
+    }
+
+    // ==================== UPGRADED 3D NEURAL EMP SHOCKWAVE & LIGHTNING DOME ====================
+    if(gameState.empWaveRadius>0){
+        const empOriginX=carCenterX;
+        const empOriginY=rearY-carH*0.45;
+        const r1=gameState.empWaveRadius;
+        const fade=Math.max(0.12,1-(r1/1500));
+
+        ctx.save();
+        ctx.globalAlpha=fade;
+
+        if(empFlashAlpha>0){
+            ctx.fillStyle=`rgba(56,189,248,${empFlashAlpha*0.32})`;
+            ctx.fillRect(0,0,W,H);
+        }
+
+        ctx.strokeStyle="#00f5d4";
+        ctx.lineWidth=6;
+        ctx.beginPath();
+        ctx.ellipse(empOriginX,empOriginY,r1,r1*0.52,0,0,Math.PI*2);
+        ctx.stroke();
+
+        ctx.strokeStyle="#ffffff";
+        ctx.lineWidth=2.8;
+        ctx.beginPath();
+        ctx.ellipse(empOriginX,empOriginY,r1*0.76,r1*0.40,0,0,Math.PI*2);
+        ctx.stroke();
+
+        ctx.strokeStyle=activeRailColor;
+        ctx.lineWidth=3.2;
+        ctx.beginPath();
+        ctx.arc(empOriginX,empOriginY,r1*0.88,0,Math.PI*2);
+        ctx.stroke();
+
+        const arcCount=isMobileHardware?6:10;
+        ctx.strokeStyle="#e0f2fe";
+        ctx.lineWidth=1.8;
+        ctx.beginPath();
+        for(let a=0;a<arcCount;a++){
+            const baseAng=(a/arcCount)*Math.PI*2+now*0.008;
+            const innerR=r1*0.25;
+            const midR=r1*0.62;
+            const outerR=r1*0.96;
+            const j1=(Math.sin(now*0.03+a*4.1))*0.14;
+            const j2=(Math.cos(now*0.04+a*2.7))*0.14;
+            ctx.moveTo(empOriginX+Math.cos(baseAng)*innerR,empOriginY+Math.sin(baseAng)*innerR*0.55);
+            ctx.lineTo(empOriginX+Math.cos(baseAng+j1)*midR,empOriginY+Math.sin(baseAng+j1)*midR*0.55);
+            ctx.lineTo(empOriginX+Math.cos(baseAng+j2)*outerR,empOriginY+Math.sin(baseAng+j2)*outerR*0.55);
+        }
+        ctx.stroke();
+
+        ctx.restore();
+    }
+
+    if(theme.weather!=='none'&&gfxSettings.particles>0.05){
+        const pCount=Math.floor((isMobileHardware?18:30)*gfxSettings.particles);
+        for(let r=0;r<pCount;r++){
+            const rx=((r*97+now*0.42)%W),ry=((r*61+now*1.05)%H);
+            if(theme.weather==='rain'){
+                ctx.strokeStyle="rgba(125,211,252,0.34)";
+                ctx.lineWidth=1.3;
+                ctx.beginPath();ctx.moveTo(rx,ry);ctx.lineTo(rx-6,ry+15);ctx.stroke();
+            }else{
+                ctx.fillStyle=theme.weather==='snow'?"rgba(241,245,249,0.75)":(theme.weather==='embers'?"rgba(251,146,60,0.75)":(theme.weather==='petals'?"rgba(244,114,182,0.75)":dynamicWorldColor));
+                ctx.fillRect(rx,theme.weather==='embers'?H-ry:ry,2.8,2.8);
+            }
+        }
+    }
+
+    for(let i=0;i<gameState.FloatingTexts.length;i++){
+        const ft=gameState.FloatingTexts[i];
+        ctx.save();
+        ctx.globalAlpha=Math.max(0,ft.life);
+        ctx.font="800 13px 'JetBrains Mono',monospace";
+        ctx.textAlign="center";
+        ctx.fillStyle=ft.color;
+        ctx.fillText(ft.text,ft.x,ft.y);
+        ctx.restore();
+    }
+
+    ctx.restore();
+}
+
+function escapeHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
+
+window.addEventListener('resize',resizeGameCanvas);
+window.addEventListener('orientationchange',()=>{setTimeout(resizeGameCanvas,60);setTimeout(resizeGameCanvas,220);});
+window.addEventListener('pageshow',()=>{resizeGameCanvas();setTimeout(resizeGameCanvas,120);resumeAudioForForeground();});
+window.addEventListener('pagehide',()=>{silenceAllAudioForBackground();});
+window.addEventListener('freeze',()=>{silenceAllAudioForBackground();});
+window.addEventListener('blur',()=>{
+    if(gameState.running&&!gameState.paused)openPauseSettingsModal('game');
+});
+window.addEventListener('focus',()=>{
+    resizeGameCanvas();
+    setTimeout(resizeGameCanvas,120);
+    resumeAudioForForeground();
+});
+window.addEventListener('popstate',()=>{
+    if(gameState.running&&!gameState.paused){
+        openPauseSettingsModal('game');
+        resizeGameCanvas();
+    }
+});
+
+document.addEventListener('visibilitychange',()=>{
+    if(document.hidden){
+        if(gameState.running&&!gameState.paused)openPauseSettingsModal('game');
+        silenceAllAudioForBackground();
+    }else{
+        resizeGameCanvas();
+        setTimeout(resizeGameCanvas,120);
+        if(controlConfig.mobileMode==='tilt')needsSilentGyroCalib=true;
+        resumeAudioForForeground();
+    }
+});
+
+window.addEventListener('deviceorientation',(e)=>{
+    if(e.beta===null&&e.gamma===null)return;
+    const angle=(screen.orientation&&typeof screen.orientation.angle==='number')?screen.orientation.angle:(typeof window.orientation==='number'?window.orientation:0);
+    let raw=0;
+    if(angle===90)raw=e.beta||0;
+    else if(angle===270||angle===-90)raw=-(e.beta||0);
+    else raw=(window.innerHeight>window.innerWidth)?(e.beta||0):(e.gamma||0);
+    if(controlConfig.invertGyro)raw=-raw;
+    lastRawLandscapeTilt=raw;
+    hasGyroReading=true;
+    if(needsSilentGyroCalib){
+        controlConfig.tiltCenterOffset=raw;
+        smoothedGyroDelta=0;
+        needsSilentGyroCalib=false;
+    }
+    const rawDelta=raw-controlConfig.tiltCenterOffset;
+    const deadzoneDelta=Math.abs(rawDelta)<1.1?0:(rawDelta>0?rawDelta-1.1:rawDelta+1.1);
+    smoothedGyroDelta+=(deadzoneDelta-smoothedGyroDelta)*0.42;
+    if(controlConfig.mobileMode==='tilt'){
+        const lbl=document.getElementById('gyroLiveAngleLabel');
+        if(lbl)lbl.innerText=`${smoothedGyroDelta>0.2?'+':''}${smoothedGyroDelta.toFixed(1)}°`;
+    }
+    if(!gameState.running||gameState.paused||controlConfig.mobileMode!=='tilt')return;
+    const maxTiltDeg=18.0-(controlConfig.gyroSensitivity*11.0);
+    const continuousLane=Math.max(-2,Math.min(2,(smoothedGyroDelta/Math.max(4.5,maxTiltDeg))*2.25));
+    setMagneticTargetLane(continuousLane);
+});
+
+window.addEventListener('pointercancel',()=>{
+    setBoosting(false);
+    setBraking(false);
+    document.querySelectorAll('.touch-paddle.active-press').forEach(el=>el.classList.remove('active-press'));
+});
+
+canvas.addEventListener('pointerdown',(e)=>{
+    if(e.isTrusted)hasTrustedGesture=true;
+    if(isMobileHardware&&gameState.running&&!document.fullscreenElement){
+        requestMobileFullscreenSafe();
+    }
+    if(!gameState.running||gameState.paused)return;
+    const now=performance.now();
+    const dtTap=now-controlConfig.lastTouchTime;
+    if(controlConfig.doubleTapNitro&&dtTap>40&&dtTap<260){
+        setBoosting(true);
+        if(doubleTapBoostTimer)clearTimeout(doubleTapBoostTimer);
+        doubleTapBoostTimer=setTimeout(()=>setBoosting(false),1100);
+    }
+    controlConfig.lastTouchTime=now;
+    if(controlConfig.mobileMode==='drag')handleCanvasTapLane(e);
+});
+
+window.addEventListener('keydown',(e)=>{
+    if(e.isTrusted)hasTrustedGesture=true;
+    if(!isBootSplashDismissed&&(e.key==='Enter'||e.key===' ')){
         e.preventDefault();
-        if (document.getElementById('confirmModal').style.display === 'flex') { resolveConfirmModal(false); return; }
-        if (document.getElementById('leaderboardModal').style.display === 'flex') { closeLeaderboardModal(); return; }
-        if (document.getElementById('inboxModal').style.display === 'flex') { closeInboxModal(); return; }
-        if (document.getElementById('pauseSettingsModal').style.display === 'flex') { resumeFromSettings(); return; }
-        if (gameState.running) openSettingsModal('game');
+        enterMainMenuFromSplash();
         return;
     }
-    if (!gameState.running || gameState.paused) return;
-    if (k === 'r' && activeAccount && activeAccount.isDev) { e.preventDefault(); devRefillAllSystems(); return; }
-    const b = globalSettings.controls.binds;
-    if (b.hideui.includes(k)) { e.preventDefault(); toggleGameHudVisibility(); return; }
-    if (b.left.includes(k)) steerLane(-1);
-    else if (b.right.includes(k)) steerLane(1);
-    else if (b.nitro.includes(k)) setBoosting(true);
-    else if (b.brake.includes(k)) setBraking(true);
-    else if (b.emp.includes(k)) { e.preventDefault(); triggerNeuralEmp(); }
-});
-window.addEventListener('keyup', e => { const k = e.key.toLowerCase(), b = globalSettings.controls.binds; if (b.nitro.includes(k)) setBoosting(false); else if (b.brake.includes(k)) setBraking(false); });
-document.addEventListener('click', e => { if (e.isTrusted) hasTrustedGesture = true; const btn = e.target.closest('button'); if (btn && !btn.disabled && !btn.classList.contains('touch-paddle')) playSfx('uiClick'); }, { passive: true });
-
-window.addEventListener('resize', resizeGameCanvas);
-if (window.visualViewport) window.visualViewport.addEventListener('resize', resizeGameCanvas);
-window.addEventListener('orientationchange', () => { setTimeout(resizeGameCanvas, 70); setTimeout(resizeGameCanvas, 220); });
-window.addEventListener('blur', () => { if (gameState.running && !gameState.paused) openSettingsModal('game'); });
-window.addEventListener('focus', () => { resizeGameCanvas(); resumeAudioForeground(); });
-document.addEventListener('visibilitychange', () => { if (document.hidden) { if (gameState.running && !gameState.paused) openSettingsModal('game'); silenceAllAudio(); } else { resizeGameCanvas(); resumeAudioForeground(); } });
-
-Object.assign(window, {
-    switchAuthSubTab, createNewPilotAccount, signInWithUid,
-    logoutActiveAccount, logoutFromProfile, saveProfileIdentity,
-    toggleRevealField, copyCurrentAccountUid, copyPrevAccountUid, copyUidDirect,
-    deleteActiveAccountSelf, deleteAccountByUid,
-    resolveConfirmModal, forceManualCloudSync,
-    startGameSession, returnToMainMenu, exitGamePortal, toggleGameHudVisibility,
-    openInboxModal, closeInboxModal, markMailRead, markAllInboxRead, clearReadInboxMail, claimInboxReward,
-    openLeaderboardModal, closeLeaderboardModal, switchLeaderboardTab, toggleLbDevManage,
-    openSettingsModal, resumeFromSettings, switchSettingsTab,
-    setDifficulty, selectManualBiome, toggleAutoBiomeCycle, resetGameSettingsOnly,
-    setCustomVehicleColor, applyGaragePreset, selectNitroSkin, resetVehicleCustomization,
-    toggleGarageNitroPreview, triggerGarageEmpPreview,
-    selectOstMode, updateVolumeSetting, handleCustomSongUpload, removeCurrentPilotCustomSong, deleteCustomSongByUid, resetSoundSettingsOnly,
-    setMobileControlMode, toggleInvertGyro, calibrateTiltSensor, updateGyroSpeedSetting, toggleDoubleTapNitro, startKeyRebind, resetControlSettingsOnly,
-    applyGraphicsPreset, updateGfxResolution, updateGfxDrawSlices, updateGfxParticles, toggleGfxOption, setVisualFilter, resetGraphicsSettingsOnly,
-    toggleDevGodMode, devRefillAllSystems, devStartAtCustomEpoch, devFastForwardSeasonPhase, devBroadcastSystemMail,
-    devResetSpecificScore, devResetAllScores, devDeleteAllNonDevAccounts, devRemoveAllCustomSongs,
-    toggleDevRevealAllIds, toggleDevRowReveal, renderDevAccountsList,
-    steerLane, setBoosting, setBraking, triggerNeuralEmp
+    ensureAudioEngine();
+    const k=e.key.toLowerCase();
+    if(awaitingRebindAction){
+        e.preventDefault();
+        if(k!=='escape')controlConfig.binds[awaitingRebindAction]=[k];
+        awaitingRebindAction=null;
+        refreshKeybindLabels();
+        saveSettingsForActiveAccount();
+        return;
+    }
+    if(e.key==='Escape'){
+        e.preventDefault();
+        if(document.getElementById('leaderboardModal').style.display!=='none'){closeLeaderboardModal();return;}
+        if(document.getElementById('pauseSettingsModal').style.display!=='none')resumeFromSettings();
+        else if(gameState.running||document.getElementById('gameOverModal').style.display!=='none')openPauseSettingsModal('game');
+        return;
+    }
+    if(!gameState.running||gameState.paused)return;
+    if(k==='r'&&currentPilot.id==='1117'){e.preventDefault();devRefillAllSystems();return;}
+    if(controlConfig.binds.hideui&&controlConfig.binds.hideui.includes(k)){e.preventDefault();toggleGameHudVisibility();return;}
+    if(controlConfig.binds.left.includes(k))steerLane(-1);
+    else if(controlConfig.binds.right.includes(k))steerLane(1);
+    else if(controlConfig.binds.nitro.includes(k))setBoosting(true);
+    else if(controlConfig.binds.brake.includes(k))setBraking(true);
+    else if(controlConfig.binds.emp.includes(k)){e.preventDefault();triggerNeuralEmp();}
 });
 
-// =========================================================================
-// 15. BOOT, HYBRID INDEXEDDB + FIREBASE DB & FAIL-SAFE 60/120FPS LOOP
-// =========================================================================
+window.addEventListener('keyup',(e)=>{
+    const k=e.key.toLowerCase();
+    if(controlConfig.binds.nitro.includes(k))setBoosting(false);
+    else if(controlConfig.binds.brake.includes(k))setBraking(false);
+});
+
+if(lbChannel){
+    lbChannel.onmessage=(ev)=>{if(ev.data&&(ev.data.type==='lb_sync_v10'||ev.data.type==='lb_sync_v8'))mergeRemoteLeaderboardPacket(ev.data);};
+}
+
 detectDeviceHardware();
-validateAndSanitizeDatabase();
-restoreFromIndexedDBIfNeeded();
-syncSeasonLifecycle();
-reconcileAllTimeChampion();
-
-setDifficulty(globalSettings.difficulty);
+upgradeEpoch250HologramWarningUI();
 buildVolumeSlidersUI();
 buildKeybindGridUI();
-setMobileControlMode(globalSettings.controls.mobileMode);
-updateGyroSpeedSetting(Math.round(globalSettings.controls.gyroSensitivity * 100));
 buildGraphicsUI();
-document.getElementById('atmosphereOverlay').classList.toggle('scanlines-active', globalSettings.graphics.scanlines);
-
-const savedUid = lsGet(STORAGE_ACTIVE_UID_KEY, '');
-if (savedUid && accountsCache[savedUid]) {
-    activateAccountSession(savedUid);
-} else {
-    refreshMenuAccountUI();
-    buildBiomeSelectorGrid();
-    syncOstButtonsUI();
-    syncDevUiVisibility();
-}
-
+const savedPilotId=localStorage.getItem('roadSense_overdrive_pilotId')||"GUEST";
+applyPilotProfile(savedPilotId);
+createAndMountBootSplashGate();
 resizeGameCanvas();
-refreshSeasonUI();
+updateTopLeaderBanner();
 renderMiniRadar();
-startMusicScheduler();
+pullGlobalCloudLeaderboard();
+startLiveLeaderboardStream();
+startUnifiedMusicScheduler();
 
-pullCloudHistoryAndSync(true);
-connectRealtimeStream();
-
-setInterval(() => {
-    seasonStatusCache = computeSeasonStatus();
-    if ((seasonStatusCache.phase === 'GAP' && seasonStateCache.lastFinalizedSeason < seasonStatusCache.seasonNum) ||
-        (seasonStatusCache.phase === 'ACTIVE' && (seasonStateCache.lastAnnouncedSeason < seasonStatusCache.seasonNum || seasonStateCache.lastFinalizedSeason < seasonStatusCache.seasonNum - 1))) {
-        syncSeasonLifecycle();
-    } else if (!gameState.running) {
-        refreshSeasonUI();
-    }
-}, 1000);
-
-let lastLoopTs = performance.now();
-function mainLoop(now) {
+let lastFrameTime=performance.now();
+function mainLoop(now){
+    const dt=Math.min(0.05,Math.max(0.001,(now-lastFrameTime)/1000));
+    lastFrameTime=now;
+    updateGamePhysics(dt,now);
+    renderSceneFrame(now);
     requestAnimationFrame(mainLoop);
-    try {
-        const dt = Math.min(0.05, Math.max(0.001, (now - lastLoopTs) / 1000));
-        lastLoopTs = now;
-        updateGamePhysics(dt, now);
-        renderSceneFrame(now);
-    } catch (err) {
-        console.error('Frame error:', err);
-    }
 }
 requestAnimationFrame(mainLoop);
-
-})();
+// --- END OF MINI-CHUNK 6.4 OF 4 ---
