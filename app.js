@@ -3631,3 +3631,260 @@ function buildGraphicsUI(){
         }).join('');
     }
     
+const tGrid=document.getElementById('gfxTogglesGrid');
+    if(tGrid){
+        tGrid.className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 pt-1";
+        tGrid.innerHTML=GFX_TOGGLE_META.map(t=>`<button type="button" id="gfxToggle_${t.k}" onclick="toggleGfxOption('${t.k}')" class="p-1.5 rounded-lg text-[10px] font-bold cursor-pointer truncate"></button>`).join('');
+        GFX_TOGGLE_META.forEach(t=>applyGfxOptionState(t.k,gfxSettings[t.k],false));
+    }
+    const fGrid=document.getElementById('gfxFilterButtonsGrid');
+    if(fGrid){
+        const parentWell=fGrid.parentElement;
+        if(parentWell&&!document.getElementById('deactivateOpticFilterBtn')){
+            const hdr=parentWell.firstElementChild;
+            if(hdr){
+                hdr.className="flex items-center justify-between gap-2";
+                hdr.innerHTML=`
+                    <span class="font-bold text-white uppercase text-[11px] mono-num">🎬 Optic Color Grade</span>
+                    <button type="button" id="deactivateOpticFilterBtn" onclick="setVisualFilter('filter-standard')" class="hidden px-2 py-0.5 rounded-md bg-red-500/20 hover:bg-red-500/35 text-red-300 border border-red-500/40 text-[9.5px] mono-num font-extrabold cursor-pointer transition">✕ Deactivate Filter</button>
+                `;
+            }
+        }
+        fGrid.innerHTML=OPTIC_FILTER_META.map(f=>`<button type="button" onclick="setVisualFilter('${f.k}')" id="flt_${f.k}" class="p-2 rounded-lg text-[10.5px] font-semibold cursor-pointer truncate"></button>`).join('');
+        setVisualFilter(VALID_OPTIC_FILTERS.has(gfxSettings.filter)?gfxSettings.filter:'filter-standard',false);
+    }
+}
+
+function setVisualFilter(fc,shouldSave=true){
+    injectCustomFilterAndGodStyles();
+    const safeFilter=VALID_OPTIC_FILTERS.has(fc)?fc:'filter-standard';
+    gfxSettings.filter=safeFilter;
+    canvas.className=safeFilter;
+
+    const ov=document.getElementById('atmosphereOverlay');
+    if(ov){
+        ov.classList.toggle('atmo-filter-warm',safeFilter==='filter-warm');
+        ov.classList.toggle('atmo-filter-vintage',safeFilter==='filter-vintage');
+        ov.classList.toggle('atmo-filter-cinematic',safeFilter==='filter-cinematic');
+    }
+
+    OPTIC_FILTER_META.forEach(f=>{
+        const btn=document.getElementById(`flt_${f.k}`);
+        if(!btn)return;
+        btn.innerText=f.lbl;
+        btn.className=(f.k===safeFilter)
+            ?"p-2 rounded-lg text-[10.5px] font-bold bg-sky-500 text-black cursor-pointer truncate"
+            :"p-2 rounded-lg text-[10.5px] font-semibold bg-[#151a26] text-gray-300 border border-[#262f45] hover:text-white cursor-pointer truncate";
+    });
+    const deactBtn=document.getElementById('deactivateOpticFilterBtn');
+    if(deactBtn){
+        deactBtn.classList.toggle('hidden',safeFilter==='filter-standard');
+    }
+    if(shouldSave)saveSettingsForActiveAccount();
+}
+
+function loadOrResetSettingsForActiveAccount(){
+    isApplyingAccountSettings=true;
+    try{
+        if(currentPilot.id!=='1117'){
+            devGodModeActive=false;
+            lbAdminManageMode=false;
+        }
+        syncDevGodModeButtonUI();
+        syncMixtapeOstVisibilityUI();
+        const allSet=JSON.parse(localStorage.getItem(SETTINGS_PER_ACC_KEY)||'{}');
+        const saved=allSet[getActiveAccountStorageKey()];
+        if(saved){
+            setDifficulty(saved.diff||'easy');
+            if(saved.liveryId&&(currentPilot.id==='1117'||saved.liveryId===currentPilot.id)){
+                activeLiveryProfile=PILOT_PROFILES[saved.liveryId]||currentPilot;
+            }else{
+                activeLiveryProfile=currentPilot;
+            }
+            biomeIdx=isBiomeUnlockedForPilot(saved.biomeIdx||0)?(saved.biomeIdx||0):0;
+            autoCycleBiomes=saved.autoCycleBiomes!==undefined?Boolean(saved.autoCycleBiomes):true;
+            syncAutoBiomeButtonUI();
+            setTextCached('hudBiomeName',BIOME_THEMES[biomeIdx].label);
+            if(saved.audio){
+                ['master','music','menuMusic','engine','sfx','uiClick'].forEach(ch=>{
+                    if(saved.audio[ch]!==undefined)updateVolumeSetting(ch,Math.round(saved.audio[ch]*100));
+                });
+                selectOstMode(saved.audio.ostMode==='mitadru'&&currentPilot.id!=='1117'?'synth':(saved.audio.ostMode||'synth'));
+            }
+            if(saved.ctrl){
+                setMobileControlMode(saved.ctrl.mobileMode||'buttons');
+                applyDoubleTapNitroState(saved.ctrl.doubleTapNitro!==false);
+                controlConfig.invertGyro=Boolean(saved.ctrl.invertGyro);
+                const invBtn=document.getElementById('invertGyroBtn');
+                if(invBtn){
+                    invBtn.innerText=`⇄ Flip Axis: ${controlConfig.invertGyro?'ON':'OFF'}`;
+                    invBtn.className=controlConfig.invertGyro?"px-2 py-1 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] mono-num font-bold cursor-pointer":"px-2 py-1 rounded bg-[#182032] hover:bg-[#232f47] text-gray-200 border border-gray-600/40 text-[10px] mono-num font-bold cursor-pointer";
+                }
+                updateGyroSpeedSetting(Math.round((saved.ctrl.gyroSensitivity||0.65)*100));
+                if(saved.ctrl.binds)controlConfig.binds=saved.ctrl.binds;
+                refreshKeybindLabels();
+            }
+            if(saved.gfx){
+                applyGraphicsPreset(saved.gfx.preset||'medium',false);
+                if(saved.gfx.resScale)updateGfxResolution(Math.round(saved.gfx.resScale*100),false);
+                if(saved.gfx.roadSlices)updateGfxDrawSlices(saved.gfx.roadSlices,false);
+                if(saved.gfx.particles!==undefined)updateGfxParticles(Math.round(saved.gfx.particles*100),false);
+                ['bloom','shake','transitions','scanlines','pillars','reflections','speedLines','hudBoxes','legacyModels'].forEach(k=>{
+                    if(saved.gfx[k]!==undefined)applyGfxOptionState(k,saved.gfx[k],false);
+                });
+                gfxSettings.voidChromaNitro=(saved.gfx.voidChromaNitro!==undefined)?Boolean(saved.gfx.voidChromaNitro):true;
+                setVisualFilter(VALID_OPTIC_FILTERS.has(saved.gfx.filter)?saved.gfx.filter:'filter-standard',false);
+            }
+        }else{
+            resetGameSettingsOnly();
+            resetSoundSettingsOnly();
+            resetControlSettingsOnly();
+            resetGraphicsSettingsOnly();
+        }
+    }catch(e){}
+    isApplyingAccountSettings=false;
+    syncMixtapeOstVisibilityUI();
+    buildVehicleLiverySelector();
+    saveSettingsForActiveAccount();
+}
+
+function resetGraphicsSettingsOnly(){
+    gfxSettings.legacyModels=false;
+    gfxSettings.voidChromaNitro=true;
+    setVisualFilter('filter-standard',false);
+    applyGraphicsPreset('medium',true);
+}
+
+// Wrap updateGamePhysics so God Mode (ID 1117) locks Hull, Nitro & EMP at 100% and prevents collision damage
+const _baseUpdateGamePhysics=updateGamePhysics;
+updateGamePhysics=function(dt,now){
+    const godActive=(devGodModeActive&&currentPilot.id==='1117');
+    if(godActive){
+        gameState.armor=100;
+        gameState.nitroFuel=100;
+        gameState.empCharge=100;
+    }
+    _baseUpdateGamePhysics(dt,now);
+    if(godActive){
+        gameState.armor=100;
+        gameState.nitroFuel=100;
+        gameState.empCharge=100;
+    }
+};
+
+// ==================== UNIFIED CUSTOM SONGS MANAGER (DEV 1117 + INDIVIDUAL & ALL DELETE) ====================
+function resetSavedAccountOstIfCustom(accKey){
+    try{
+        const allSet=JSON.parse(localStorage.getItem(SETTINGS_PER_ACC_KEY)||'{}');
+        if(allSet[accKey]&&allSet[accKey].audio&&allSet[accKey].audio.ostMode==='custom'){
+            allSet[accKey].audio.ostMode='synth';
+            localStorage.setItem(SETTINGS_PER_ACC_KEY,JSON.stringify(allSet));
+        }
+    }catch(e){}
+}
+
+async function deleteCustomSongByKey(accKey){
+    try{
+        const db=await openCustomSongsIDB();
+        await new Promise((res)=>{
+            const tx=db.transaction('songs','readwrite');
+            tx.objectStore('songs').delete(accKey);
+            tx.oncomplete=()=>res();
+            tx.onerror=()=>res();
+        });
+        resetSavedAccountOstIfCustom(accKey);
+        if(accKey===getActiveAccountStorageKey()){
+            await loadCustomSongForActivePilot();
+        }else{
+            await renderDevCustomSongsList();
+        }
+        if(currentPilot.id==='1117'){
+            showDevConsoleFeedback(`✓ Custom Song Removed for ${CORE_IDS.has(accKey)?PILOT_PROFILES[accKey].name:accKey.replace('GUEST_ID_','Guest #')}!`);
+        }
+        playGameSfx('uiClick');
+    }catch(e){}
+}
+
+async function devRemoveAllCustomSongs(){
+    if(currentPilot.id!=='1117')return;
+    try{
+        const db=await openCustomSongsIDB();
+        await new Promise((res)=>{
+            const tx=db.transaction('songs','readwrite');
+            tx.objectStore('songs').clear();
+            tx.oncomplete=()=>res();
+            tx.onerror=()=>res();
+        });
+        const allSet=JSON.parse(localStorage.getItem(SETTINGS_PER_ACC_KEY)||'{}');
+        Object.keys(allSet).forEach(k=>{
+            if(allSet[k]&&allSet[k].audio&&allSet[k].audio.ostMode==='custom'){
+                allSet[k].audio.ostMode='synth';
+            }
+        });
+        localStorage.setItem(SETTINGS_PER_ACC_KEY,JSON.stringify(allSet));
+        await loadCustomSongForActivePilot();
+        showDevConsoleFeedback("✓ All Custom Uploaded Songs (Core, 1117 & Guests) Removed!");
+        playGameSfx('pickup');
+    }catch(e){}
+}
+
+async function renderDevCustomSongsList(){
+    const container=document.getElementById('devCustomSongsList');
+    if(!container||currentPilot.id!=='1117')return;
+    try{
+        const parentBox=container.parentElement;
+        if(parentBox&&parentBox.firstElementChild){
+            parentBox.firstElementChild.className="hidden";
+        }
+        const db=await openCustomSongsIDB();
+        const allRecords=await new Promise((res)=>{
+            const tx=db.transaction('songs','readonly');
+            const req=tx.objectStore('songs').getAll();
+            req.onsuccess=()=>res(req.result||[]);
+            req.onerror=()=>res([]);
+        });
+
+        const count=allRecords.length;
+        const headerHtml=`
+            <div class="flex flex-wrap items-center justify-between gap-1.5 pb-1.5 mb-1.5 border-b border-[#1d2638]">
+                <div class="flex items-center gap-1.5">
+                    <span class="text-[10.5px] font-extrabold text-cyan-300 mono-num uppercase">🎵 Custom Songs Vault</span>
+                    <span class="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[9px] mono-num font-bold">${count} Active</span>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <button type="button" onclick="document.getElementById('customSongFileInput').click()" class="px-2 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/35 text-emerald-300 border border-emerald-500/40 text-[9px] mono-num font-bold cursor-pointer transition">📤 Upload (1117)</button>
+                    <button type="button" onclick="devRemoveAllCustomSongs()" ${count===0?'disabled':''} class="px-2 py-0.5 rounded text-[9px] mono-num font-bold transition ${count>0?'bg-red-600/85 hover:bg-red-500 text-white cursor-pointer':'bg-[#141926] text-gray-600 border border-[#22293a] cursor-not-allowed'}">🗑️ Clear All (${count})</button>
+                </div>
+            </div>
+        `;
+
+        if(count===0){
+            container.className="space-y-1 text-[10px] mono-num text-gray-400";
+            container.innerHTML=headerHtml+`<div class="text-gray-500 py-1 text-center">No custom songs uploaded by Core or Guest pilots yet.</div>`;
+            return;
+        }
+
+        container.className="space-y-1.5 text-[10px] mono-num text-gray-300";
+        const rowsHtml=allRecords.map(r=>{
+            const mb=(r.sizeBytes/(1024*1024)).toFixed(1);
+            const accK=String(r.accountKey||'');
+            const isSelf=(accK==='1117');
+            const isCore=CORE_IDS.has(accK);
+            const roleBadge=isSelf
+                ?`<span class="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-400/40 text-[8.5px] font-extrabold shrink-0">👑 1117</span>`
+                :(isCore
+                    ?`<span class="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-400/40 text-[8.5px] font-bold shrink-0">⚡ CORE #${escapeHtml(accK)}</span>`
+                    :`<span class="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30 text-[8.5px] shrink-0">👤 GUEST</span>`);
+            return `
+                <div class="flex items-center justify-between gap-2 bg-[#121724] px-2.5 py-1.5 rounded-lg border border-[#232c42]">
+                    <div class="flex items-center gap-1.5 min-w-0">
+                        ${roleBadge}
+                        <span class="truncate text-gray-200">${escapeHtml(r.pilotName||accK)}: <strong class="text-white">${escapeHtml(r.fileName)}</strong> <span class="text-gray-400">(${mb}MB)</span></span>
+                    </div>
+                    <button type="button" onclick="deleteCustomSongByKey('${escapeHtml(accK)}')" class="px-2 py-0.5 rounded bg-red-500/20 hover:bg-red-500/40 text-red-300 border border-red-500/40 text-[9px] font-extrabold shrink-0 cursor-pointer transition">✕ Delete</button>
+                </div>
+            `;
+        }).join('');
+        container.innerHTML=headerHtml+`<div class="space-y-1 max-h-28 overflow-y-auto pr-0.5">${rowsHtml}</div>`;
+    }catch(e){}
+}
